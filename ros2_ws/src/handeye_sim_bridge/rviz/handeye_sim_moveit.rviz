@@ -118,10 +118,14 @@ Visualization Manager:
       Enabled: true
       Name: CalibMarkers
       Namespaces:
+        endpoints: true
         fov_plane_edge: true
         fov_plane_surface: true
+        intersection_line: true
         plate: true
         plate_edge: true
+        scanline: true
+        sensor_frame: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -131,13 +135,13 @@ Visualization Manager:
       Value: true
     - Class: rviz_default_plugins/InteractiveMarkers
       Enable Transparency: true
-      Enabled: false
+      Enabled: true
       Interactive Markers Namespace: plate_im
       Name: FOV_Corners
       Show Axes: true
       Show Descriptions: true
       Show Visual Aids: true
-      Value: false
+      Value: true
     - Acceleration_Scaling_Factor: 0.1
       Class: moveit_rviz_plugin/MotionPlanning
       Enabled: true
@@ -404,25 +408,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 4.651436805725098
+      Distance: 2.516009569168091
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 0.08838330954313278
-        Y: -0.6529199481010437
-        Z: 0.21285757422447205
+        X: 0.8047996163368225
+        Y: 0.6335883140563965
+        Z: 0.6411588788032532
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.6549999713897705
+      Pitch: 0.18499986827373505
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 0.7849990725517273
+      Yaw: 0.18499945104122162
     Saved: ~
 Window Geometry:
   Displays:

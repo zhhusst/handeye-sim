@@ -15,7 +15,7 @@ from std_msgs.msg import Header
 from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, Marker
 from std_srvs.srv import Trigger
 
-import sys, os
+import sys, os, json
 sys.path.insert(0, '/workspace/common')
 
 from fov_geometry import (
@@ -80,6 +80,11 @@ class ScenePublisher(Node):
 
         self.publisher = CalibPublisher()
 
+        # FOV 校准持久化路径 — 拖拽后自动保存，重启自动加载
+        # 保存在源码目录的 config/ 下，便于版本控制
+        self._fov_calib_path = '/workspace/ros2_ws/src/handeye_sim_bridge/config/fov_calib.json'
+        self._load_fov_calib()
+
         # 模拟 GoCator 数据发布器（点云，传感器系 XZ 坐标）
         self.gocator_pub = self.create_publisher(
             PointCloud2, '/gocator/profile', 10)
@@ -89,6 +94,9 @@ class ScenePublisher(Node):
         self._fov_query_srv = self.create_service(
             Trigger, '~/query_fov_corners',
             self._query_fov_corners_cb)
+        self._fov_save_srv = self.create_service(
+            Trigger, '~/save_fov_calib',
+            self._save_fov_calib_cb)
 
         # latest_joints 需要先初始化，FOV IM 引用它
         self.latest_joints = None
@@ -311,6 +319,8 @@ class ScenePublisher(Node):
         self.scene['fov_corners_S'][idx] = pt_sensor
         self.get_logger().info(
             f'角点{idx} → ({pt_sensor[0]:.3f}, {pt_sensor[1]:.3f}, {pt_sensor[2]:.3f}) [传感器系]')
+        # 自动保存（下次重启自动加载）
+        self._save_fov_calib()
 
         # 投影 world 位姿（约束 Y=0）
         pt_world_proj = t_BS + R_BS @ pt_sensor
@@ -409,14 +419,51 @@ class ScenePublisher(Node):
             # 无 joint 数据时只发平板
             self.publisher.publish_scene_markers(stamp)
 
+    def _load_fov_calib(self):
+        """从文件加载已保存的 FOV 校准值"""
+        try:
+            with open(self._fov_calib_path, 'r') as f:
+                data = json.load(f)
+            corners = [np.array(c, dtype=float) for c in data['fov_corners_S']]
+            if len(corners) == 4:
+                self.scene['fov_corners_S'] = corners
+                self.get_logger().info(
+                    f'已加载 FOV 校准: {[f"[{c[0]:.3f},{c[1]:.3f},{c[2]:.3f}]" for c in corners]}')
+        except FileNotFoundError:
+            self.get_logger().info('无已保存的 FOV 校准，使用默认值')
+        except Exception as e:
+            self.get_logger().warn(f'加载 FOV 校准失败: {e}')
+
+    def _save_fov_calib(self):
+        """保存当前 FOV 角点到文件"""
+        corners = self.scene['fov_corners_S']
+        data = {
+            'fov_corners_S': [c.tolist() for c in corners],
+        }
+        try:
+            os.makedirs(os.path.dirname(self._fov_calib_path), exist_ok=True)
+            with open(self._fov_calib_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            self.get_logger().info(f'FOV 校准已保存 -> {self._fov_calib_path}')
+        except Exception as e:
+            self.get_logger().warn(f'保存 FOV 校准失败: {e}')
+
     def _query_fov_corners_cb(self, req, res):
         """返回当前 FOV 4个角点坐标（传感器系）"""
         corners = self.scene['fov_corners_S']
-        msg = '\\n'.join([f'corner_{i}: [{c[0]:.4f}, {c[1]:.4f}, {c[2]:.4f}]'
-                         for i, c in enumerate(corners)])
-        self.get_logger().info(f'FOV角点查询:\\n{msg}')
+        msgs = [f'corner_{i}: [{c[0]:.4f}, {c[1]:.4f}, {c[2]:.4f}]'
+                for i, c in enumerate(corners)]
+        msg = '\n'.join(msgs)
+        self.get_logger().info(f'FOV角点查询:\n{msg}')
         res.success = True
         res.message = msg
+        return res
+
+    def _save_fov_calib_cb(self, req, res):
+        """手动保存当前 FOV 校准"""
+        self._save_fov_calib()
+        res.success = True
+        res.message = f'已保存到 {self._fov_calib_path}'
         return res
 
     # ──────────────────────────────────────────
