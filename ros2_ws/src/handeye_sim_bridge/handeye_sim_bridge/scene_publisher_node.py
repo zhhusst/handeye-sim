@@ -83,7 +83,6 @@ class ScenePublisher(Node):
         # FOV 校准持久化路径 — 拖拽后自动保存，重启自动加载
         # 保存在源码目录的 config/ 下，便于版本控制
         self._fov_calib_path = '/workspace/ros2_ws/src/handeye_sim_bridge/config/fov_calib.json'
-        self._load_fov_calib()
 
         # 模拟 GoCator 数据发布器（点云，传感器系 XZ 坐标）
         self.gocator_pub = self.create_publisher(
@@ -144,6 +143,9 @@ class ScenePublisher(Node):
             'fov_corners_S': fov_corners_S,
         }
         self.publisher.set_scene(C, n_B, u_B, v_B, w, h)
+
+        # 加载已保存的 FOV 校准（覆盖默认角点）
+        self._load_fov_calib()
 
         # TF 缓存 — 用于将 gocator_sensor 系坐标转 world 系
         self.tf_buffer = Buffer()
@@ -225,40 +227,28 @@ class ScenePublisher(Node):
     def _setup_fov_corner_markers(self):
         """创建 FOV 平面的4个角点 Interactive Marker
 
-        主动等待 TF world→gocator_sensor 就绪（最多2s），
-        确保小球与 FOV 平面使用同一坐标系。
-        TF 超时则回退正运动学。
+        用 TF 将传感器系角点转换到 world 系（与 FOV 平面渲染一致）。
+        如果 TF 还没就绪，返回 False 等下一个 joint_callback 重试。
+        （不用 sleep 阻塞 — 那样会卡住 spin 导致 TF 永远收不到）
         """
         from geometry_msgs.msg import Quaternion as GeoQuat
 
-        # 等待 TF 就绪，与 publish_all_markers 使用同一坐标系
-        R_BS, t_BS = None, None
-        for retry in range(20):  # 最多等 20 帧 = ~2s
-            try:
-                t = self.tf_buffer.lookup_transform(
-                    'world', 'gocator_sensor', rclpy.time.Time())
-                q_arr = np.array([t.transform.rotation.x,
-                                  t.transform.rotation.y,
-                                  t.transform.rotation.z,
-                                  t.transform.rotation.w])
-                R_BS = quat_to_matrix(q_arr)
-                t_BS = np.array([t.transform.translation.x,
-                                 t.transform.translation.y,
-                                 t.transform.translation.z])
-                break
-            except Exception:
-                import time
-                time.sleep(0.1)
-                self.get_logger().info(
-                    f'等待 TF world→gocator_sensor... ({retry+1})')
-
-        if R_BS is None:
-            # TF 不可用 → FK 回退
-            self.get_logger().warn('TF 超时，回退 FK')
-            R_BS, t_BS = self._get_sensor_pose(fallback_fk=True)
-            if R_BS is None:
-                self.get_logger().warn('传感器位姿获取失败，IM 创建推迟')
-                return False
+        # TF 查询 — 与 publish_all_markers 完全一致
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'world', 'gocator_sensor', rclpy.time.Time())
+            q_arr = np.array([t.transform.rotation.x,
+                              t.transform.rotation.y,
+                              t.transform.rotation.z,
+                              t.transform.rotation.w])
+            R_BS = quat_to_matrix(q_arr)
+            t_BS = np.array([t.transform.translation.x,
+                             t.transform.translation.y,
+                             t.transform.translation.z])
+        except Exception as e:
+            self.get_logger().info(
+                f'等待 TF world→gocator_sensor 就绪... ({e})')
+            return False
 
         self.get_logger().info(
             f'gocator_sensor→world: t={t_BS}')
