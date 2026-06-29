@@ -180,33 +180,33 @@ class ScenePublisher(Node):
         self.im_server = InteractiveMarkerServer(self, 'plate_im')
         self.get_logger().info('InteractiveMarkerServer 已初始化（供 FOV 角点使用）')
 
-    def _get_sensor_pose(self):
+    def _get_sensor_pose(self, fallback_fk=False):
         """获取当前传感器在世界系中的位姿 (R_BS, t_BS)
         
-        先用 TF 查 world → gocator_sensor（与 FOV 平面渲染一致），
-        TF 不可用时回退 FK（需手动补 flange→fanuc_flange 变换）。
+        参数:
+            fallback_fk: True=只用FK回退（不试TF），False=先TF后FK
         """
-        # 优先用 TF（与 publish_all_markers 一致）
-        try:
-            t = self.tf_buffer.lookup_transform(
-                'world', 'gocator_sensor', rclpy.time.Time())
-            tw = t.transform.translation
-            qw = t.transform.rotation
-            q_arr = np.array([qw.x, qw.y, qw.z, qw.w])
-            R = quat_to_matrix(q_arr)
-            t_vec = np.array([tw.x, tw.y, tw.z])
-            return R, t_vec
-        except Exception:
-            pass
+        # 非fallback模式：优先用TF
+        if not fallback_fk:
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    'world', 'gocator_sensor', rclpy.time.Time())
+                tw = t.transform.translation
+                qw = t.transform.rotation
+                q_arr = np.array([qw.x, qw.y, qw.z, qw.w])
+                R = quat_to_matrix(q_arr)
+                t_vec = np.array([tw.x, tw.y, tw.z])
+                return R, t_vec
+            except Exception:
+                pass
 
-        # TF 不可用 → FK 回退
+        # TF不可用或fallback → FK（补 flange→fanuc_flange）
         if self.latest_joints is None:
             return None, None
         T_B_H = forward_kinematics(self.latest_joints)
         R_i, t_i = T_B_H[:3, :3], T_B_H[:3, 3]
 
         # URDF 中额外有 flange → fanuc_flange (rpy=180°, -90°, 0°)
-        # FK 直接到 flange，需加此变换才能与 TF 链一致
         R_ff = np.array([[0., 0., 1.],
                          [0., -1., 0.],
                          [1., 0., 0.]])
@@ -217,22 +217,43 @@ class ScenePublisher(Node):
     def _setup_fov_corner_markers(self):
         """创建 FOV 平面的4个角点 Interactive Marker
 
-        优先用 TF 将传感器系角点转换到 world 系（与 FOV 平面渲染一致），
-        TF 不可用时回退正运动学。
+        主动等待 TF world→gocator_sensor 就绪（最多2s），
+        确保小球与 FOV 平面使用同一坐标系。
+        TF 超时则回退正运动学。
         """
         from geometry_msgs.msg import Quaternion as GeoQuat
 
-        # 获取传感器在世界系中的位姿 (优先 TF / 回退 FK)
-        try:
-            R_BS, t_BS = self._get_sensor_pose()
+        # 等待 TF 就绪，与 publish_all_markers 使用同一坐标系
+        R_BS, t_BS = None, None
+        for retry in range(20):  # 最多等 20 帧 = ~2s
+            try:
+                t = self.tf_buffer.lookup_transform(
+                    'world', 'gocator_sensor', rclpy.time.Time())
+                q_arr = np.array([t.transform.rotation.x,
+                                  t.transform.rotation.y,
+                                  t.transform.rotation.z,
+                                  t.transform.rotation.w])
+                R_BS = quat_to_matrix(q_arr)
+                t_BS = np.array([t.transform.translation.x,
+                                 t.transform.translation.y,
+                                 t.transform.translation.z])
+                break
+            except Exception:
+                import time
+                time.sleep(0.1)
+                self.get_logger().info(
+                    f'等待 TF world→gocator_sensor... ({retry+1})')
+
+        if R_BS is None:
+            # TF 不可用 → FK 回退
+            self.get_logger().warn('TF 超时，回退 FK')
+            R_BS, t_BS = self._get_sensor_pose(fallback_fk=True)
             if R_BS is None:
                 self.get_logger().warn('传感器位姿获取失败，IM 创建推迟')
                 return False
-            self.get_logger().info(
-                f'gocator_sensor→world: t={t_BS}')
-        except Exception as e:
-            self.get_logger().warn(f'传感器位姿获取异常: {e}')
-            return False
+
+        self.get_logger().info(
+            f'gocator_sensor→world: t={t_BS}')
 
         colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.2, 1.0), (1.0, 1.0, 0.2)]
         labels = ['左下', '右下', '右上', '左上']
