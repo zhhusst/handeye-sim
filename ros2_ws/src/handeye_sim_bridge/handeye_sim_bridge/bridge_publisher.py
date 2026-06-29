@@ -105,14 +105,20 @@ class CalibPublisher(Node):
 
     def publish_frame_markers(self, stamp, R_BS, t_BS, scan_pts_B,
                                endpoints_B, P0=None, line_dir=None,
-                               frame_id="world"):
-        """发布单帧可视化 (FOV + 扫描线 + 断点 + 传感器坐标系)"""
+                               frame_id="world", corners_B=None):
+        """发布单帧可视化 (FOV + 扫描线 + 断点 + 传感器坐标系)
+
+        如果提供了 corners_B，用角点定义的 FOV 平面替代理论三角形。
+        """
         markers = MarkerArray()
 
-        # FOV 三角
-        fov_arr = make_fov_marker(R_BS, t_BS, frame_id,
-                                   half_fov_deg=self.half_fov_deg,
-                                   max_range=self.max_range)
+        # FOV: 用角点平面（用户校准的真实激光窗口）或理论三角形
+        if corners_B is not None:
+            fov_arr = make_fov_plane_marker(corners_B, frame_id)
+        else:
+            fov_arr = make_fov_marker(R_BS, t_BS, frame_id,
+                                       half_fov_deg=self.half_fov_deg,
+                                       max_range=self.max_range)
         for m in fov_arr.markers:
             m.header.stamp = stamp
             markers.markers.append(m)

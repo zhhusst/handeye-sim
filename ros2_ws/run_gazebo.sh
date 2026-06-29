@@ -140,10 +140,13 @@ ros2 run robot_state_publisher robot_state_publisher --ros-args --params-file /t
 sleep 1
 
 # 4. 生成机器人到 Gazebo
-echo "[4/8] 生成机器人到 Gazebo..."
+echo "[4/8] 生成机器人 + 标定平板到 Gazebo..."
 gz sdf -p "$URDF_PATH" > /tmp/robot_ready.sdf
 ros2 run ros_gz_sim create -file /tmp/robot_ready.sdf -name fanuc_robot -world empty -allow_renaming true &
-sleep 3
+sleep 2
+echo "  -> 生成标定平板..."
+ros2 run ros_gz_sim create -file /workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_plate.sdf -name calibration_plate -world empty -allow_renaming true &
+sleep 1
 
 # 5. 加载控制器参数
 echo "[5/8] 加载控制器参数到 controller_manager..."

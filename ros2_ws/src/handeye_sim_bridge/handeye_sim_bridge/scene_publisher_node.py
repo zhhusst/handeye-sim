@@ -8,7 +8,10 @@ import rclpy
 from rclpy.node import Node
 import numpy as np
 from sensor_msgs.msg import JointState
+from sensor_msgs.msg import PointCloud2, PointField
+import sensor_msgs_py.point_cloud2 as pc2
 from geometry_msgs.msg import Pose, Point, Quaternion
+from std_msgs.msg import Header
 from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, Marker
 from std_srvs.srv import Trigger
 
@@ -77,6 +80,11 @@ class ScenePublisher(Node):
 
         self.publisher = CalibPublisher()
 
+        # 模拟 GoCator 数据发布器（点云，传感器系 XZ 坐标）
+        self.gocator_pub = self.create_publisher(
+            PointCloud2, '/gocator/profile', 10)
+        self.gocator_noise_std = 0.0001  # 0.1mm 高斯噪声（模拟真实传感器）
+
         # 查询 FOV 角点的服务（用于读取当前拖拽后的值）
         self._fov_query_srv = self.create_service(
             Trigger, '~/query_fov_corners',
@@ -85,23 +93,11 @@ class ScenePublisher(Node):
         # latest_joints 需要先初始化，FOV IM 引用它
         self.latest_joints = None
 
-        # 场景 (固定, 每次随机生成)
-        rng = np.random.default_rng(42)
-        # 平板位置 - 放远一些
-        C = np.array([rng.uniform(0.6, 1.0),
-                      rng.uniform(-0.2, 0.2),
-                      rng.uniform(0.1, 0.3)])
-        # 平板法向/面内方向
-        n_B = np.array([0., 0., 1.])
-        ax = rng.uniform(-10, 10); ay = rng.uniform(-10, 10); az = rng.uniform(-10, 10)
-        R_plane = rpy_to_matrix(ax, ay, az)
-        n_B = R_plane @ np.array([0., 0., 1.]); n_B = n_B / np.linalg.norm(n_B)
-        if abs(n_B[2]) < 0.9:
-            u_B = np.cross(np.array([0., 0., 1.]), n_B)
-        else:
-            u_B = np.cross(np.array([0., 1., 0.]), n_B)
-        u_B = u_B / np.linalg.norm(u_B)
-        v_B = np.cross(n_B, u_B)
+        # 场景 — 固定位置（与 Gazebo 里生出的物理平板一致）
+        C = np.array([0.7, 0.0, 0.25])   # 前上方
+        n_B = np.array([0., 0., 1.])      # 朝上
+        u_B = np.array([1., 0., 0.])
+        v_B = np.array([0., 1., 0.])
         w, h = 0.4, 0.5
 
         # 手眼真值 — gocator_sensor 坐标系原点（在激光平面上）
@@ -115,14 +111,22 @@ class ScenePublisher(Node):
         X_gt = make_transform(R_he, t_he)
         R_he, t_he = X_gt[:3, :3], X_gt[:3, 3]
 
-        R_plate = rpy_to_matrix(ax, ay, az)  # 初始平板旋转
+        R_plate = np.eye(3)  # 平板面朝上（与 Gazebo 模型一致）
+
+        # FOV 三角形偏移参数：锥尖在传感器系中的位置
+        # Gocator 2450 的激光窗口位置相对于 sensor frame 原点的偏移
+        fov_tip_offset_x = self.declare_parameter('fov_tip_offset_x', 0.0).value
+        fov_tip_offset_z = self.declare_parameter('fov_tip_offset_z', 0.0).value
+
         # FOV 激光平面 = gocator_sensor 的 XZ 平面
-        # 4个角点（在传感器系中），默认=GoCator 2450 规格
+        # 4个角点: 0=激光窗口, 1=(同点,退化), 2=右上, 3=左上
+        # tip_offset 让锥尖对准实际激光发射窗口
+        dx, dz = fov_tip_offset_x, fov_tip_offset_z
         fov_corners_S = [
-            np.array([ 0.0, 0.0, -0.282]),  # corner 0: 底部顶点
-            np.array([ 0.0, 0.0, -0.282]),  # corner 1: 底部顶点（与0重合，三角形）
-            np.array([ 0.22, 0.0, 0.820]),  # corner 2: 右上
-            np.array([-0.22, 0.0, 0.820]),  # corner 3: 左上
+            np.array([dx, 0.0, dz]),           # corner 0: 激光窗口锥尖
+            np.array([dx, 0.0, dz]),           # corner 1: 同上（退化形成三角形）
+            np.array([dx + 0.22, 0.0, dz + 0.820]), # corner 2: 右上
+            np.array([dx - 0.22, 0.0, dz + 0.820]), # corner 3: 左上
         ]
         self.scene = {
             'C': C, 'n_B': n_B, 'u_B': u_B, 'v_B': v_B,
@@ -177,35 +181,57 @@ class ScenePublisher(Node):
         self.get_logger().info('InteractiveMarkerServer 已初始化（供 FOV 角点使用）')
 
     def _get_sensor_pose(self):
-        """获取当前传感器在世界系中的位姿 (R_BS, t_BS)"""
+        """获取当前传感器在世界系中的位姿 (R_BS, t_BS)
+        
+        先用 TF 查 world → gocator_sensor（与 FOV 平面渲染一致），
+        TF 不可用时回退 FK（需手动补 flange→fanuc_flange 变换）。
+        """
+        # 优先用 TF（与 publish_all_markers 一致）
+        try:
+            t = self.tf_buffer.lookup_transform(
+                'world', 'gocator_sensor', rclpy.time.Time())
+            tw = t.transform.translation
+            qw = t.transform.rotation
+            q_arr = np.array([qw.x, qw.y, qw.z, qw.w])
+            R = quat_to_matrix(q_arr)
+            t_vec = np.array([tw.x, tw.y, tw.z])
+            return R, t_vec
+        except Exception:
+            pass
+
+        # TF 不可用 → FK 回退
         if self.latest_joints is None:
             return None, None
         T_B_H = forward_kinematics(self.latest_joints)
         R_i, t_i = T_B_H[:3, :3], T_B_H[:3, 3]
-        R_BS = R_i @ self.scene['R_he']
-        t_BS = t_i + R_i @ self.scene['t_he']
+
+        # URDF 中额外有 flange → fanuc_flange (rpy=180°, -90°, 0°)
+        # FK 直接到 flange，需加此变换才能与 TF 链一致
+        R_ff = np.array([[0., 0., 1.],
+                         [0., -1., 0.],
+                         [1., 0., 0.]])
+        R_BS = R_i @ R_ff @ self.scene['R_he']
+        t_BS = t_i + R_i @ R_ff @ self.scene['t_he']
         return R_BS, t_BS
 
     def _setup_fov_corner_markers(self):
         """创建 FOV 平面的4个角点 Interactive Marker
 
-        用 TF 将传感器系角点转换到 world 系，IM 创建在 world 系中。
+        优先用 TF 将传感器系角点转换到 world 系（与 FOV 平面渲染一致），
+        TF 不可用时回退正运动学。
         """
         from geometry_msgs.msg import Quaternion as GeoQuat
 
-        # 用 TF 查 gocator_sensor → world
+        # 获取传感器在世界系中的位姿 (优先 TF / 回退 FK)
         try:
-            t = self.tf_buffer.lookup_transform(
-                'base_link', 'gocator_sensor', rclpy.time.Time())
-            t_w = t.transform.translation
-            q_w = t.transform.rotation
-            q_arr = np.array([q_w.x, q_w.y, q_w.z, q_w.w])
-            R_SW = quat_to_matrix(q_arr)
-            t_SW = np.array([t_w.x, t_w.y, t_w.z])
+            R_BS, t_BS = self._get_sensor_pose()
+            if R_BS is None:
+                self.get_logger().warn('传感器位姿获取失败，IM 创建推迟')
+                return False
             self.get_logger().info(
-                f'gocator_sensor→base_link: t={t_SW}')
+                f'gocator_sensor→world: t={t_BS}')
         except Exception as e:
-            self.get_logger().warn(f'TF 查找失败，下次重试: {e}')
+            self.get_logger().warn(f'传感器位姿获取异常: {e}')
             return False
 
         colors = [(1.0, 0.2, 0.2), (0.2, 1.0, 0.2), (0.2, 0.2, 1.0), (1.0, 1.0, 0.2)]
@@ -213,7 +239,7 @@ class ScenePublisher(Node):
 
         for i, corner_S in enumerate(self.scene['fov_corners_S']):
             # 传感器系 → 世界系
-            pos_world = t_SW + R_SW @ corner_S
+            pos_world = t_BS + R_BS @ corner_S
 
             im = InteractiveMarker()
             im.header.frame_id = 'world'
@@ -249,19 +275,15 @@ class ScenePublisher(Node):
         """FOV 角点被拖拽 — 反馈位姿在 world 系，转存为传感器系"""
         p = feedback.pose.position
         pt_world = np.array([p.x, p.y, p.z])
-        # 用 TF 查 gocator_sensor → world
         try:
-            t = self.tf_buffer.lookup_transform(
-                'base_link', 'gocator_sensor', rclpy.time.Time())
-            t_w = t.transform.translation
-            q_w = t.transform.rotation
-            q_arr = np.array([q_w.x, q_w.y, q_w.z, q_w.w])
-            R_SW = quat_to_matrix(q_arr)
-            t_SW = np.array([t_w.x, t_w.y, t_w.z])
+            R_BS, t_BS = self._get_sensor_pose()
+            if R_BS is None:
+                self.get_logger().warn('传感器位姿获取失败')
+                return
             # world → gocator_sensor
-            pt_sensor = R_SW.T @ (pt_world - t_SW)
+            pt_sensor = R_BS.T @ (pt_world - t_BS)
         except Exception as e:
-            self.get_logger().warn(f'TF 查找失败: {e}')
+            self.get_logger().warn(f'传感器位姿获取异常: {e}')
             return
         # 约束到 XZ 平面 (Y=0)
         pt_sensor[1] = 0.0
@@ -270,7 +292,7 @@ class ScenePublisher(Node):
             f'角点{idx} → ({pt_sensor[0]:.3f}, {pt_sensor[1]:.3f}, {pt_sensor[2]:.3f}) [传感器系]')
 
         # 投影 world 位姿（约束 Y=0）
-        pt_world_proj = t_SW + R_SW @ pt_sensor
+        pt_world_proj = t_BS + R_BS @ pt_sensor
         feedback.pose.position.x = float(pt_world_proj[0])
         feedback.pose.position.y = float(pt_world_proj[1])
         feedback.pose.position.z = float(pt_world_proj[2])
@@ -290,7 +312,7 @@ class ScenePublisher(Node):
             self.get_logger().error(f"timer_callback 异常: {e}")
 
     def publish_all_markers(self, stamp):
-        """一次性发布所有场景 Marker（平板 + FOV 平面 + TF）"""
+        """一次性发布所有场景 Marker + 模拟 GoCator 数据"""
         if self.scene is None:
             return
         C = self.scene['C']
@@ -301,7 +323,7 @@ class ScenePublisher(Node):
         h = self.scene['h']
         corners_S = self.scene['fov_corners_S']
         if self.latest_joints is not None:
-            # 用 TF 将角点从传感器系转换到 world 系（与URDF/RSP完全一致）
+            # 用 TF 将角点从传感器系转换到 world 系
             try:
                 t = self.tf_buffer.lookup_transform(
                     'world', 'gocator_sensor', rclpy.time.Time())
@@ -311,14 +333,59 @@ class ScenePublisher(Node):
                 R = quat_to_matrix(q_arr)
                 t_vec = np.array([tw.x, tw.y, tw.z])
                 corners_world = [t_vec + R @ c for c in corners_S]
-                self.publisher.publish_all_markers(
-                    stamp, corners_world, C, n_B, u_B, v_B, w, h,
-                    frame_id="world", sensor_frame="world")
-            except Exception:
-                self.publisher.publish_all_markers(
-                    stamp, corners_S, C, n_B, u_B, v_B, w, h)
+
+                # 计算 FOV 与平板交线 → 扫描点
+                res = compute_fov_plate_scanline(
+                    R_BS=R, t_BS=t_vec,
+                    C=C, n_B=n_B, u_B=u_B, v_B=v_B,
+                    pw=w, ph=h)
+
+                # 世界系角点（用户校准的真实激光窗口）
+                corners_world = [t_vec + R @ c for c in self.scene['fov_corners_S']]
+
+                # 发布场景 markers（平板 + FOV平面 + 扫描线 + 断点）
+                if res['has_intersection']:
+                    self.publisher.publish_frame_markers(
+                        stamp, R, t_vec,
+                        res['scan_pts_B'], res['endpoints_B'],
+                        P0=res['line_origin_B'], line_dir=res['line_dir'],
+                        frame_id='world',
+                        corners_B=corners_world)  # 用校准过的角点
+                    # publish_frame_markers 不包含平板，额外发一次
+                    self.publisher.publish_scene_markers(stamp)
+                else:
+                    # 无交线时只发平板 + FOV平面（基于角点）
+                    self.publisher.publish_fov_plane(stamp, corners_world, 'world')
+                    self.publisher.publish_scene_markers(stamp)
+
+                # 发布模拟 GoCator 数据（传感器系 2D 轮廓点）
+                if res['has_intersection'] and len(res['scan_pts_S']) > 0:
+                    pts_S = res['scan_pts_S']
+                    # 加噪声 (模拟真实传感器)
+                    noise = np.random.normal(0, self.gocator_noise_std, pts_S.shape)
+                    pts_noisy = pts_S + noise
+                    # 发布为 PointCloud2 (X, Y=0, Z 在传感器系)
+                    fields = [
+                        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                    ]
+                    # 只保留 X, Z (Y 在传感器系中恒为 0)
+                    pts_2d = np.zeros((len(pts_noisy), 3), dtype=np.float32)
+                    pts_2d[:, 0] = pts_noisy[:, 0]  # X
+                    pts_2d[:, 1] = 0.0               # Y = 0 (激光平面)
+                    pts_2d[:, 2] = pts_noisy[:, 2]   # Z
+                    cloud = pc2.create_cloud(
+                        Header(stamp=stamp, frame_id='gocator_sensor'),
+                        fields, pts_2d)
+                    self.gocator_pub.publish(cloud)
+
+            except Exception as e:
+                self.get_logger().warn(f'TF/scene publish error: {e}')
+                # TF 失败时只发平板（不画 FOV，因为没 TF 算不准位置）
+                self.publisher.publish_scene_markers(stamp)
         else:
-            # 无 joint 数据时只发平板（FOV 需要传感器位姿）
+            # 无 joint 数据时只发平板
             self.publisher.publish_scene_markers(stamp)
 
     def _query_fov_corners_cb(self, req, res):

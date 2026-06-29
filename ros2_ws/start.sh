@@ -172,8 +172,12 @@ tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_bridge parameter_bridge /cloc
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "ros2 run robot_state_publisher robot_state_publisher --ros-args --params-file /tmp/ros_params/rsp_params.yaml" Enter
 sleep 1
+tmux send-keys -t handeye_sim:0.1 "ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 world base_link" Enter
+sleep 1
 tmux send-keys -t handeye_sim:0.1 "gz sdf -p '$URDF_PATH' > /tmp/robot_ready.sdf && ros2 run ros_gz_sim create -file /tmp/robot_ready.sdf -name fanuc_robot -world empty -allow_renaming true" Enter
-sleep 3
+sleep 2
+tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_sim create -file /workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_plate.sdf -name calibration_plate -world empty -allow_renaming true" Enter
+sleep 1
 tmux send-keys -t handeye_sim:0.1 "ros2 param load /controller_manager '$GZ_CTRL_CONFIG' 2>&1 | head -3" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "ros2 run controller_manager spawner joint_state_broadcaster" Enter
@@ -215,16 +219,22 @@ export GZ_SIM_SYSTEM_PLUGIN_PATH=/opt/ros/jazzy/lib
 gz sim -r -v 4 empty.sdf &
 sleep 4
 
-echo "[2/7] Bridges + RSP..."
+echo "[2/7] Bridges + RSP + static TF..."
 ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock &
 sleep 1
 ros2 run robot_state_publisher robot_state_publisher --ros-args --params-file /tmp/ros_params/rsp_params.yaml &
 sleep 1
+# 静态 TF: world -> base_link（标记/场景使用 world 帧）
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 world base_link &
+sleep 1
 
-echo "[3/7] Spawn robot..."
+echo "[3/7] Spawn robot + calibration plate..."
 gz sdf -p "$URDF_PATH" > /tmp/robot_ready.sdf
 ros2 run ros_gz_sim create -file /tmp/robot_ready.sdf -name fanuc_robot -world empty -allow_renaming true &
-sleep 3
+sleep 2
+echo "  -> Spawn calibration plate..."
+ros2 run ros_gz_sim create -file /workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_plate.sdf -name calibration_plate -world empty -allow_renaming true &
+sleep 1
 
 echo "[4/7] Controllers..."
 ros2 param load /controller_manager "$GZ_CTRL_CONFIG" 2>&1 | head -3 || true

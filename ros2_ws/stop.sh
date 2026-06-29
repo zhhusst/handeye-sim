@@ -10,4 +10,7 @@ if [ "$REMAINING" -gt 0 ]; then
     ps aux | grep -E "gz sim|gazebo|move_group|rviz2|robot_state|parameter_bridge|scene_publisher|srdf_publisher" | grep -v grep | awk '{print $2}' | xargs kill -9 2>/dev/null
 fi
 tmux kill-session -t handeye_sim 2>/dev/null || true
+# Gazebo 模型清理
+gz model -m calibration_plate --remove 2>/dev/null || true
+gz model -m fanuc_robot --remove 2>/dev/null || true
 echo "All stopped"
