@@ -1,0 +1,5 @@
+#!/usr/bin/env python3
+"""Wrapper script installed to lib/handeye_sim_bridge/ for ros2 launch compatibility"""
+from handeye_sim_bridge.scene_publisher_node import main
+import sys
+sys.exit(main())

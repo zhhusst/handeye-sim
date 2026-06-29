@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<robot name="m20id25_calib">
+  <!-- 手臂组：base_link → gocator_sensor（末端传感器） -->
+  <group name="arm">
+    <chain base_link="base_link" tip_link="flange"/>
+  </group>
+
+  <!-- 虚拟关节：world → base_link -->
+  <virtual_joint name="world_joint" type="fixed" parent_frame="world" child_link="base_link"/>
+
+  <!-- 禁用碰撞对 -->
+  <disable_collisions link1="base_link" link2="J1_link" reason="Adjacent"/>
+  <disable_collisions link1="J1_link" link2="J2_link" reason="Adjacent"/>
+  <disable_collisions link1="J2_link" link2="J3_link" reason="Adjacent"/>
+  <disable_collisions link1="J3_link" link2="J4_link" reason="Adjacent"/>
+  <disable_collisions link1="J4_link" link2="J5_link" reason="Adjacent"/>
+  <disable_collisions link1="J5_link" link2="J6_link" reason="Adjacent"/>
+  <disable_collisions link1="J6_link" link2="flange" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="gocator_sensor" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="ee_link" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="fanuc_flange" reason="Adjacent"/>
+</robot>

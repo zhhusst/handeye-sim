@@ -1,0 +1,26 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "构建 ROS2 包",
+            "type": "shell",
+            "command": "bash -c 'source /opt/ros/jazzy/setup.bash && cd /workspace/ros2_ws && colcon build --symlink-install'",
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "启动标定仿真",
+            "type": "shell",
+            "command": "bash -c 'source /workspace/ros2_ws/install/setup.bash && ros2 launch handeye_sim_bridge handeye_sim.launch.py'",
+            "group": "test",
+            "problemMatcher": []
+        },
+        {
+            "label": "离线几何引擎测试",
+            "type": "shell",
+            "command": "python3 /workspace/test_geometry_standalone.py",
+            "group": "test",
+            "problemMatcher": []
+        }
+    ]
+}

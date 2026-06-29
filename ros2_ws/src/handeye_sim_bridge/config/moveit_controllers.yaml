@@ -1,0 +1,8 @@
+/**:
+  ros__parameters:
+    controller_names: ["joint_trajectory_controller"]
+    joint_trajectory_controller:
+      type: FollowJointTrajectory
+      joints: ["J1_joint", "J2_joint", "J3_joint", "J4_joint", "J5_joint", "J6_joint"]
+      action_ns: follow_joint_trajectory
+      default: true

@@ -1,0 +1,76 @@
+<?xml version="1.0" ?>
+<robot name="calib_scene" xmlns:xacro="http://wiki.ros.org/xacro">
+
+  <!-- 标定场景: 平板 + 传感器 + FOV 可视化 -->
+
+  <!-- 全局参数 -->
+  <xacro:property name="plate_w" value="0.4" />
+  <xacro:property name="plate_h" value="0.5" />
+  <xacro:property name="plate_thick" value="0.01" />
+
+  <!-- ======== 平板 ======== -->
+  <link name="plate">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="${plate_w} ${plate_h} ${plate_thick}" />
+      </geometry>
+      <material name="plate_mat">
+        <color rgba="0.3 0.6 0.9 0.6" />
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <box size="${plate_w} ${plate_h} ${plate_thick}" />
+      </geometry>
+    </collision>
+  </link>
+
+  <!-- ======== 传感器 (GoCator 2450 mesh) ======== -->
+  <link name="sensor">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry>
+        <mesh filename="package://handeye_sim_bridge/../../meshes/Gocator_2450.dae" />
+      </geometry>
+    </visual>
+  </link>
+
+  <!-- ======== 边1标记 (红色) ======== -->
+  <link name="edge1_marker">
+    <visual>
+      <geometry>
+        <cylinder length="0.4" radius="0.002" />
+      </geometry>
+      <material name="edge1_mat">
+        <color rgba="1.0 0.2 0.2 1.0" />
+      </material>
+    </visual>
+  </link>
+
+  <!-- ======== 边2标记 (蓝色) ======== -->
+  <link name="edge2_marker">
+    <visual>
+      <geometry>
+        <cylinder length="0.5" radius="0.002" />
+      </geometry>
+      <material name="edge2_mat">
+        <color rgba="0.2 0.2 1.0 1.0" />
+      </material>
+    </visual>
+  </link>
+
+  <!-- ======== 角点标记 (金色小球) ======== -->
+  <link name="corner_marker">
+    <visual>
+      <geometry>
+        <sphere radius="0.008" />
+      </geometry>
+      <material name="corner_mat">
+        <color rgba="1.0 0.8 0.0 1.0" />
+      </material>
+    </visual>
+  </link>
+
+</robot>

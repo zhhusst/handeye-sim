@@ -1,0 +1,11 @@
+# 纯仿真 — 不执行轨迹，只用 MoveIt 规划 + RViz 面板
+# 关节滑条由 joint_state_publisher_gui 提供
+moveit_manage_controllers: false
+initial_robot_pose:
+  joints:
+    J1_joint: 0.0
+    J2_joint: 0.524
+    J3_joint: -1.047
+    J4_joint: 0.0
+    J5_joint: -0.524
+    J6_joint: 0.0

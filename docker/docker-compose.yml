@@ -1,0 +1,23 @@
+version: "2.3"
+services:
+  handeye-sim:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_UID: 1000
+        USER_GID: 1000
+    image: handeye-sim:latest
+    container_name: handeye-sim
+    stdin_open: true
+    tty: true
+    network_mode: host
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=42
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ..:/workspace
+    working_dir: /workspace
+    command: /bin/bash

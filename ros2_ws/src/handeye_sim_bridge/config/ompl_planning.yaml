@@ -1,0 +1,47 @@
+# OMPL 规划器配置
+arm:
+  planner_configs:
+    - RRTConnect
+    - RRTstar
+    - PRM
+    - PRMstar
+    - EST
+    - SBL
+    - KPIECE
+    - BKPIECE
+
+  # 默认规划器
+  default_planner_config: RRTConnect
+
+  # 规划器参数
+  RRTConnect:
+    type: geometric::RRTConnect
+    range: 0.0  # 自动
+
+  RRTstar:
+    type: geometric::RRTstar
+    range: 0.0
+    delay_collision_checking: 1
+
+  PRM:
+    type: geometric::PRM
+    max_nearest_neighbors: 10
+
+  PRMstar:
+    type: geometric::PRMstar
+
+  EST:
+    type: geometric::EST
+    range: 0.0
+
+  SBL:
+    type: geometric::SBL
+    range: 0.0
+
+  KPIECE:
+    type: geometric::KPIECE
+    range: 0.0
+
+  BKPIECE:
+    type: geometric::BKPIECE
+    range: 0.0

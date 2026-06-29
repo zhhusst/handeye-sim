@@ -1,0 +1,28 @@
+# Build artifacts
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# ROS2 build deps
+ros-jazzy-*/
+*.tar.gz
+*.tar.xz
+*.dsc
+
+# Temp files
+/tmp/
+/tmp/*.yaml
+/tmp/*.sdf
+
+# Generated params
+mg_params.yaml
+rsp_params.yaml
+
+# OS
+.DS_Store
+*.swp
+*.swo
