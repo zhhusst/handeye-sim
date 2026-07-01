@@ -57,7 +57,8 @@ def combined_residuals(theta, poses, meas, w_plane=0.1, w_edge=1.0):
         for p_S in m.get('p_S_plane', []):
             plane_vals.append(np.dot(n_B, R_BS @ p_S + t_BS))
     
-    # Plane: centered (per-pose already, but we do global centered)
+    # Plane: global centered (2D line scanner scan lines are 1D per pose,
+    # per-pose centering would eliminate all plane information)
     plane_vals = np.array(plane_vals)
     if len(plane_vals) > 0:
         plane_vals = plane_vals - np.mean(plane_vals)
@@ -115,7 +116,7 @@ def combined_jacobian(theta, poses, meas, w_plane=0.1, w_edge=1.0, eps=1e-6):
 
 
 def combined_solve_lm(theta_init, poses, meas, w_plane=0.1, w_edge=1.0,
-                      max_iter=100, tol=1e-10, lam0=1e-6):
+                      max_iter=200, tol=1e-12, lam0=1e-6):
     """LM 求解器"""
     theta = theta_init.copy()
     lam = lam0
