@@ -134,7 +134,8 @@ def generate_plane(rng=None, plane_size=(0.4, 0.5)):
 
 def compute_fov_plate_scanline(R_BS, t_BS, C, n_B, u_B, v_B, pw, ph,
                                 half_fov_deg=15.0, min_range=0.27, max_range=0.82,
-                                n_sample=500, half_span=0.5):
+                                n_sample=500, half_span=0.8,
+                                fov_corners_S=None):
     """统一计算 FOV 三角与平板的交线 — 动画可视化 + 测量生成共用
 
     参数:
@@ -143,10 +144,12 @@ def compute_fov_plate_scanline(R_BS, t_BS, C, n_B, u_B, v_B, pw, ph,
         n_B: 平板法向量 (3)
         u_B, v_B: 平板坐标系基向量 (3, 3)
         pw, ph: 平板尺寸 (m)
-        half_fov_deg: 半视场角, Gocator 2450 默认 15°
-        min_range, max_range: 测量范围 (m), Gocator 2450 默认 0.27~0.82
+        half_fov_deg: 半视场角, Gocator 2450 默认 15°（fov_corners_S 未提供时使用）
+        min_range, max_range: 测量范围 (m), Gocator 2450 默认 0.27~0.82（同上）
         n_sample: 交线采样点数
         half_span: 交线搜索半跨度 (m)
+        fov_corners_S: 4×3 校准后的 FOV 角点 [c0,c1,c2,c3] 传感器系
+                       c0/c1=锥尖(激光窗), c2=右上, c3=左上
 
     返回:
         dict with:
@@ -184,7 +187,38 @@ def compute_fov_plate_scanline(R_BS, t_BS, C, n_B, u_B, v_B, pw, ph,
     R_SB = R_BS.T
     t_SB = -R_SB @ t_BS
 
-    tan_fov = np.tan(np.deg2rad(half_fov_deg))
+    # FOV 裁剪: 优先用校准角点，回退到几何参数
+    if fov_corners_S is not None and len(fov_corners_S) >= 4:
+        tip_x, tip_z = fov_corners_S[0][0], fov_corners_S[0][2]
+        base_z = fov_corners_S[2][2]
+        x_left_base = fov_corners_S[3][0]    # 左底 x
+        x_right_base = fov_corners_S[2][0]   # 右底 x
+        fov_range_z = base_z - tip_z          # >0
+        use_calibrated_fov = True
+    else:
+        tip_x = 0.0
+        tip_z = 0.0
+        x_left_base = 0.0
+        x_right_base = 0.0
+        fov_range_z = 1.0
+        tan_fov = np.tan(np.deg2rad(half_fov_deg))
+        use_calibrated_fov = False
+
+    def _in_fov(x, z):
+        """检查点 (x, z) 是否在 FOV 三角内（传感器系 Y=0）"""
+        if use_calibrated_fov:
+            if z < tip_z or z > base_z:
+                return False
+            # 三角边界: 从 tip 到 left/right base 线性插值
+            t_frac = (z - tip_z) / fov_range_z
+            x_left = tip_x + (x_left_base - tip_x) * t_frac
+            x_right = tip_x + (x_right_base - tip_x) * t_frac
+            return x_left - 1e-6 <= x <= x_right + 1e-6
+        else:
+            if z < min_range or z > max_range:
+                return False
+            return abs(x) <= z * tan_fov + 1e-6
+
     t_vals = np.linspace(-half_span, half_span, n_sample)
     valid = []
 
@@ -198,13 +232,9 @@ def compute_fov_plate_scanline(R_BS, t_BS, C, n_B, u_B, v_B, pw, ph,
         if u < -1e-6 or v < -1e-6 or u > pw + 1e-6 or v > ph + 1e-6:
             continue
 
-        # 裁剪: FOV 三角 + 测量范围
+        # 裁剪: FOV 三角
         p_S = R_SB @ p_B + t_SB
-        z = p_S[2]
-        x = p_S[0]
-        if z < min_range or z > max_range:
-            continue
-        if abs(x) > z * tan_fov:
+        if not _in_fov(p_S[0], p_S[2]):
             continue
 
         valid.append(k)
@@ -233,32 +263,68 @@ def compute_fov_plate_scanline(R_BS, t_BS, C, n_B, u_B, v_B, pw, ph,
     eps = 0.005
     endpoints_B = []
     endpoints_S = []
+    ep_debug = []  # debug info
 
-    # 边1: 沿 u_B 方向, C + s*u_B
+    # 边1: 沿 u_B 方向, C + s*u_B (v=0 侧)
     denom_e1 = np.dot(laser_normal, u_B)
     if abs(denom_e1) > 1e-12:
         s_e1 = np.dot(laser_normal, sensor_origin - C) / denom_e1
         if -eps <= s_e1 <= pw + eps:
             pB_e1 = C + s_e1 * u_B
             pS_e1 = R_SB @ pB_e1 + t_SB
-            z_e1, x_e1 = pS_e1[2], pS_e1[0]
-            if (min_range - eps <= z_e1 <= max_range + eps and
-                    abs(x_e1) <= z_e1 * tan_fov + eps):
+            in_fov = _in_fov(pS_e1[0], pS_e1[2])
+            ep_debug.append(f"e1(v=0): s={s_e1:.3f} pS=({pS_e1[0]:.3f},{pS_e1[2]:.3f}) in_fov={in_fov}")
+            if in_fov:
                 endpoints_B.append(('e1', pB_e1))
                 endpoints_S.append(('e1', pS_e1))
 
-    # 边2: 沿 v_B 方向 (α=90°)
+    # 边1 对面: C + h*v_B + s*u_B (v=ph 侧)
+    C_opp = C + ph * v_B
+    s_e1b = np.dot(laser_normal, sensor_origin - C_opp) / denom_e1
+    if -eps <= s_e1b <= pw + eps:
+        pB_e1b = C_opp + s_e1b * u_B
+        pS_e1b = R_SB @ pB_e1b + t_SB
+        in_fov = _in_fov(pS_e1b[0], pS_e1b[2])
+        ep_debug.append(f"e1(v=ph): s={s_e1b:.3f} pS=({pS_e1b[0]:.3f},{pS_e1b[2]:.3f}) in_fov={in_fov}")
+        if in_fov:
+            endpoints_B.append(('e1', pB_e1b))
+            endpoints_S.append(('e1', pS_e1b))
+    else:
+        ep_debug.append(f"e1(v=ph): s={s_e1b:.3f} OUT_OF_RANGE [-eps,{pw+eps:.3f}]")
+
+    # 边2: 沿 v_B 方向, C + s*v_B (u=0 侧)
     denom_e2 = np.dot(laser_normal, v_B)
     if abs(denom_e2) > 1e-12:
         s_e2 = np.dot(laser_normal, sensor_origin - C) / denom_e2
         if -eps <= s_e2 <= ph + eps:
             pB_e2 = C + s_e2 * v_B
             pS_e2 = R_SB @ pB_e2 + t_SB
-            z_e2, x_e2 = pS_e2[2], pS_e2[0]
-            if (min_range - eps <= z_e2 <= max_range + eps and
-                    abs(x_e2) <= z_e2 * tan_fov + eps):
+            in_fov = _in_fov(pS_e2[0], pS_e2[2])
+            ep_debug.append(f"e2(u=0): s={s_e2:.3f} pS=({pS_e2[0]:.3f},{pS_e2[2]:.3f}) in_fov={in_fov}")
+            if in_fov:
                 endpoints_B.append(('e2', pB_e2))
                 endpoints_S.append(('e2', pS_e2))
+        else:
+            ep_debug.append(f"e2(u=0): s={s_e2:.3f} OUT_OF_RANGE [-eps,{ph+eps:.3f}]")
+
+        # 边2 对面: C + w*u_B + s*v_B (u=pw 侧)
+        C_opp2 = C + pw * u_B
+        s_e2b = np.dot(laser_normal, sensor_origin - C_opp2) / denom_e2
+        if -eps <= s_e2b <= ph + eps:
+            pB_e2b = C_opp2 + s_e2b * v_B
+            pS_e2b = R_SB @ pB_e2b + t_SB
+            in_fov = _in_fov(pS_e2b[0], pS_e2b[2])
+            ep_debug.append(f"e2(u=pw): s={s_e2b:.3f} pS=({pS_e2b[0]:.3f},{pS_e2b[2]:.3f}) in_fov={in_fov}")
+            if in_fov:
+                endpoints_B.append(('e2', pB_e2b))
+                endpoints_S.append(('e2', pS_e2b))
+        else:
+            ep_debug.append(f"e2(u=pw): s={s_e2b:.3f} OUT_OF_RANGE [-eps,{ph+eps:.3f}]")
+    else:
+        ep_debug.append(f"denom_e2={denom_e2:.6f} NEAR_ZERO, no e2 intersection")
+
+    # Debug: store for scene_publisher log
+    _ep_debug = '\n'.join(ep_debug)
 
     return {
         'scan_pts_B': scan_pts_B,
@@ -268,6 +334,7 @@ def compute_fov_plate_scanline(R_BS, t_BS, C, n_B, u_B, v_B, pw, ph,
         'has_intersection': True,
         'line_origin_B': P0,
         'line_dir': line_dir,
+        'ep_debug': _ep_debug,
     }
 
 

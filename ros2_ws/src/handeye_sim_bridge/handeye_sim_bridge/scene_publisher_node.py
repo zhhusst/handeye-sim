@@ -12,6 +12,7 @@ from sensor_msgs.msg import PointCloud2, PointField
 import sensor_msgs_py.point_cloud2 as pc2
 from geometry_msgs.msg import Pose, Point, Quaternion
 from std_msgs.msg import Header
+from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, Marker
 from std_srvs.srv import Trigger
 
@@ -87,7 +88,13 @@ class ScenePublisher(Node):
         # 模拟 GoCator 数据发布器（点云，传感器系 XZ 坐标）
         self.gocator_pub = self.create_publisher(
             PointCloud2, '/gocator/profile', 10)
+        # 断点信息发布器（传感器系，正确标记 e1/e2）
+        self.endpoint_pub = self.create_publisher(
+            Float64MultiArray, '/gocator/endpoints', 10)
         self.gocator_noise_std = 0.0001  # 0.1mm 高斯噪声（模拟真实传感器）
+
+        # 调试日志节流
+        self._debug_frame = 0
 
         # 查询 FOV 角点的服务（用于读取当前拖拽后的值）
         self._fov_query_srv = self.create_service(
@@ -359,7 +366,8 @@ class ScenePublisher(Node):
                 res = compute_fov_plate_scanline(
                     R_BS=R, t_BS=t_vec,
                     C=C, n_B=n_B, u_B=u_B, v_B=v_B,
-                    pw=w, ph=h)
+                    pw=w, ph=h,
+                    fov_corners_S=self.scene['fov_corners_S'])
 
                 # 世界系角点（用户校准的真实激光窗口）
                 corners_world = [t_vec + R @ c for c in self.scene['fov_corners_S']]
@@ -380,26 +388,55 @@ class ScenePublisher(Node):
                     self.publisher.publish_scene_markers(stamp)
 
                 # 发布模拟 GoCator 数据（传感器系 2D 轮廓点）
-                if res['has_intersection'] and len(res['scan_pts_S']) > 0:
+                fields = [
+                    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                ]
+                if res['has_intersection'] and len(res['scan_pts_S']) >= 3:
                     pts_S = res['scan_pts_S']
                     # 加噪声 (模拟真实传感器)
                     noise = np.random.normal(0, self.gocator_noise_std, pts_S.shape)
                     pts_noisy = pts_S + noise
-                    # 发布为 PointCloud2 (X, Y=0, Z 在传感器系)
-                    fields = [
-                        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
-                        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-                    ]
                     # 只保留 X, Z (Y 在传感器系中恒为 0)
                     pts_2d = np.zeros((len(pts_noisy), 3), dtype=np.float32)
                     pts_2d[:, 0] = pts_noisy[:, 0]  # X
                     pts_2d[:, 1] = 0.0               # Y = 0 (激光平面)
                     pts_2d[:, 2] = pts_noisy[:, 2]   # Z
-                    cloud = pc2.create_cloud(
-                        Header(stamp=stamp, frame_id='gocator_sensor'),
-                        fields, pts_2d)
-                    self.gocator_pub.publish(cloud)
+                    # 只保留扫描线范围调试（每秒1次，方便确认有无断点）
+                    self._debug_frame += 1
+                    if len(pts_S) >= 3 and self._debug_frame % 30 == 0:
+                        z_min, z_max = float(pts_S[:, 2].min()), float(pts_S[:, 2].max())
+                        x_min, x_max = float(pts_S[:, 0].min()), float(pts_S[:, 0].max())
+                        eps_S = res.get('endpoints_S', [])
+                        if not eps_S:
+                            self.get_logger().info(
+                                f"scan: pts={len(pts_S)} x=[{x_min:.3f},{x_max:.3f}] z=[{z_min:.3f},{z_max:.3f}] no ep")
+                else:
+                    # 无交线 → 发布空点云，让 RViz 清掉旧帧
+                    pts_2d = np.zeros((0, 3), dtype=np.float32)
+                cloud = pc2.create_cloud(
+                    Header(stamp=stamp, frame_id='gocator_sensor'),
+                    fields, pts_2d)
+                self.gocator_pub.publish(cloud)
+
+                # 发布断点信息（传感器系，正确标记 e1/e2）
+                ep = Float64MultiArray()
+                ep.layout.dim = [MultiArrayDimension(label='endpoints', size=9, stride=9)]
+                ep.layout.data_offset = 0
+                ep_data = [0.0] * 9  # [n_endpoints, e1_x, e1_y, e1_z, e1_valid, e2_x, e2_y, e2_z, e2_valid]
+                eps_S = res.get('endpoints_S', [])
+                ep_data[0] = float(len(eps_S))
+                e1_valid, e2_valid = 0.0, 0.0
+                for et, pt in eps_S:
+                    if et == 'e1':
+                        ep_data[1:4] = pt; e1_valid = 1.0
+                    elif et == 'e2':
+                        ep_data[5:8] = pt; e2_valid = 1.0
+                ep_data[4] = e1_valid
+                ep_data[8] = e2_valid
+                ep.data = ep_data
+                self.endpoint_pub.publish(ep)
 
             except Exception as e:
                 self.get_logger().warn(f'TF/scene publish error: {e}')
