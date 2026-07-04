@@ -27,7 +27,6 @@ sys.path.insert(0, '/workspace/common')
 from plane_calib import (
     solve_plane_he, init_plane_from_scans,
     _unpack_plane_theta, _n_from_angles,
-    compute_fim, parameter_covariance, predict_info_gain,
     compute_laser_plate_intersection,
 )
 from fov_geometry import so3_exp, so3_log, rodrigues, rpy_to_matrix
@@ -609,106 +608,73 @@ class AutoCalibV2Node(Node):
         self._phase2_count = 0
         self._build_phase2()
 
-    # ─── Phase 2: NBV 循环 ──────────────────────────────
+    # ─── Phase 2: Xiao 风格自动采集 ─────────────────────
 
     def _build_phase2(self):
-        """生成首批 NBV 候选 (METHOD.md B.4 Phase 2)"""
-        self.get_logger().info('\n╔══ Phase 2: NBV 循环 ══╗')
+        """Xiao 2022 风格: 生成候选 → 约束过滤 → 随机选取 (无 NBV/FIM)"""
+        self.get_logger().info('\n╔══ Phase 2: 自动采集 (Xiao 风格) ══╗')
 
         if self.C is None or self.n_B is None:
             self.get_logger().error('无板平面估计，无法 Phase 2')
             self._auto_phase = None
             return
 
+        # 生成全量候选并过滤
         self._phase2_candidates = self._generate_candidates()
         if not self._phase2_candidates:
             self.get_logger().error('无有效候选')
             self._auto_phase = None
             return
 
-        self.get_logger().info(
-            f'  候选: {len(self._phase2_candidates)} 个')
+        self._rng.shuffle(self._phase2_candidates)  # 随机顺序
+        self.get_logger().info(f'  候选: {len(self._phase2_candidates)} 个 (随机顺序)')
 
     def _generate_candidates(self):
-        """生成 + 过滤 + FIM 排序候选位姿"""
+        """Xiao Eq.5-7 风格: 生成朝向 → 约束过滤 (无 FIM)"""
         deg = np.deg2rad
         raw = []
 
-        # 生成候选朝向
+        # 生成候选朝向: 绕 RX/RY/RZ ±15°~±25°
         for ang in self._cand_angles:
             for ax in range(3):
-                a = np.zeros(3)
-                a[ax] = 1
+                a = np.zeros(3); a[ax] = 1
                 for sgn in [1, -1]:
                     R_p = rodrigues(a, deg(sgn * ang))
                     R_BS = R_p @ self.R_BS_0
                     raw.append(R_BS)
             # 组合旋转
-            if ang <= 25:
-                for (a1, a2) in [(0, 1), (0, 2), (1, 2)]:
-                    v1 = np.zeros(3); v1[a1] = 1
-                    v2 = np.zeros(3); v2[a2] = 1
-                    a = deg(ang * 0.7)
-                    R_p = rodrigues(v1, a) @ rodrigues(v2, a)
-                    R_BS = R_p @ self.R_BS_0
-                    raw.append(R_BS)
+            for (a1, a2) in [(0, 1), (0, 2), (1, 2)]:
+                v1 = np.zeros(3); v1[a1] = 1
+                v2 = np.zeros(3); v2[a2] = 1
+                a = deg(ang * 0.7)
+                R_p = rodrigues(v1, a) @ rodrigues(v2, a)
+                R_BS = R_p @ self.R_BS_0
+                raw.append(R_BS)
 
-        # 板平面约束 → 传感器位置 (METHOD.md B.4 Phase 2 步骤 2a)
         d_offset = 0.50  # 500mm 工作距离
         candidates = []
         for R_BS in raw:
-            # 传感器位置: t_BS = C + d_offset * n_B
-            # 但还需要保证激光面朝向合理
-            # 简化：t_BS = C + d_offset * n_B
+            # 板平面约束位置: t_BS = C + d_offset * n_B
             t_BS = self.C + d_offset * self.n_B
 
-            # Z 预检查 (步骤 2b): 预测交线 Z 是否接近 Z_0
+            # Z 预检查 (Xiao Eq.6-7 等价)
             pts_pred, seg_len = compute_laser_plate_intersection(
                 self.n_B, self.d_plate, self.C,
-                0.400, 0.500,  # 板尺寸
-                R_BS, t_BS, n_pts=20)
+                0.400, 0.500, R_BS, t_BS, n_pts=20)
             if pts_pred is None or seg_len < 0.03:
                 continue
-
-            # 预测 Z 值
             Z_pred = np.mean(pts_pred[:, 2])
             if abs(Z_pred - self.Z_0) > 0.050:
                 continue
 
-            # 预测扫描点用于 FIM
-            # (交线在传感器系)
             R_BH = R_BS @ self.R_he_nom.T
             t_BH = t_BS - R_BH @ self.t_he_nom
             candidates.append((R_BH, t_BH, R_BS, pts_pred))
 
-        # FIM 排序 (步骤 2d-e)
-        if len(self.records) >= 8 and self.n_B is not None:
-            poses_cur = [(r['R_BH'], r['t_BH']) for r in self.records
-                         if 'R_BH' in r]
-            scans_cur = [r['pts_S'] for r in self.records]
-            # 用板参数构造 theta
-            tn = np.arccos(np.clip(self.n_B[2], -1, 1))
-            pn = np.arctan2(self.n_B[1], self.n_B[0])
-            from plane_calib import _pack_plane_theta
-            theta_cur = _pack_plane_theta(
-                np.zeros(3), self.t_he_nom, tn, pn, self.d_plate)
-
-            def score(c):
-                R_BH, t_BH, R_BS, pts_pred = c
-                gain = predict_info_gain(
-                    theta_cur, scans_cur, poses_cur,
-                    R_BH, t_BH, pts_pred)
-                return gain
-
-            candidates.sort(key=score, reverse=True)
-        else:
-            # 无足够数据 → 随机
-            self._rng.shuffle(candidates)
-
         return candidates
 
     def _next_phase2(self):
-        """Phase 2 下一步"""
+        """Phase 2 下一步 (随机选取, 无 FIM 排序)"""
         if self._phase2_count >= self._phase2_target:
             self._finish_phase2()
             return
@@ -716,6 +682,7 @@ class AutoCalibV2Node(Node):
         # 定期重新生成候选
         if self._phase2_count % 5 == 0 or not self._phase2_candidates:
             self._phase2_candidates = self._generate_candidates()
+            self._rng.shuffle(self._phase2_candidates)
 
         if not self._phase2_candidates:
             self._finish_phase2()
@@ -725,7 +692,7 @@ class AutoCalibV2Node(Node):
         self._phase2_count += 1
         self.get_logger().info(
             f'\n  ── Phase2.{self._phase2_count}/{self._phase2_target}')
-        self._move_to_pose(R_BH, t_BH, f'NBV #{self._phase2_count}')
+        self._move_to_pose(R_BH, t_BH, f'#{self._phase2_count}')
 
     def _finish_phase2(self):
         """Phase 2 完成 → Phase 3"""
