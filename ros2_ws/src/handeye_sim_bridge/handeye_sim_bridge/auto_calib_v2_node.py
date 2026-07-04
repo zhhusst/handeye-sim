@@ -68,16 +68,24 @@ class AutoCalibV2Node(Node):
     def __init__(self):
         super().__init__('auto_calib_v2_node')
 
-        # ─── 名义手眼（URDF真值）─────────────────────
-        rpy = np.array([0.485145, 0.160648, -1.509479])
-        self.R_he_nom = rpy_to_matrix(np.rad2deg(rpy[0]),
-                                       np.rad2deg(rpy[1]),
-                                       np.rad2deg(rpy[2]))
-        self.t_he_nom = np.array([-0.011579, -0.004621, 0.359284])
-
-        # ─── 真值（用于评估）────────────────────────
+        # ─── 手眼真值（URDF）─────────────────────────
         self.R_he_gt = rpy_to_matrix(27.8, 9.2, -86.5)
         self.t_he_gt = np.array([-0.011579, -0.004621, 0.359284])
+
+        # ─── 名义手眼 = 真值 + 扰动（模拟 CAD/卡尺粗略测量）─
+        rng = np.random.RandomState(12345)  # 固定种子，可复现
+        # 旋转扰动: 轴角 ±5° (~0.087 rad std)
+        axis = rng.randn(3); axis /= np.linalg.norm(axis)
+        angle = rng.normal(0, np.deg2rad(5))
+        R_perturb = so3_exp(axis * angle)
+        self.R_he_nom = R_perturb @ self.R_he_gt
+        # 平移扰动: 各轴 ±5mm
+        self.t_he_nom = self.t_he_gt + rng.randn(3) * 0.005
+
+        self.get_logger().info(
+            f'名义手眼 (真值+扰动): '
+            f'R_err={np.rad2deg(np.linalg.norm(so3_log(self.R_he_nom.T @ self.R_he_gt))):.1f}° '
+            f't_err={np.linalg.norm(self.t_he_nom - self.t_he_gt)*1000:.1f}mm')
 
         # ─── TF / 传感器 / 关节 ──────────────────────
         self.tf_buffer = Buffer()
