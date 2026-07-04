@@ -128,6 +128,9 @@ class AutoCalibV2Node(Node):
         # ─── 定时器 ──────────────────────────────────
         self.create_timer(0.2, self._state_machine)
         self.create_timer(0.1, self._keyboard_check)
+        # 自动启动 (无键盘环境测试用, 3秒后触发一次)
+        self._auto_start_triggered = False
+        self._auto_start_count = 0
 
         self.get_logger().info(
             "\n╔══════════════════════════════════════╗\n"
@@ -238,6 +241,19 @@ class AutoCalibV2Node(Node):
     # ─── 状态机 ──────────────────────────────────────────
 
     def _state_machine(self):
+        # 自动启动 (测试用) — 每隔3秒重试直到成功
+        if not self._auto_start_triggered:
+            self._auto_start_count += 1
+            if self._auto_start_count >= 15:  # 3秒
+                self._auto_start_count = 0
+                valid = self._valid(5)
+                self.get_logger().info(f'[AUTO] retry valid={valid} pts={len(self.latest_profile) if self.latest_profile is not None else 0}')
+                if valid:
+                    self._auto_start_triggered = True
+                    self.get_logger().info('[AUTO] 触发 _start()')
+                    self._start()
+                    return
+
         if not hasattr(self, '_auto_phase'):
             return
         if self._state == 'IDLE' and self._auto_queue:
@@ -335,11 +351,7 @@ class AutoCalibV2Node(Node):
     def _on_invalid_move(self):
         """移动后无法获取有效数据"""
         if self._auto_phase == 'PHASE1':
-            self.get_logger().warn('  Phase1 扰动无效，回退锚点')
-            # 回退到锚点
-            self._move_to_pose(self.R_BS_0 @ self.R_he_nom.T,
-                               self._t_BS_0 - (self.R_BS_0 @ self.R_he_nom.T) @ self.t_he_nom,
-                               '回退锚点')
+            self.get_logger().warn('  Phase1 扰动无效，跳过')
             self._next_step()
             return
         if self._auto_phase == 'PHASE2':
@@ -460,8 +472,8 @@ class AutoCalibV2Node(Node):
 
     def _start(self):
         """按 'a' 触发"""
-        if not self._valid(10):
-            self.get_logger().warn('初始位姿无效 (N_pts < 10)')
+        if not self._valid(5):
+            self.get_logger().warn('初始位姿无效 (N_pts < 5)')
             return
         self.get_logger().info('\n╔══ Phase 0: 锚点 ══╗')
         self.records = []
@@ -516,29 +528,29 @@ class AutoCalibV2Node(Node):
         self._phase1_tasks = []
         deg = np.deg2rad
 
-        # pose_1: +X 30mm (沿激光线)
-        self._phase1_tasks.append(('+X 30mm', 'translate',
-                                    np.array([0.03, 0, 0])))
+        # pose_1: +X 15mm (沿激光线)
+        self._phase1_tasks.append(('+X 15mm', 'translate',
+                                    np.array([0.015, 0, 0])))
 
-        # pose_2: -X 30mm
-        self._phase1_tasks.append(('-X 30mm', 'translate',
-                                    np.array([-0.03, 0, 0])))
+        # pose_2: -X 15mm
+        self._phase1_tasks.append(('-X 15mm', 'translate',
+                                    np.array([-0.015, 0, 0])))
 
-        # pose_3: +Z 20mm (靠近板)
-        self._phase1_tasks.append(('+Z 20mm', 'translate',
-                                    np.array([0, 0, 0.02])))
+        # pose_3: +Z 10mm (靠近板)
+        self._phase1_tasks.append(('+Z 10mm', 'translate',
+                                    np.array([0, 0, 0.010])))
 
-        # pose_4: RY +10°
-        self._phase1_tasks.append(('RY +10°', 'rotate',
-                                    rodrigues(np.array([0, 1, 0]), deg(10))))
+        # pose_4: RY +5°
+        self._phase1_tasks.append(('RY +5°', 'rotate',
+                                    rodrigues(np.array([0, 1, 0]), deg(5))))
 
-        # pose_5: RY -10°
-        self._phase1_tasks.append(('RY -10°', 'rotate',
-                                    rodrigues(np.array([0, 1, 0]), deg(-10))))
+        # pose_5: RY -5°
+        self._phase1_tasks.append(('RY -5°', 'rotate',
+                                    rodrigues(np.array([0, 1, 0]), deg(-5))))
 
-        # pose_6: RZ +8° (平面内旋转)
-        self._phase1_tasks.append(('RZ +8°', 'rotate',
-                                    rodrigues(np.array([0, 0, 1]), deg(8))))
+        # pose_6: RZ +5° (平面内旋转)
+        self._phase1_tasks.append(('RZ +5°', 'rotate',
+                                    rodrigues(np.array([0, 0, 1]), deg(5))))
 
     def _next_step(self):
         """Phase 1/2 的步骤调度"""
