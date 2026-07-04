@@ -24,6 +24,7 @@ setup(
           os.path.join(package_name, 'scene_publisher_node.py'),
           os.path.join(package_name, 'srdf_publisher_node.py'),
           os.path.join(package_name, 'auto_calib_node.py'),
+          os.path.join(package_name, 'auto_calib_v2_node.py'),
           os.path.join(package_name, 'auto_servo_collect.py'),
           os.path.join(package_name, 'replay_calib_poses.py')]),
     ],
@@ -40,7 +41,9 @@ setup(
             'scene_publisher_node = handeye_sim_bridge.scene_publisher_node:main',
             'srdf_publisher_node = handeye_sim_bridge.srdf_publisher_node:main',
             'auto_calib_node = handeye_sim_bridge.auto_calib_node:main',
+            'auto_calib_v2 = handeye_sim_bridge.auto_calib_v2_node:main',
             'auto_servo_collect = handeye_sim_bridge.auto_servo_collect:main',
+            'auto_collect = handeye_sim_bridge.auto_collect:main',
         ],
     },
 )
