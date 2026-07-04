@@ -506,35 +506,31 @@ class AutoCalibV2Node(Node):
     # ─── Phase 1: 探索运动 ─────────────────────────────
 
     def _build_phase1(self):
-        """6 扰动: +X, -X, +Z, RY+, RY-, RZ+ (METHOD.md B.4 Phase 1)"""
-        self.get_logger().info('\n╔══ Phase 1: 探索运动 (6 扰动) ══╗')
+        """6 扰动: 关节空间小幅偏移 (METHOD.md B.4 Phase 1)"""
+        self.get_logger().info('\n╔══ Phase 1: 探索运动 (6 关节扰动) ══╗')
+
+        # 记录锚点关节角
+        self._anchor_joints = self.latest_joints.copy()
 
         self._phase1_tasks = []
         deg = np.deg2rad
 
-        # pose_1: +X 8mm (沿激光线)
-        self._phase1_tasks.append(('+X 8mm', 'translate',
-                                    np.array([0.008, 0, 0])))
+        # 每次扰动: 一个关节 ±2~3°，保持其他关节不变
+        # 使用关节空间扰动 → 不经过 IK → 保证小幅度安全移动
+        perturbations = [
+            ('J4 +2°', 3, deg(2)),          # J4 正转
+            ('J4 -2°', 3, deg(-2)),         # J4 反转
+            ('J5 +2°', 4, deg(2)),          # J5 正转
+            ('J5 -2°', 4, deg(-2)),         # J5 反转
+            ('J6 +3°', 5, deg(3)),          # J6 正转(手腕旋转)
+            ('J6 -3°', 5, deg(-3)),         # J6 反转
+        ]
 
-        # pose_2: -X 8mm
-        self._phase1_tasks.append(('-X 8mm', 'translate',
-                                    np.array([-0.008, 0, 0])))
-
-        # pose_3: +Z 5mm (靠近板)
-        self._phase1_tasks.append(('+Z 5mm', 'translate',
-                                    np.array([0, 0, 0.005])))
-
-        # pose_4: RY +3°
-        self._phase1_tasks.append(('RY +3°', 'rotate',
-                                    rodrigues(np.array([0, 1, 0]), deg(3))))
-
-        # pose_5: RY -3°
-        self._phase1_tasks.append(('RY -3°', 'rotate',
-                                    rodrigues(np.array([0, 1, 0]), deg(-3))))
-
-        # pose_6: RZ +5° (平面内旋转)
-        self._phase1_tasks.append(('RZ +5°', 'rotate',
-                                    rodrigues(np.array([0, 0, 1]), deg(5))))
+        for label, joint_idx, offset in perturbations:
+            joints = self._anchor_joints.copy()
+            joints[joint_idx] += offset
+            # 直接保存关节角，不走 IK
+            self._phase1_tasks.append((label, 'joints', joints))
 
     def _next_step(self):
         """Phase 1/2 的步骤调度"""
@@ -553,18 +549,18 @@ class AutoCalibV2Node(Node):
         self._phase1_step += 1
         self.get_logger().info(f'\n  ── Phase1.{self._phase1_step}: {label}')
 
-        if mtype == 'translate':
-            # 传感器系平移 → vTCP 方程 → 法兰位姿
+        if mtype == 'joints':
+            # 关节空间扰动 — 直接发关节角，不走 IK
+            self._auto_queue.append((label, param))
+        elif mtype == 'translate':
             t_BS_new = self.t_BS_0 + self.R_BS_0 @ param
             R_BS_new = self.R_BS_0
             R_BH = R_BS_new @ self.R_he_nom.T
             t_BH = t_BS_new - R_BH @ self.t_he_nom
             self._move_to_pose(R_BH, t_BH, label)
-
         elif mtype == 'rotate':
-            R_p = param  # 旋转矩阵 (绕传感器轴)
+            R_p = param
             R_BS_new = R_p @ self.R_BS_0
-            # vTCP 约束：保持激光中心打在同一点
             t_BS_new = self.vTCP - R_BS_new @ np.array([0, 0, self.Z_0])
             R_BH = R_BS_new @ self.R_he_nom.T
             t_BH = t_BS_new - R_BH @ self.t_he_nom
