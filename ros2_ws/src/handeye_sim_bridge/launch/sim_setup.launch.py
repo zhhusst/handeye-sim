@@ -103,6 +103,9 @@ def generate_launch_description():
     scene_pub = Node(
         package='handeye_sim_bridge', executable='scene_publisher_node',
         parameters=[{'use_sim_time': True}], output='screen')
+    profile_viz = Node(
+        package='handeye_sim_bridge', executable='profile_viz',
+        parameters=[{'use_sim_time': True}], output='screen')
     rviz = Node(
         package='rviz2', executable='rviz2',
         arguments=['-d', rviz_config],
@@ -114,5 +117,5 @@ def generate_launch_description():
         TimerAction(period=5.0, actions=[LogInfo(msg='Spawning robot...'), spawn_gz]),
         TimerAction(period=7.0, actions=[LogInfo(msg='Loading controllers...'), load_ctrl, spawn_jsb, spawn_jtc]),
         TimerAction(period=9.0, actions=[LogInfo(msg='Starting MoveIt2...'), move_group]),
-        TimerAction(period=14.0, actions=[LogInfo(msg='Starting visualization...'), srdf_pub, scene_pub, rviz]),
+        TimerAction(period=14.0, actions=[LogInfo(msg='Starting visualization...'), srdf_pub, scene_pub, profile_viz, rviz]),
     ])

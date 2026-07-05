@@ -1,549 +1,578 @@
-# 平板角点法手眼标定：12-DOF 完整方法
+# 线激光平板角点法手眼标定：12-DOF 完整方法
 
-> 日期：2026-07-03
-> 状态：✅ 实测验证 — R=0.0225°, t=0.09mm（9 个角点位姿，3 朝向）
-> 
-> 理论基础：`/home/z/research_contact_handeye/verification/Num2/PRINCIPLE.md`（§2-5：gauge 分析、信息效率、对称群证明）
-> 代码：`calibrate.py`、`auto_calib_node.py`、`common/calib_solver.py`
+> 最后修订：2026-07-04
+> 状态：✅ 9 个角点位姿实测 R=0.0225°, t=0.09mm
 
 ---
 
-## 一、理论框架
+## 目录
 
-### 1.1 动机：为什么需要角点
+**第一部分：理论框架**
+1. [问题定义与坐标系](#1-问题定义与坐标系)
+2. [纯平面约束的局限性](#2-纯平面约束的局限性)
+3. [角点法：数学模型](#3-角点法数学模型)
+4. [Gauge 消除：完整的对称性证明](#4-gauge-消除完整的对称性证明)
 
-线激光 + 单平面标定（Sharifzadeh 2020）的瓶颈：$n_B$（平板法向量）和 $R_{he}$（手眼旋转）在约束方程中以乘积形式出现——
+**第二部分：求解器与实现**
+5. [三种求解器形式](#5-三种求解器形式)
+6. [初始化与多重重启策略](#6-初始化与多重重启策略)
 
-$$n_B^T \cdot \big(R_i(R_{he} \cdot p_S + t_{he}) + t_i\big) = d_B$$
+**第三部分：自动化采集**
+7. [角点伺服：Xiao 2022 线激光等价](#7-角点伺服xiao-2022-线激光等价)
+8. [自动化管线设计](#8-自动化管线设计)
 
-单个位姿只能给出 $n_B^T R_i R_{he}$ 这一个组合——法向量和旋转"耦合"在一起，单个位姿下无法分离。每个位姿贡献约 2 个有效独立方程（1 个来自平面平移梯度 $n_B^T R_i$，1 个来自旋转梯度 $n_B^T R_i R p_S$），需要 ~48 个位姿积累足够多样性才能把耦合撕开。
+**第四部分：验证与结论**
+9. [仿真验证结果](#9-仿真验证结果)
 
-**平板角点打破这个耦合**：引入两条正交边的断点。边约束走面内方向（$v_B$, $n_{\perp 2}$），平面约束走法向（$n_B$）。三个方向线性独立（PRINCIPLE.md §2.4 证明）→ 每个角点位姿贡献 ~4 个有效独立方程。**信息密度翻倍，理论最少位姿从 5 降到 3。**
+**附录**
+A. [完整 Jacobian 推导](#附录-a完整-jacobian-推导)
+B. [代码清单与版本差异](#附录-b代码清单与版本差异)
 
-| | 纯平面（Sharifzadeh） | 角点法 |
+---
+
+# 第一部分：理论框架
+
+## 1. 问题定义与坐标系
+
+### 1.1 问题陈述
+
+**给定**：
+- 线激光传感器（如 Gocator）固定在机器人末端法兰上
+- 标定板是已知尺寸 $w \times h$ 的平板，置于工作空间
+- 机器人可执行 $M$ 个不同位姿，激光扫描线穿过板角区域，产生断点
+
+**目标**：估计手眼变换 $R_{he} \in SO(3)$ 和 $t_{he} \in \mathbb{R}^3$（传感器坐标系 $S$ 到法兰坐标系 $H$）
+
+### 1.2 坐标系
+
+| 坐标 | 符号 | 含义 |
 |:--|:--|:--|
-| 未知数 | 10 | 12 |
-| 每 pose $t_{he}$ 梯度方向 | $\{n_B^T R_i\}$ — 1 个 | $\{v_B^T R_i, n_{\perp 2}^T R_i, n_B^T R_i\}$ — 3 个 |
-| 每 pose 有效独立方程 | ≈ 2 | ≈ 4 |
-| 理论最少位姿 | 5 | **3** |
-| 实际推荐位姿数 | 48 | **6-9** |
+| $B$ | 基座标系 | 机器人基座，世界坐标系 |
+| $H_i$ | 法兰坐标系 | 第 $i$ 个位姿时的机器人末端 |
+| $S$ | 传感器坐标系 | 线激光（$y=0$ 为激光平面） |
+| $P$ | 平板坐标系 | 以角点 $C$ 为原点，$u_B$ 为边 1 方向，$v_B$ 为边 2 方向，$n_B = u_B \times v_B$ 为法向量 |
 
-**精度不是主打**——48 位姿的统计平均效应本身有精度优势。我们的 claim 是：**同等精度可以用更少的位姿达到，且位姿选择有理论指导**（Jacobian 秩分析告诉你旋转不能全共轴、平移不能全共面）。
+### 1.3 基本变换
 
-### 1.2 数学模型
+传感器点 → 基座标系：
 
-**状态向量**（12 参数）：
+$$p_B = R_i(R_{he} \cdot p_S + t_{he}) + t_i \tag{1}$$
+
+其中 $(R_i, t_i)$ 为第 $i$ 个位姿时法兰在基座标系下的位姿（由 FK 给出）。
+
+### 1.4 已知量与未知量
+
+**已知**：$(R_i, t_i)$（机器人 FK）、平板尺寸 $w \times h$、扫描线断点坐标 $p_{S,e1}, p_{S,e2}$
+
+**未知**（12 参数）：
 
 $$\theta = [\omega_{he}(3),\; t_{he}(3),\; \omega_{pl}(3),\; C(3)] \in \mathbb{R}^{12}$$
 
-| 参数 | 含义 |
-|:--|:--|
-| $\omega_{he}$ | 手眼旋转（轴角），$R_{he} = \exp([\omega_{he}]_\times)$，传感器→法兰 |
-| $t_{he}$ | 手眼平移（传感器→法兰） |
-| $\omega_{pl}$ | 平板姿态（轴角），$R_{pl} = [u_B, v_B, n_B]$，$u_B$ 对齐边 1 |
-| $C$ | 角点在基座标系下的位置（两正交边的交点） |
+| 参数 | 维度 | 参数化 | 含义 |
+|:--|:--|:--|:--|
+| $\omega_{he}$ | 3 | 轴角，$R_{he} = \exp([\omega_{he}]_\times)$ | 手眼旋转 |
+| $t_{he}$ | 3 | 笛卡尔 | 手眼平移 |
+| $\omega_{pl}$ | 3 | 轴角，$R_{pl} = [u_B, v_B, n_B]$ | 平板朝向 |
+| $C$ | 3 | 笛卡尔 | 角点在基座标系中的位置 |
 
-**已知量**：$R_i, t_i$（FK）、断点 $p_{S,e1}, p_{S,e2}$（Gocator 扫描线端点落在板边处）、平板尺寸 $w \times h$。
+*为什么是 12 参数？* 手眼变换需要 6 个参数（SO(3) + 平移），平板需要 3 个朝向参数（SO(3) 平板局部坐标系），角点需要 3 个位置参数。平板朝向需要 3 个参数（而非 2 个），因为面内旋转（$u_B, v_B$ 绕 $n_B$ 的定向）由边缘约束锁定——面内旋转在纯平面约束下不可观测，但角点法的边缘约束使其成为可观测量。
 
-**坐标系变换**（传感器→法兰→基座标）：
+---
 
-$$p_B = R_i(R_{he} \cdot p_S + t_{he}) + t_i$$
+## 2. 纯平面约束的局限性
 
-**约束方程**（PRINCIPLE.md §4.3，通用记法适用于任意已知夹角 $\alpha \neq 0,\pi$）：
+### 2.1 约束方程
 
-$$r_{e1} = v_B^T \cdot (p_{B,e1} - C) = 0 \quad\text{（边 1：断点到 $u_B$ 方向线的垂直距离为零）}$$
+纯平面（Sharifzadeh 2020）的约束：激光点落在平板上：
 
-$$r_{e2} = n_{\perp 2}^T \cdot (p_{B,e2} - C) = 0 \quad\text{（边 2：断点到 $d_2$ 方向线的垂直距离为零）}$$
+$$n_B^T \cdot (R_i(R_{he} \cdot p_S + t_{he}) + t_i) = d_B \tag{2}$$
 
-$$r_{plane} = n_B^T \cdot (p_B - C) = 0 \quad\text{（平面：点落在过 $C$ 的平板上）}$$
+其中 $d_B$ 为平面到基座标系原点的距离。
 
-其中边 2 方向 $d_2 = \cos\alpha \cdot u_B + \sin\alpha \cdot v_B$，边 2 法向量 $n_{\perp 2} = n_B \times d_2 = \cos\alpha \cdot v_B - \sin\alpha \cdot u_B$。
+### 2.2 耦合结构
 
-本文实际场景为**直角矩形板**（$\alpha = \pi/2$），此时 $n_{\perp 2} = -u_B$，$d_2 = v_B$，边 2 约束退化为 $u_B^T \cdot (p_{B,e2} - C) = 0$。
+方程 (2) 中，$n_B$ 和 $R_{he}$ 以乘积形式出现：$n_B^T R_i R_{he} p_S$。固定 $n_B^T R_i R_{he}$ 这个组合的值，$n_B$ 和 $R_{he}$ 可以联合变化而残差不变——这就是 $n_B$-$R$ 耦合。这是 gauge 的根源，不是数值问题。
 
-### 1.3 为什么共享角点消除 Gauge（耦合机制）
+### 2.3 信息效率分析
 
-**关键洞察**（PRINCIPLE.md §3.2）：两条边共享同一个 $C$，而非各有独立原点。
+考察约束对 $t_{he}$ 的梯度：
 
-**若两条边有独立原点 $C_1, C_2$**：平移变换 $t_{he} \to t_{he} + \delta$ 可与 $C_1 \to C_1 + \Delta_1$、$C_2 \to C_2 + \Delta_2$ 联合补偿。令 $A_i = R_i\delta$，两边的残差变化分别为 $(A_i - \Delta_1)^T v_B = 0$ 和 $(A_i - \Delta_2)^T n_{\perp 2} = 0$。$\Delta_1$ 和 $\Delta_2$ 独立 → 存在非零的 $(\delta, \Delta_1, \Delta_2)$ 使两式同时成立 → **多维权衡空间（gauge）**。
+$$\frac{\partial}{\partial t_{he}} \big(n_B^T R_i(R_{he} p_S + t_{he}) + t_i - d_B\big) = n_B^T R_i$$
 
-**角点法中共享 $C$**：只有单一 $\Delta$（$C \to C + \Delta$）。两边约束同时施加在同一个 $\Delta$ 上：
+**关键事实**：一个位姿的所有平面点共享同一个 $t_{he}$ 梯度方向——$n_B^T R_i$（一个 $1 \times 3$ 行向量）。这意味着：
+- 每个位姿只贡献 $t_{he}$ 方向上的 1 个有效独立方程
+- 要覆盖 $t_{he}$ 的全部 3 个方向，需要不同 $R_i$ 产生独立性
 
-$$A_i = R_i\delta - \Delta$$
+对旋转参数 $\omega_{he}$ 的可观测性同理：$n_B^T R_i \cdot [R_{he}p_S]_\times$ 虽随 $p_S$ 变化，但所有平面点在 $t_{he}$ 方向上共享同一个梯度子空间 → 每个位姿贡献 ≈2 个有效独立方程。
 
-边 1：$A_i^T v_B = 0 \;\Rightarrow\; A_i \perp v_B$；边 2：$A_i^T n_{\perp 2} = 0 \;\Rightarrow\; A_i \perp n_{\perp 2}$。
+**结论**：纯平面约束下每个位姿 ≈2 个有效独立方程。覆盖 10 个未知参数（$R_{he}, t_{he}, n_B, d_B$）需要至少 5 个位姿（理论下界），实际需要更多（如 Sharifzadeh 的 48 个）来克服信息重叠。
 
-$v_B$ 和 $n_{\perp 2}$ 张成平板面 → $A_i \parallel n_B$，即：
+---
 
-$$R_i\delta - \Delta = \lambda_i n_B \quad \forall i \tag{★}$$
+## 3. 角点法：数学模型
 
-方程 (★) 对不同 $R_i$ 给出不同的 $\lambda_i$。仅用边缘约束时，$\delta = 0$ 且 $\Delta = \alpha n_B$（$\Delta$ 沿法向自由）是残差不变的解——**1 维残余 gauge**。
+### 3.1 核心思想
 
-加上平面约束 $n_B^T \cdot (p_B - C) = 0$：$C \to C + \alpha n_B$ 时平面残差变化 $n_B^T \cdot \alpha n_B = \alpha \neq 0$ → 残余 gauge 被消灭。
+线激光扫描线同时穿过板角区域时，轮廓两端出现两个断点——分别落在两条正交边上。**两条边共享同一个角点 $C$ 作为坐标系原点**，这引入了物理一致性约束，从根本上压缩了 gauge 群。
 
-**对称群从多维压缩到平凡。** 这就是角点法每 pose 信息效率翻倍的数学根源（PRINCIPLE.md §2.4-2.5）。
+### 3.2 约束方程（C-anchored 形式）
 
-### 1.4 代码实现中的残差形式
+**边 1 约束**（断点 $p_{S,e1}$ 落在 $u_B$ 方向线上）：
 
-对于直角矩形板（$\alpha = \pi/2$），代码使用等价的 cross-product 形式：
+$$\boxed{v_B^T \cdot (p_{B,e1} - C) = 0} \tag{Ed1-s}$$
 
-```python
-# 状态: θ = [ω_he(3), t_he(3), ω_pl(3), C(3)] — 12 参数
-R_he = so3_exp(ω_he)
-[u_B, v_B, n_B] = so3_exp(ω_pl).T  # R_pl 的列
+等价于 cross-product 形式：$\operatorname{cross}(p_{B,e1} - C, u_B) = 0$。后者同时隐含 $v_B^T(p_{B,e1}-C)=0$ 和 $n_B^T(p_{B,e1}-C)=0$，其中 $n_B^T(\cdots)=0$ 与平面约束冗余。
 
-p_B = R_i @ (R_he @ p_S + t_he) + t_i
+**边 2 约束**（断点 $p_{S,e2}$ 落在 $v_B$ 方向线上，直角板情况）：
 
-r_e1 = cross(p_B_e1 - C, u_B)     # 3 分量, 2 独立 (⟂ u_B)
-r_e2 = cross(p_B_e2 - C, v_B)     # 3 分量, 2 独立 (⟂ v_B)
-r_plane = n_B @ (p_B - C)         # 1 分量
-```
+$$\boxed{u_B^T \cdot (p_{B,e2} - C) = 0} \tag{Ed2-s}$$
 
-$cross(p - C, u_B) = 0$ 强制 $p - C \parallel u_B$，等价于 $v_B^T(p-C) = 0$ **且** $n_B^T(p-C) = 0$（前者是边 1 约束，后者与平面约束冗余）。同理 $cross(p - C, v_B) = 0$ 等价于 $u_B^T(p-C) = 0$ 且 $n_B^T(p-C) = 0$。代码用满 3 分量是为了简洁——LM 的 pseudoinverse 自动处理冗余。
+等价于 $\operatorname{cross}(p_{B,e2} - C, v_B) = 0$。
 
-**与旧 9-DOF 的关键区别**：① 边约束过 $C$（不用差向量）；② 平面不去心（相对于 $C$）。旧 9-DOF 的 `plane_vals - mean(plane_vals)` 消除绝对参考点 → $t_{he}$ 沿 $n_B$ 存在 1-DOF gauge → Jacobian 秩 = 8 < 9。
+**平面约束**（所有激光点落在过 $C$ 的平面上）：
 
-**12-DOF Gauge 证明**（cross-product 形式）：
+$$\boxed{n_B^T \cdot (p_B - C) = 0} \tag{Pl}$$
 
-假设 $C \to C + \delta_C$、$t_{he} \to t_{he} + \delta_t$ 使所有残差不变。
+### 3.3 通用夹角记法
 
-- 边 1：$cross(\delta_C, u_B) = 0$ → $\delta_C \parallel u_B$
-- 边 2：$cross(\delta_C, v_B) = 0$ → $\delta_C \parallel v_B$
-- $u_B \perp v_B$ → **$\delta_C = 0$**（边约束单独锁定 $C$）
+对非直角的已知夹角 $\alpha$（边 2 方向 $d_2 = \cos\alpha \cdot u_B + \sin\alpha \cdot v_B$），边 2 法向量为：
 
-带 $\delta_C = 0$：
-- 边 1：$cross(R_i\delta_t, u_B) = 0$ → $R_i\delta_t \parallel u_B$
-- 边 2：$cross(R_i\delta_t, v_B) = 0$ → $R_i\delta_t \parallel v_B$
-- 平面：$n_B \cdot R_i\delta_t = 0$ → $R_i\delta_t \perp n_B$
+$$n_{\perp 2} = n_B \times d_2 = \cos\alpha \cdot v_B - \sin\alpha \cdot u_B$$
 
-$R_i\delta_t$ 同时 ∥ $u_B$、∥ $v_B$、⟂ $n_B$ → $R_i\delta_t = 0$ → **$\delta_t = 0$**。
+边 2 约束通用形式：$n_{\perp 2}^T \cdot (p_{B,e2} - C) = 0$。
 
-$\delta_\omega = 0$ 类似论证（若 $\omega_{pl}$ 改变 → $u_B, v_B, n_B$ 方向改变 → 残差非零）。
+当 $\alpha = \pi/2$（直角板）：$n_{\perp 2} = -u_B$，退化为 $u_B^T(p-C)=0$。
 
-**QED：12-DOF 满秩，Jacobian 秩 = 12，无需正则化。**
+### 3.4 自由度统计
 
-### 1.5 与 PRINCIPLE.md 的对应关系
-
-代码与 PRINCIPLE.md 理论框架完全一致，仅有实现层面的等价变换：
-
-| PRINCIPLE.md | 代码 (`calib_solver.py`) | 说明 |
+| 约束 | 每姿态度量数 | 独立秩（每 pose） |
 |:--|:--|:--|
-| $v_B^T(p-C)=0$（边 1，标量） | `cross(p-C, u_B)`（3 分量） | 等价：$cross=0 \iff p-C \parallel u_B \iff v_B^T(p-C)=0$ 且 $n_B^T(p-C)=0$。后者与平面约束冗余 |
-| $n_{\perp 2}^T(p-C)=0$（边 2） | `cross(p-C, v_B)`（3 分量） | 直角 $(\alpha=\pi/2)$ 时 $n_{\perp 2}=-u_B$，$cross(p-C, v_B)=0 \iff u_B^T(p-C)=0$ |
-| $n_B^T(p_B-C)=0$（平面） | `n_B @ (p_B-C)` | 完全一致 |
-| 状态 $\theta = [\omega_{he}, t_{he}, \omega_{pl}, C]$ | 同 | 完全一致 |
-| Jacobian 解析推导 | 有限差分（$\epsilon=10^{-6}$） | 实现选择：解析形式仅用于信息效率分析，LM 用有限差分更简单 |
+| 边 1：$v_B^T(p_{e1}-C)=0$ | 1 | 1 |
+| 边 2：$u_B^T(p_{e2}-C)=0$ | 1 | 1 |
+| 平面：$n_B^T(p-C)=0$（$N_p$ 点） | $N_p$ | $\le 2$（点间 $t$ 梯度线性相关） |
+| **合计** | $N_p+2$ | $\approx 4$ |
 
-**差异**：代码的 cross-product 形式将平面约束嵌入边约束中（边断点同时满足边和平面），对 LM 无影响（pseudoinverse 自动处理冗余行）。
+- $t_{he}$ 方向：$\{v_B^T R_i, u_B^T R_i, n_B^T R_i\}$ 三个线性独立方向 → 满覆盖 $\mathbb{R}^3$
+- 覆盖 12 DOF 理论下界：$\lceil 12/4 \rceil = 3$ 个位姿
 
-### 1.6 $u_B \leftrightarrow v_B$ 对称性被打破
+### 3.5 C-anchored cross-product 残差（代码形式）
 
-旧 9-DOF $cross(p_B^{[k+1]} - p_B^{[k]}, u_B) = 0$ 中 $C$ 被差向量消去 → 交换 $u_B$、$v_B$ 同时重标断点所属边，残差不变 → ~90° 对称解。
+将边约束写为 3 分量 cross-product 确保与代码完全一致：
 
-12-DOF $cross(p_B - C, u_B) = 0$ 中 $C$ 是锚点。$p_{B,e1}$ 的测量值在 $u_B$ 线上（不在 $v_B$ 线上）→ 交换 $u_B \leftrightarrow v_B$ 后 $cross(p_{B,e1} - C, v_B) \neq 0$。**对称性被 $C$ 的自然物理含义打破。** 实测确认无对称解残留。
+$$\begin{aligned}
+r_{e1} &= \operatorname{cross}(p_{B,e1} - C,\; u_B) \in \mathbb{R}^3 \\
+r_{e2} &= \operatorname{cross}(p_{B,e2} - C,\; v_B) \in \mathbb{R}^3 \\
+r_{\text{plane}} &= n_B^T(p_B - C) \in \mathbb{R}
+\end{aligned}$$
 
----
-
-## 二、求解管线
-
-### 2.1 闭式解 $R_{he}$（Xu 2021 直边法，可选）
-
-**核心观察**：同一法兰朝向 $R_b$ 下，同一条边上的所有断点共线——**这个约束只依赖 $R_{he}$**，不依赖 $C$ 或平板位置。
-
-两点差 $u_b = R_b R_{he} u_s + u_t$（$u_s = p_S^{[j]} - p_S^{[i]}$，$u_t = t_i^{[j]} - t_i^{[i]}$），三点的共线性：
-
-$$\| u_b^{[ij]} \times u_b^{[ik]} \| = 0$$
-
-关键项 $R_b R_{he}(u_s^{[ij]} \times u_s^{[ik]})$ 中，叉积在传感器 $XZ$ 平面内 → 纯沿 $y$ 方向 → **$R_{he}$ 的中间列出现**（与平面约束不同，后者 $y=0$ 消掉中间列）。利用 Kronecker 积线性化为 $A \cdot \text{vec}(R_{he}) = b$，堆叠所有朝向 × 所有边 × 所有三点组 → SVD 最小二乘 → 投影到 SO(3)。
-
-**局限性**：从 $R=I$ 出发，阻尼 Gauss-Newton 限制步长 >30°。当真实 $R_{he}$ 距 $I$ 超过 ~30° 时（如仿真中 RPY ≈ 92.5°），闭式解几乎不动。因此 2.3 节的多重重启是必需的。
-
-### 2.2 初始化 $t_{he}$、$\omega_{pl}$、$C$
-
-给定候选 $R_{cf}$（来自闭式解或随机采样），估算其余 9 个参数：
-
-1. **$t_{he}$ 线性解**：跨朝向边距离约束 $v_B^T \cdot (R_j - R_i) \cdot t_{he} = \cdots$，消去未知 $C$ → 线性最小二乘
-2. **$\omega_{pl}$ 估算**：用 $(R_{cf}, t_{cf})$ 将断点变换到基座标系，同朝向内 SVD 拟合边方向 → 正交化 → $R_{pl}$
-3. **$C$ 估算**：两条边线在基座标系中的最小二乘交点（含法向分量由平面约束确定）
-
-### 2.3 12-DOF LM — 多重随机重启
-
-闭式解不可靠时的解决方案：在 SO(3) 上均匀采样 $N=20$ 个随机初始旋转，各运行完整 `init_12dof()` + `solve_12dof_lm()`，选 cost 最低的解。
-
-```python
-theta_opt, info = solve_12dof_with_restarts(poses, meas, n_restarts=20)
-# info = {'n_good': 17, 'n_tried': 20, 'best_cost': 2.57e-06}
-```
-
-实测：所有法兰旋转 >140° 时（闭式解仅移动 0.001°），17/20 重启收敛到 R=0.02°。3 个未收敛的落入对称分支（cost 略高，可通过平板尺寸 post-hoc 排除）。
-
-**LM 参数**：$\lambda_0 = 10^{-4}$，有限差分 Jacobian（$\epsilon = 10^{-6}$），无正则化，满秩系统快速收敛。
-
-### 2.4 完整流水线
-
-```
-采集 6-9 个位姿（≥2 朝向，角点+纯边混合）
-    ↓
-20 次随机重启:
-  R_rand ← random SO(3) sample
-  θ_init = init_12dof(poses, meas, R_cf=R_rand)
-  θ_opt = solve_12dof_lm(θ_init)            ← 满秩 LM
-    ↓
-选 cost 最低的解
-    ↓
-post-hoc: 平板尺寸合规检查（断点投影是否在 [0,400mm]/[0,500mm] 内）
-    ↓
-R_he, t_he, ω_pl, C
-```
+cross-product 为零等价于向量平行：$r_{e1}=0 \iff p_{B,e1}-C \parallel u_B \iff v_B^T(p_{B,e1}-C)=0$（边 1）$\land\; n_B^T(p_{B,e1}-C)=0$（与平面冗余）。LM 的伪逆自动处理冗余行。
 
 ---
 
-## 三、采集操作指南
+## 4. Gauge 消除：完整的对称性证明
 
-### 3.1 启动
+### 4.1 定义
 
-```bash
-cd /home/z/research_contact_handeye/verification/Sim
-./start.sh --tmux
-```
+令 $r: \mathbb{R}^{12} \to \mathbb{R}^m$ 为所有位姿的所有约束堆叠成的残差向量。
 
-### 3.2 键盘控制（auto_calib_node）
+**定义**：一个非平凡变换 $g \neq \operatorname{id}$ 是 **gauge 变换**，若对所有可能的数据 $r(g\theta) = r(\theta)$。
 
-| 按键 | 作用 |
+### 4.2 前件
+
+- $p_{B} = R_i(R_{he}p_S + t_{he}) + t_i$
+- Assumption 1 (旋转非退化)：$\operatorname{span}\{R_i^T v_B, R_i^T u_B\}_{i=1}^M = \mathbb{R}^3$
+- Assumption 2 (平移非退化)：$\{t_i\}_{i=1}^M$ 张成 $\mathbb{R}^3$
+
+### 4.3 平移 Gauge
+
+考虑变换 $(t_{he}, C) \to (t_{he} + \delta, C + \Delta)$。
+
+**边约束**：断点 $p_{B,e1}$ 变为 $p_{B,e1} + R_i\delta$。
+
+边 1：$v_B^T(p_{B,e1} + R_i\delta - C - \Delta) = v_B^T(p_{B,e1} - C) + v_B^T(R_i\delta - \Delta)$
+
+要求对所有 $i$ 残差不变，即 $v_B^T(R_i\delta - \Delta) = 0$：
+
+$$v_B^T R_i\delta = v_B^T \Delta \quad \forall i \tag{★}$$
+
+这意味着标量 $v_B^T R_i\delta$ 对所有 $i$ 取相同常数 $c_1 = v_B^T \Delta$。取任意 $i, j$ 相减：
+
+$$v_B^T(R_i - R_j)\delta = 0 \quad \forall i,j$$
+
+即 $\delta \perp (R_i - R_j)^T v_B$ 对所有 $i,j$。令 $D_v = \operatorname{span}\{(R_i - R_j)^T v_B : i,j=1...M\}$，则 $\delta \in D_v^\perp$。
+
+同理，边 2 给出 $\delta \in D_u^\perp$，其中 $D_u = \operatorname{span}\{(R_i - R_j)^T u_B\}$。
+
+由 Assumption 1，$\operatorname{span}\{R_i^T v_B, R_i^T u_B\} = \mathbb{R}^3$。其差分子空间 $D_v$ 和 $D_u$ 的维数分别至少为 $\dim(\operatorname{span}\{R_i^T v_B\}) - 1$ 和 $\dim(\operatorname{span}\{R_i^T u_B\}) - 1$。当两个差分子空间的并集张成 $\mathbb{R}^3$ 时，$D_v^\perp \cap D_u^\perp = \{0\}$。
+
+**因此 $\delta = 0$。** ∎
+
+代入 $\delta = 0$：边 1 → $v_B^T \Delta = 0$，边 2 → $u_B^T \Delta = 0$ → $\Delta \parallel n_B$，即 $\Delta = \alpha n_B$（1-DOF 残余 gauge）。
+
+**平面约束破除法向残余**：$C \to C + \alpha n_B$，平面残差 → $n_B^T(p_B - C - \alpha n_B) = n_B^T(p_B - C) - \alpha \neq n_B^T(p_B - C)$，除非 $\alpha = 0$。
+
+**因此 $\Delta = 0$。** ∎
+
+### 4.4 旋转 Gauge
+
+**定理**：若 $(v_B, u_B, n_B, R_{he}) \to (Sv_B, Su_B, Sn_B, R_{he}S^T)$（$S \in SO(3)$）保持所有约束不变，则 $S = I$。
+
+**证明**：考虑边 1 约束在变换下的形式：
+
+$$r'_{e1} = (Sv_B)^T \cdot (R_i(R_{he}S^T p_{S,e1} + t_{he}) + t_i - C)$$
+
+$r'_{e1}$ 中 $t_i$ 的系数为 $(Sv_B)^T$。为使 $r'_{e1} = r_{e1}$ 对所有位姿 $i$ 成立，$t_i$ 的系数必须相等：$(Sv_B)^T t_i = v_B^T t_i$ 对所有 $i$。
+
+提取公共项：$(Sv_B - v_B)^T t_i = 0 \;\forall i$。由 Assumption 2（$\{t_i\}$ 张成 $\mathbb{R}^3$），$Sv_B - v_B$ 必须为零向量。
+
+$$\boxed{S v_B = v_B}$$
+
+同理，边 2 约束的 $t_i$ 系数给出 $Su_B = u_B$。平面约束的 $t_i$ 系数给出 $Sn_B = n_B$。
+
+$\{u_B, v_B, n_B\}$ 是 $\mathbb{R}^3$ 的标准正交基（$R_{pl}$ 的列）。$S$ 在基的所有三个向量上均为恒等映射。
+
+$$\boxed{S = I}$$
+
+**推论**：$p_S$ 项自动满足——当 $Sv_B = v_B$ 时，$(Sv_B)^T R_i R_{he} S^T p_{S,e1} = v_B^T R_i R_{he} S^T p_{S,e1}$。由于 $S$ 在完整基底上为 $I$，此项退化为原始形式。 ∎
+
+### 4.5 综合结论
+
+| 变换 | 仅边缘约束的对称群 | 加平面约束后 | 最终 |
+|:--|:--|:--|:--|
+| 平移 $(t_{he}, C)$ | $\{(0, \alpha n_B)\}$ — 1-DOF | $\alpha = 0$ | **平凡** |
+| 旋转 | $\{I\}$ | — | **平凡** |
+
+**Gauge 已被完全消除。12-DOF 系统满秩，无需正则化。**
+
+### 4.6 Gauge 消除 → 局部可辨识性
+
+**定理**：若 gauge 已被消除（对称群平凡），则存在 $\theta^*$ 的邻域使 Jacobian $J(\theta)$ 满列秩（$\operatorname{rank}=12$）。
+
+**工程意义**：
+1. 非线性优化具有局部唯一极小值
+2. 任意梯度求解器在接近真值时必然收敛
+3. 条件数仅由数据质量决定，不受参数化冗余污染
+
+### 4.7 数值验证
+
+| 测试场景 | Jacobian 秩 | 条件数 | 结论 |
+|:--|:--|:--|:--|
+| C-anchored cross-product（3 姿，混合朝向） | **12/12** | 123 | 满秩 ✓ |
+| 标量形式（3 姿，混合朝向） | **12/12** | 107 | 满秩 ✓ |
+| 传感器全 ∥ $-n_B$（3 姿） | **11/12** | $3.0 \times 10^{11}$ | **gauge 重现** ✗ |
+| Pairwise + centered（3 姿） | **9/12** | — | **C 3-DOF gauge** ✗ |
+
+### 4.8 实操警示：严禁传感器 Z 轴平行于平板法向量
+
+若所有位姿的传感器 $Z$ 轴均平行于 $-n_B$（即"垂直往下照"），则 $R_i^T n_B$ 对所有 $i$ 为常向量。此时 $t_{he}$ 沿 $R_{he}e_z$ 方向的平移与 $C$ 沿 $n_B$ 方向的位移构成无法分离的耦合——gauge 重新出现，条件数从 $10^2$ 飙升至 $3.0 \times 10^{11}$（数值验证确认）。
+
+**避免方法**：保持传感器有 5°–25° 的自然倾斜。操作员手持扫角点时通常自动满足——危险的是自动化位姿规划（如果算法只优化"分母最大"，会自我毁灭倾向 $z_S = -n_B$）。
+
+---
+
+# 第二部分：求解器与实现
+
+## 5. 三种求解器形式
+
+代码提供了三种残差形式，均对应上述 C-anchored 数学框架（标量形式最直接；cross-product 等价但多出行数；传感器帧预测是等价变换）。本节使用**标量形式**作为数学描述。
+
+### 5.1 形式 1：C-anchored Cross-Product（verify_12dof.py / calibrate.py）
+
+残差定义见 §3.5。参数向量 $\theta = [\omega_{he}(3), t_{he}(3), \omega_{pl}(3), C(3)]$。边约束 $cross(p - C, \text{axis}) \in \mathbb{R}^3$，平面约束 $n_B^T(p - C) \in \mathbb{R}$。None-centered，C 参与所有约束 → gauge-free（§4 证明）。
+
+### 5.2 形式 2：标量边约束（calib_solver.py `residuals_principle`）
+
+边 1 残差：$v_B^T(p_{B,e1} - C)$（标量）；边 2：$u_B^T(p_{B,e2} - C)$（标量）；平面：$n_B^T(p - C)$（标量）。
+
+**数学等价性**：$v_B^T(p_{e1} - C) = 0$ 是 $cross(p_{e1} - C, u_B) = 0$ 的非冗余分量（$n_B^T(p_{e1} - C) = 0$ 分量与平面约束冗余，被省略）。
+
+优势：残差数量少（每个边断点 1 个标量 vs 3 个分量），信息不损失。
+
+### 5.3 形式 3：传感器帧预测（calib_solver.py `residuals_principle_12dof`）
+
+**基本思想**：利用边缘几何的解析关系，将断点预测回传感器帧与实测值比较。
+
+对于边 1（方向 $u_B$），激光面（$y=0$ 平面，法向量 $n_l = R_{BS} e_2$）与边缘线的交点满足（推导见 PRINCIPLE.md Sec 4.3）：
+
+$$s = \frac{n_l^T (t_{BS} - C)}{n_l^T u_B}$$
+
+预测的传感器坐标 $p_S^{pred} = R_{he}^T(R_i^T(C + s \cdot u_B - t_i) - t_{he})$。残差为 $p_S^{pred}[0] - p_{S,e1}[0]$，$p_S^{pred}[2] - p_{S,e1}[2]$（$(x,z)$ 分量，$y$ 恒为零）。
+
+**特点**：在传感器帧比对，本征地处理了线激光的 1D 特性。
+
+### 5.4 求解器选择
+
+| 形式 | 残差维度 | C 是否参与 | 推荐场景 |
+|:--|:--|:--|:--|
+| Cross-product (C-anchored) | $3N_e + N_p$ | ✅ | 验证、快速标定 |
+| 标量 | $N_e + N_p$ | ✅ | 理论最简洁、数值稳定 |
+| 传感器帧预测 | $2N_e + N_p$ | ✅ | 对噪声更鲁棒（传感器帧比较） |
+
+---
+
+## 6. 初始化与多重重启策略
+
+### 6.1 R_he 初始化
+
+当手眼真值距单位阵 >30° 时，从 $R=I$ 出发的 LM 被困在局部极小值（阻尼限制步长）。解决方案：
+
+**多重重启**：在 SO(3) 上均匀采样 $N=20$ 个随机旋转 $\omega_{rand} = \alpha \cdot \hat{v}$（$\hat{v}$ 为随机单位向量，$\alpha \sim \text{Uniform}(0, \pi)$），各运行完整 init + LM，选 cost 最低的解。
+
+实测：17/20 重启收敛到正确解，3 个未收敛的落入对称分支（cost 略高，可通过平板尺寸 post-hoc 排除）。
+
+### 6.2 t_he、ω_pl、C 初始化
+
+给定候选 $R_{cf}$（随机采样或名义值），初始化其余 9 参数：
+
+1. **t_he 初值**：用 $R_{cf}$ 变换所有断点到基座标系 → 边方向拟合 → 跨朝向边距离约束 → 线性最小二乘（代码目前简化为零向量，但 LM 收敛到正确值——满秩系统对所有参数的梯度覆盖全空间）
+
+2. **ω_pl 初值**：同朝向内皮点 SVD 拟合边方向 → 正交化 $v_B = n_B \times u_B$ → $R_{pl} = [u_B, v_B, n_B]$
+
+3. **C 初值**：两条边线的最小二乘交点：
+   - 边 1 线：$cross(C - p_{1,ref}, u_B) = 0$
+   - 边 2 线：$cross(C - p_{2,ref}, v_B) = 0$
+   - 法向约束：$n_B^T C = \operatorname{mean}(n_B^T \cdot \text{all plane points})$
+
+   线性系统 A·C = b，最小二乘求解。
+
+### 6.3 LM 参数
+
+- $\lambda_0 = 10^{-4}$（初始阻尼）
+- 有限差分 Jacobian，$\epsilon = 10^{-6}$
+- 无正则化（满秩系统不包含冗余参数化）
+- 收敛判据：cost 变化 < $10^{-12}$
+
+---
+
+# 第三部分：自动化采集
+
+## 7. 角点伺服：Xiao 2022 线激光等价
+
+### 7.1 Xiao 2022 框架映射
+
+Xiao 2022 的核心：相机图像中板中心是可测量点特征 → 不依赖精确板模型做伺服。线激光等价：角点在 profile 中产生两个可测量断点，同样是直接可测量的几何特征。
+
+| Xiao 2022（2D 相机） | 线激光等价（本方法） |
 |:--|:--|
-| `r` | 记录当前位姿 |
-| `s` | 显示位姿列表 |
-| `c` | 运行 12-DOF 标定（20 重启） |
-| `w` | 保存到 `~/recorded_poses.json` |
-| `q` | 保存并退出 |
+| 板中心像素 → 机器人修正 | 角点偏移 $\tilde{e} = (e_{1,x}+e_{2,x})/2$ → 1D 伺服 |
+| 锁定后绕光轴旋转 | 锁定后绕传感器 Z 轴 ±5°~12° |
+| EKF 更新板位姿 | 端点 PCA 更新 $u_B/v_B$ |
 
-### 3.3 RViz 中看什么
+### 7.2 伺服不变性定理 ★
 
-灰色平板（400×500mm）+ 绿色 FOV 三角 + 黄色扫描线 + 红/蓝球（断点 e1/e2）。终端每帧打印 `e1=1 e2=1`（角点）或 `e1=1 e2=0`（纯边）。
+**定理**：传感器平移命令与手眼参数无关。
 
-### 3.4 采集方式
+**证明**：传感器在基座标系中的位置：
 
-**最低要求**：≥6 位姿，≥2 朝向（夹角 >30°），全体位姿覆盖两边各 ≥1 次。
+$$t_{BS} = t_{BH} + R_{BH} \cdot t_{he}$$
 
-**推荐方式 A**（3 朝向 × 3 角点 = 9 个）：
+对法兰施加平移 $\delta t_{BH}$：
 
-```
-用 MoveIt2 拖动法兰：
+$$t_{BS}^{new} = (t_{BH} + \delta t_{BH}) + R_{BH} \cdot t_{he} = t_{BS} + \delta t_{BH}$$
 
-朝向 A: 摇到角点(FOV过两边) → r  #1
-        沿边平移 ~3cm       → r  #2
-        沿边平移 ~3cm       → r  #3
+**法兰平移量 = 传感器平移量。与 $t_{he}$ 无关。** ∎
 
-朝向 B: 换朝向(转J6 ±30°或加pitch/yaw) → 摇角点 → r  #4-6
+**推论**：伺服命令 $\delta t_{BH} = k \cdot \tilde{e} \cdot \hat{s}_x$（$\hat{s}_x = R_{BH} \cdot R_{he}^{nom}[:,0]$），其中方向用名义手眼有偏置角 $\theta$，但闭环伺服补偿。收敛条件：$|1 - k\cos\theta| < 1$，取 $k=0.5$ 即使 $\theta=30^\circ$ 仍满足。
 
-朝向 C: 再换朝向 → 摇角点 → r  #7-9
+### 7.3 伺服信号
 
-按 w 保存 → 按 c 标定
-```
+$$\tilde{e} = \frac{e_{1,x} + e_{2,x}}{2}$$
 
-**方式 B**（混合纯边位姿）：
+- $\tilde{e} \approx 0$：锁定
+- $\tilde{e} > 0$：角点偏右 → $\delta t = +k\tilde{e} \cdot \hat{s}_x$
+- $\tilde{e} < 0$：角点偏左 → $\delta t = -k\tilde{e} \cdot \hat{s}_x$
 
-```
-朝向 A: 角点位姿 ×1              ← 锁定 C
-朝向 A: 纯边位姿 ×2（平移 >10cm）← 改善条件数
-朝向 B: 角点位姿 ×1
-...
-```
+$|\tilde{e}| \le 2$mm 判定锁定。$\tilde{e}$ 是连续量（不二值），提供"偏了多少、朝哪"的完整信息——闭环伺服充要条件。
 
-纯边位姿优势：FOV 只需切一条边，平移不受限。但**至少需要一个角点位姿锁定 $C$**——边约束 $cross(p-C, u_B)=0$ 只锁定 $C$ 在 $\perp u_B$ 方向的分量，缺少另一条边则 $C$ 沿该边方向可自由滑动。这与理论一致：3 个位姿要达到满秩必须每个都同时过两边；实际位姿数更多时只需至少一个角点位姿。
+### 7.4 锁定后的朝向多样性
 
-### 3.5 运行标定
-
-```bash
-PYTHONPATH=./common python3 calibrate.py ~/recorded_poses.json
-```
-
-或 Docker 终端按 `c`。
-
-### 3.6 朝向检查
-
-标定前终端显示朝向分组：
-```
-朝向组: 3
-  G0: 3 poses  G1: 3 poses  G2: 3 poses
-  G0↔G1: 170.4°  G0↔G2: 81.8°  G1↔G2: 140.8°
-```
-
-**确保 ≥2 组，彼此夹角 >30°。** 单朝向会失败（朝向间约束不足，$t_{he}$ 不可观测）。
+锁定状态（$\tilde{e} \approx 0$）下做旋转获取朝向多样性：
+- **绕 Z 轴**：角点不丢，直接记录（3~5 朝向 × ±5°, ±8°, ±12°）
+- **绕 X/Y 轴**：±5~8°，旋转后需重伺服
 
 ---
 
-## 四、实测验证
+## 8. 自动化管线设计
 
-数据：9 个角点位姿（3 朝向，间距 82°–170°），$R_{he}$ 真值 ~92.5°（URDF: RPY=[27.8°,9.2°,-86.5°]）。
+### 8.1 管线（移除 Phase 1 后的精简版本）
+
+```
+Phase 0: 操作工将激光放到板角 → 按 a → 记录锚点（FK + 关节角）
+    ↓
+Phase 2: 角点伺服采集
+    2a. 伺服锁定（1D X 轴比例控制）
+    2b. 朝向探索（锁定状态，绕 Z ±5~12°）
+    2c. 平移多样性（沿传感器 X 平移 ±15mm, +30mm）
+    ↓
+Phase 3: 12-DOF LM（20 重启）→ R_he, t_he, ω_pl, C
+```
+
+### 8.2 为什么移除 Phase 1
+
+Phase 1（关节扰动 + PCA 粗估板方向）的原始用途：
+1. 提供粗糙板方向 $u_B, v_B$ → 用于边缘分配
+2. 提供 7 个扰动位姿 → 额外数据
+
+v6 伺服直接锁定到角点，锁定后的平移多样性位姿（±15mm, +30mm）用端点差分运动确定 $u_B/v_B$ → Phase 1 功能被替代。移除后管线更简洁：无需等待 7 个扰动位姿，从 Phase 0 直接进伺服。
+
+### 8.3 已修复的关键问题
+
+| # | 问题 | 修复 |
+|:--|:--|:--|
+| 1 | DH 模型与 URDF 不一致（IK 偏差 535mm） | 新增 `inverse_kinematics_numeric()`（URDF FK + Newton-Raphson） |
+| 2 | Z 修正与伺服互搏 | 独立 $z\_correct\_count$，仅 Z < 300mm 或 > 700mm 触发 |
+| 3 | 角点移动依赖偏置 locked 姿态 | 从锚点关节角出发 |
+| 4 | 平移多样性不足 | DIVERSITY 子状态：±15mm, +30mm |
+| 5 | 边缘分配用 Phase 1 PCA 出错 | 改用于端点差分运动确定 $u_B/v_B$ |
+
+---
+
+# 第四部分：验证与结论
+
+## 9. 仿真验证结果
+
+### 9.1 零噪声理想条件（Sim 手动采集，9 角点位姿，3 朝向）
+
+> ⚠ **前提**：零激光噪声、零翘曲、零机器人重复性误差。结果代表求解器的理论精度上限。
 
 | 指标 | 12-DOF（20 重启） | 目标 |
 |:--|:--|:--|
 | **R 误差** | **0.0225°** | <0.1° ✅ |
 | **t 误差** | **0.09mm** | <0.1mm ✅ |
-| **C 收敛** | **[0.70, 0.00, 0.25]** | ✅ |
-| **Jacobian 秩** | **12/12** | 满秩 ✅ |
+| **C 收敛** | [0.70, 0.00, 0.25] | ✅ |
+| **Jacobian 秩** | **12/12**（verify_12dof.py） | 满秩 ✅ |
 | **收敛率** | **17/20** 重启 | ✅ |
-| **cost** | **2.57×10⁻⁶** | ✅ |
+| **cost** | 2.57×10⁻⁶ | ✅ |
+
+### 9.2 含噪声 MC（Num2 统一框架，0.055mm 激光 + 0.5mm 翘曲 + 0.1mm 重复性）
+
+> 方法 1 和 3 使用相同的传感器帧预测求解器——唯一区别是采集策略（垂直 vs 倾斜）。
+
+| 方法 | cond(J) | R median | R<0.1° | t median | gauge | 位姿数 |
+|:--|:--|:--|:--|:--|:--|:--|
+| `corner_12dof`（强制垂直） | ~10¹¹ | 3.9° (max 107°) | 0/10 | 15.9mm | ✗ | 6 |
+| `plane_edge_9dof`（pairwise NBV） | ~10² | **0.24°** | 3/10 | 1.1mm | ✓ | 6 |
+| `tilted_corner`（C-anchored 倾斜） | ~10² | 0.46° | 0/10 | 4.5mm | ✓ | 5-6 |
+
+**解读**：
+1. **强制垂直（corner_12dof）→ 灾难性失败**：cond=10¹¹，R 高达 107°，完全验证 §4.8 的警告。同一数学模型的 tilted_corner 仅因倾斜了 5-20° 就消除了 gauge（cond=10²）
+2. **gauge 消除是必要条件，不是充分条件**：tilted_corner 的 gauge 消除了（cond=10²），但噪声 + 翘曲 + 5-6 个自动生成位姿（z_S 仅偏 6-10°）→ R median=0.46°，不如 Sim 的 0.0225°（零噪声 + 9 个手动精选位姿 + 3 个宽朝向）
+3. **plane_edge_9dof 在噪声环境下表现最好**：pairwise edge 共线约束 + NBV 位姿（z_S 偏离 13-35°）→ R median=0.24°，3/10 达 <0.1°。但这是 9-DOF（C 不估计）——对于不需要 C 的场景够用了
+
+### 9.3 精度瓶颈分析
+
+零噪声 → R=0.0225°，含噪声（0.055mm + 0.5mm 翘曲）→ R≈0.2-0.5°。精度瓶颈是**数据质量**（噪声 + 翘曲），不是 gauge 或求解器。
 
 ---
 
-## 五、发现的问题与解决
+# 附录
 
-| # | 问题 | 现象 | 根因 | 解决 |
+## 附录 A：完整 Jacobian 推导
+
+### A.1 符号
+
+| 符号 | 含义 |
+|:--|:--|
+| $[a]_\times$ | 反对称矩阵：$[a]_\times b = a \times b$ |
+| $\partial(Rp)/\partial\omega = -[Rp]_\times$ | 旋转对轴角的标准导数 |
+
+### A.2 平面约束 $r_p = n_B^T(R_i(R_{he}p_S + t_{he}) + t_i - C)$
+
+$$\boxed{\frac{\partial r_p}{\partial t_{he}} = n_B^T R_i \quad (1 \times 3)}$$
+
+$$\boxed{\frac{\partial r_p}{\partial \omega_{he}} = -n_B^T R_i [R_{he} p_S]_\times \quad (1 \times 3)}$$
+
+令 $p_B^{full} = R_i(R_{he}p_S + t_{he}) + t_i$：
+
+$$\frac{\partial r_p}{\partial \omega_{pl}} = \frac{\partial}{\partial \omega_{pl}}(n_B^T(p_B^{full} - C)) = (p_B^{full} - C)^T \cdot \frac{\partial n_B}{\partial \omega_{pl}}$$
+
+由于 $n_B = R_{pl} e_3$，$\partial n_B^T/\partial \omega_{pl} = n_B^T[\cdot]_\times$：
+
+$$\boxed{\frac{\partial r_p}{\partial \omega_{pl}} = n_B^T [p_B^{full} - C]_\times \quad (1 \times 3)}$$
+
+$$\boxed{\frac{\partial r_p}{\partial C} = -n_B^T \quad (1 \times 3)}$$
+
+### A.3 边 1 约束 $r_{e1} = v_B^T(p_{B,e1} - C)$
+
+$$\frac{\partial r_{e1}}{\partial t_{he}} = v_B^T R_i$$
+
+$$\frac{\partial r_{e1}}{\partial \omega_{he}} = -v_B^T R_i [R_{he} p_{S,e1}]_\times$$
+
+$$\frac{\partial r_{e1}}{\partial \omega_{pl}} = v_B^T [p_{B,e1} - C]_\times$$
+
+$$\frac{\partial r_{e1}}{\partial C} = -v_B^T$$
+
+### A.4 边 2 约束（同结构，$v_B \to u_B$）
+
+$$\frac{\partial r_{e2}}{\partial t_{he}} = u_B^T R_i$$
+
+$$\frac{\partial r_{e2}}{\partial \omega_{he}} = -u_B^T R_i [R_{he} p_{S,e2}]_\times$$
+
+$$\frac{\partial r_{e2}}{\partial \omega_{pl}} = u_B^T [p_{B,e2} - C]_\times$$
+
+$$\frac{\partial r_{e2}}{\partial C} = -u_B^T$$
+
+### A.5 关键对比
+
+一个位姿的 Jacobian（$t_{he}$ 列）：
+- 纯平面：$\{n_B^T R_i\}$ — 1 个方向 → 秩 = 1
+- 角点法：$\{v_B^T R_i, u_B^T R_i, n_B^T R_i\}$ — 3 个线性独立方向 → 秩 = 3
+
+这是信息密度翻倍的精确数学表达。
+
+---
+
+## 附录 B：代码清单与版本差异
+
+### B.1 文件结构
+
+```
+Sim/
+├── calibrate.py          # 标定管线（C-anchored cross-product + RMRL）
+├── verify_12dof.py        # Jacobian 秩 + 精度验证
+├── common/
+│   ├── calib_solver.py    # 求解器库（3 种形式）
+│   ├── plane_calib.py     # 平面约束 LM + NBV
+│   └── fov_geometry.py    # so3_exp, so3_log
+└── ros2_ws/src/handeye_sim_bridge/
+    └── auto_calib_v2_node.py  # 自动化采集管线
+```
+
+### B.2 残差函数版本差异（重要）
+
+| 函数 | 文件 | C 使用 | 平面 centering | C gauge |
 |:--|:--|:--|:--|:--|
-| 1 | **R_gt 硬编码错误** | R 恒 ~90°，t 完美（0.09mm） | auto_calib_node 中 R_gt 为 ~1.6°；URDF 真值 ~92.5° | 从 URDF 读取 RPY 替换 |
-| 2 | **边界约束扭曲 LM** | cost 0.13，t 误差 50mm | 平板尺寸铰链损失混入优化梯度 | 移除；平板尺寸仅 post-hoc |
-| 3 | **t_he 初始化极差仍收敛** | t 误差 265mm → LM 得 0.09mm | 12-DOF 满秩 → 梯度覆盖全空间 | 不需额外修复 |
-| 4 | **双分支仲裁降质** | 90° 旋转后 cost 恶化 | 替换解不在真正极小值 | 回退单分支 LM |
-| 5 | **u_B↔v_B 对称不存** | 理论担忧，实测不存在 | $C$ 作为锚点打破对称 | 无需处理 |
-| 6 | **闭式解卡在 R≈I** | 法兰旋转 >140° 时闭式解仅移 0.001° | 阻尼限制步长 >30°，距真值 92° | 多重随机重启（17/20 收敛） |
+| `residuals_12dof` | calibrate.py | ✅ cross(p-C, axis) | ❌ | **0 DOF** |
+| `residuals_12dof` | verify_12dof.py | ✅ cross(p-C, axis) | ❌ | **0 DOF** |
+| `residuals_12dof` | **calib_solver.py** | ❌ pairwise diff | ✅ mean-subtracted | **⚠ 3 DOF** |
+| `residuals_principle` | calib_solver.py | ✅ scalar dot | ❌ | **0 DOF** |
+| `residuals_principle_12dof` | calib_solver.py | ✅ sensor-frame pred | ❌ | **0 DOF** |
 
-**核心原则**：纯几何 LM + post-hoc 合规检查 + 多重随机重启。物理约束不混入优化目标。
+**⚠ calib_solver.py 的 `residuals_12dof` 使用 pairwise 边缘差 + 平面中心化 → C 参数完全不可观测（3-DOF gauge）**。该 form 仅在 C 初始化合理且只关注 $(R_{he}, t_{he}, \omega_{pl})$ 时可用。数学上不应标称 12/12 满秩。
 
----
+推荐使用 `residuals_principle`（标量形式）或 calibrate.py 的 C-anchored cross-product。
 
-## 六、代码参考
+### B.2.1 Num2 vs Sim 求解器对照
 
-| 文件 | 内容 |
-|:--|:--|
-| `calibrate.py` | 标定管线（加载 → 12-DOF → 真值对比） |
-| `common/calib_solver.py` | `solve_he_closed_form()`, `init_12dof()`, `solve_12dof_lm()`, `solve_12dof_with_restarts()` |
-| `auto_calib_node.py` | 仿真采集节点（键盘 r/s/c/w/q） |
-| `verify_12dof.py` | 12-DOF 验证（含 SVD 满秩检查） |
+| Num2 方法 | 残差形式 | 等效 Sim 函数 | DOF | 采集策略 |
+|:--|:--|:--|:--|:--|
+| `corner_12dof` | 传感器帧预测 | `calib_solver.residuals_principle_12dof` | 12 | **强制垂直** $z_S=-n_B$ |
+| `tilted_corner` | 传感器帧预测 | `calib_solver.residuals_principle_12dof` | 12 | 倾斜网格 $z_S$ 偏 5-20° |
+| `plane_edge_9dof` | pairwise diff + centered | `calib_solver.combined_residuals` | 9 | NBV 候选 $z_S$ 偏 13-35° |
 
-**唯一外部输入**：平板尺寸。不需要 URDF 名义值、不需要平板位姿、不需要角点位置。
+**关键结论**：`corner_12dof` 和 `tilted_corner` 使用**完全相同**的数学求解器（传感器帧预测，12-DOF，C-anchored）。cond 从 10¹¹ 降到 10² 的唯一原因是采集时传感器倾斜了 5-20°——同一数学模型，gauge 不是几何固有的，是"强制垂直"的产物。
 
----
+### B.3 实测采集指南
 
-# 附录 B：自动化采集方案（基于 Xiao 2022 + 线激光适配）
+**最低要求**：≥3 位姿，≥2 朝向（夹角 >30°），覆盖两边。
 
-> 日期：2026-07-04
-> 状态：v3 — 关节空间 Phase 1 + 扰动名义手眼
-> 实现：`auto_calib_v2_node.py`
-> 参考文献：
-> - Xiao et al. 2022 — J. Intell. Manuf. (闭环采集框架)
-> - Yang et al. 2022 — IEEE TIM (光轴约束)
-> - Yang et al. 2023 — arXiv:2303.06766 (NBV/FIM，后续扩展用)
-> - Sharifzadeh et al. 2020 — RCIM (单平面 PCA)
-
----
-
-## B.1 整体架构：Xiao 2022 框架 + 线激光适配
-
-Xiao 2022 的核心理念：**先粗后精**。分两层：
-
-| Xiao 阶段 | Xiao 机制 | 本方法 | 差异说明 |
-|:--|:--|:--|:--|
-| **Phase 1 探索** | Navy 算法 → 粗估板位姿 | 关节扰动 + PCA → (n_B,d,C) | Navy 需 6-DOF 测量,线激光不可用; PCA 等效 |
-| | 估计图像 Jacobian J | (无) | 线激光 1D 轮廓,无法做 2D Jacobian |
-| **Phase 2 采集** | Eq.5: 定朝向→算位置 | t_BS=C+d_offset·n_B | Xiao 用投影约束,我们用板法向约束 |
-| | Eq.6-7: 预判角度→过滤 | Z 预检查: |Z_pred-Z_0|<50mm | 等价 — 执行前过滤不安全位姿 |
-| | EKF 每帧更新板位姿 | 增量 PCA 每 1 位姿更新 | 等价 — 在线修正目标估计 |
-| | Eq.12: 图像 Jacobian 修正 | Z 修正: |Z-Z_0|>5mm→微调 | 仅 1D(X 方向弹球兜底) |
-| **Phase 3 求解** | Tsai+GA 精化 | 平面约束 LM(20 重启) | 解法不同,角色等价 |
-
-**线激光的天然局限**：只有 1D 轮廓 → 只能观测深度方向 → 无法像相机那样做 $(dx,dy)$ 二维修正。沿激光线方向（传感器 X 轴）的漂移不可观测。**弹球反馈做兜底**。
-
----
-
-## B.2 手眼初值
-
-### B.2.1 初值来源
-
-名义手眼来自 CAD + 卡尺粗略测量（仿真中用 URDF 真值 + 随机扰动模拟）：
-
-$$
-R_{HS}^{nom} = R_{perturb}(\sigma_R=5°) \cdot R_{HS}^{true}, \quad
-t_{HS}^{nom} = t_{HS}^{true} + \mathcal{N}(0, 5\text{mm})
-$$
-
-### B.2.2 名义手眼的使用
-
-**Phase 1 PCA 拟合**：用名义手眼将扫描点从传感器系转到基座标系做 PCA。
-
-$$p_B = R_{BH} \cdot R_{HS}^{nom} \cdot p_S + R_{BH} \cdot t_{HS}^{nom} + t_{BH}$$
-
-名义手眼误差 → 点云偏置 → $(n_B, d, C)$ 有偏置。但 Phase 2 用保守阈值（Z 偏移 < 50mm），Phase 3 LM 联合优化消偏。
-
-**Phase 1 运动规划**：已改为关节空间扰动（见 B.4），**完全不依赖手眼**。
-
-**Phase 2 候选生成**：涉及板平面 $(n_B, d, C)$，手眼仅通过 PCA 间接影响。保守阈值保证不会错误过滤。
-
----
-
-## B.3 线激光适配：约束与反馈
-
-### B.3.1 FOV 梯形 + 平板边界 — 统一处理
-
-线激光传感器的坐标原点在激光平面（FOV 三角形内，FOV 校准时标定）。Gocator 的有效测量区域是一个梯形：从激光窗口沿 Z 轴 270mm 处开始，820mm 处截止。
-
-**关键洞察**：激光线伸出 FOV 梯形 → 超出的部分没有任何 2D 轮廓数据。这和碰到平板边缘的效果**物理上完全一致**——都是某侧信号丢失。因此不区分两种边界。
-
-| 信号 | 含义 | 动作 |
-|:--|:--|:--|
-| $N_{pts}$ 相对于锚点下降 > 50% | 接近某边界 | **激光线中心向板中心 C 移动** |
-| $N_{pts} < 10$ | 完全离开有效区域 | 紧急回退到上一有效位姿 |
-| `|Z_center - Z_0| > 20mm` | 深度漂移 | Z 方向伺服回正 |
-
-所有 Z 值判断用**相对锚点偏移**，不用 Gocator 规格绝对值（传感器原点与光学参考点的偏移未知）。
-
-### B.3.2 Z-range 预检查（Xiao Eq.6-7 等价）
-
-候选位姿执行前，用 `compute_laser_plate_intersection()` 预测交线 Z 值，过滤偏离锚点 > 50mm 的候选：
-
-$$\text{valid} \iff |Z_{pred} - Z_0| < 50 \text{ mm}$$
-
-### B.3.3 弹球反弹
-
-$N_{pts}$ 下降时向板中心 C 方向收缩 20mm。边界在远离 C 的方向 → 向 C 移动一定安全。不需要区分哪条边。
-
-### B.3.4 每步 Z 位置修正（Xiao Eq.12 线激光版）
-
-每次移动后检查 `|Z_center - Z_0|`。若 > 5mm → 沿传感器 Z 轴微调。这是每次移动后的**标准步骤**，不是异常处理。
-
-**注意**：沿激光线方向（传感器 X 轴）的漂移不可观测 → 无法修正 → 弹球兜底。
-
-### B.3.5 绕激光线旋转 — 天然不可观测
-
-传感器绕 X 轴旋转时 2D 轮廓不变（局部不可观测）。候选生成不排除——确实不可观测的方向采集数据后 Phase 3 LM 也无法利用，但不会导致激光离开板。后续可用 FIM 或协方差分析自动避开。
-
----
-
-## B.4 完整自动化管线
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Phase 0: 初始化（操作工一键启动）                              │
-│                                                              │
-│  1. 操作工将激光放到板中心区域 → 按 a                         │
-│  2. 系统提取锚点特征:                                          │
-│     - FK × 名义手眼 → R_BS_0, t_BS_0 (传感器在基座标系)        │
-│     - Z_0 = 当前扫描点 Z 均值                                  │
-│     - N_anchor = 当前有效点数                                  │
-│  3. 验证: N_pts > 20 → 合格；< 20 → 提示调整                   │
-│  4. 记录 pose_0 (锚点位姿) + 锚点关节角                         │
-│                                                              │
-│  注意: 名义手眼 = 真值 + 扰动(±5°, ±5mm)，模拟粗略测量          │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Phase 1: 探索运动 — 关节空间小扰动 + PCA 拟合板平面            │
-│                                                              │
-│  核心: 关节空间扰动 → 不经过 IK → 保证小步安全移动              │
-│        (IK 可能返回与锚点差很远的关节配置，导致激光离开板)       │
-│                                                              │
-│  扰动序列 (在锚点关节角基础上加减):                             │
-│    pose_1: J4 +2°    pose_2: J4 -2°                           │
-│    pose_3: J5 +2°    pose_4: J5 -2°                           │
-│    pose_5: J6 +3°    pose_6: J6 -3°                           │
-│                                                              │
-│  每次移动后:                                                  │
-│    - N_pts > 0.5 × N_anchor? → 记录；否则跳过                  │
-│                                                              │
-│  收集完成后:                                                  │
-│    → 用名义手眼将全部 7 个位姿(含 pose_0)的扫描点转到基座标系    │
-│    → PCA 拟合平面 → (n_B, d)                                  │
-│    → 估算板中心 C ≈ 所有转点均值                                │
-│                                                              │
-│  参考: Sharifzadeh 2020 用 48 位姿圆形模式。                    │
-│  我们 7 位姿覆盖 J4/J5/J6 各两个方向 → PCA 质量足够             │
-│  Phase 3 LM 会联合优化消去名义手眼偏置                          │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Phase 2: Xiao 风格自动采集 (约束过滤 → 随机选取)                             │
-│                                                              │
-  核心: 与 Xiao 2022 完全对应 — 生成候选 → 约束过滤 → 随机选取
-        (无 NBV/FIM, 保证与论文框架一致)
-
-  原则:
-    - 手眼在运动规划中消去，Phase 2 不需要手眼先验
-    - 每次移动后标准执行 Z 位置修正 (Xiao Eq.12 线激光版)
-    - 每 1 位姿增量更新板平面 (Xiao EKF 思路)
-│                                                              │
-│  ┌─────────────────────────────────────────────────┐         │
-│  │ 1. 生成候选朝向 (N=30):                           │         │
-│  │    绕 RX/RY/RZ: ±15°~±25°                         │         │         │
-│  │                                                  │         │
-│  │ 2. 对每个候选:                                    │         │
-│  │    a. 板平面约束位置: t_BS = C + d_offset · n_B   │         │
-│  │    b. Z 预检查: |Z_pred - Z_0| < 50mm?           │         │
-│  │    c. 预测扫描点                                 │         │
-│  │    d. (无 FIM — 随机选取)                          │         │
-│  │                                                  │         │
-│  │ 4. 逐个选取 → IK → 执行 →                       │         │
-│  │  4b. Z 修正 (每步): |Z-Z_0|>5mm → 微调          │         │
-│  │  5. 特征检查 + 弹球:                           │         │
-│  │        ✓ 正常 → 记录                              │         │
-│  │        ⚠ N↓  → 向C收缩                           │         │
-│  │        🔴 N<10 → 回退                             │         │
-│  │    4b. 增量 PCA 更新 (n_B,d,C)                    │         │
-│  └─────────────────────────────────────────────────┘         │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│  Phase 3: 联合优化 — 平面约束手眼标定                           │
-│                                                              │
-│  目标: min Σ_i Σ_j [n_B · (R_BH_i R_HS p_S_ij                 │
-│                          + R_BH_i t_HS + t_BH_i) - d]²        │
-│                                                              │
-│  DOF: 9 (R_HS 3, t_HS 3, n_B 2, d 1)                        │
-│  约束: ~25 位姿 × 50 点 = 1250 (严重过定)                    │
-│  求解: 多重随机重启 LM (20 次)，选 cost 最低解                  │
-│                                                              │
-│  输出: R_HS, t_HS, n_B, d                                    │
-└──────────────────────────────────────────────────────────────┘
+**仿真启动**：
+```bash
+cd /home/z/research_contact_handeye/verification/Sim
+./start.sh --tmux
 ```
 
-### B.4.1 约束层次总结
-
-| 层级 | 约束类型 | 作用阶段 | 机制 |
-|:--|:--|:--|:--|
-| **几何约束** | $|Z_{pred}-Z_0|<50$mm | Phase 2 候选筛选 | 事前过滤 |
-| **信息约束** | (无，随机选取) | — | 与 Xiao 2022 对齐，后续可加 FIM |
-| **反馈约束** | N_pts↓ + Z偏移 | Phase 2 执行后 | 弹球+伺服+回退 |
-| **求解约束** | $n_B \cdot p_B - d = 0$ | Phase 3 | LM 联合优化 |
-
-### B.4.2 设计决策与理由
-
-| 决策 | 理由 |
-|:--|:--|
-| Phase 1 用关节空间扰动 | IK 可能返回与锚点差很远的关节配置，导致激光离开板 |
-| Phase 2 用板平面生成位置 | 有 $(n_B,d,C)$ 后不需要 vTCP |
-| Z 修正仅 1D | 线激光只能观测深度方向 |
-| 弹球不区分板边/FOV边 | N_pts 下降效果相同，统一向 C 回拉 |
-| 候选范围固定 ±15°~±25° | Xiao 小步长风格，保证安全 |
-| 增量 PCA (每 1 位姿) | 比批处理(每 5 位姿)更快纠正累积误差 |
-
----
-
-## B.5 与随机行走的差异
-
-之前在 v5-v8 中的随机关节行走失败，因为：关节空间大范围随机扰动 → 激光离开板 → 无法恢复。
-
-本方法的 Phase 1 虽然也用关节空间，但**扰动幅度极小** (J4/J5 ±2°, J6 ±3°)——从锚点出发，保证激光线始终在板附近。Phase 2 在板平面约束下生成候选，**每个候选都经过 Z 预检查**，从源头过滤不安全位姿。
-
----
-
-## B.6 实现
-
-| 文件 | 内容 |
-|:--|:--|
-| `auto_calib_v2_node.py` | **v3** — 关节空间 Phase 1 + 扰动名义手眼 + Xiao 风格 Phase 2 + LM Phase 3 |
-|  | 平面约束求解器 + 交线计算 |
-| `common/fov_geometry.py` | SO(3)/RPY 工具函数 |
-| `fanuc_kinematic.py` | FANUC 逆运动学 (Phase 2 用) |
-| `auto_calib_node.py` | v1 legacy — 约束方程 + 特征反馈 (保留用于手动关节控制) |
-
-**按键** (v2 节点):
-| 键 | 作用 |
-|:--|:--|
-| `a` | 启动自动标定 |
-| `c` | 仅运行求解 (用已采集数据) |
-| `s` | 汇总位姿列表 |
-| `w` | 保存到 `~/recorded_poses_v2.json` |
-| `q` | 退出 |
+**自动化采集**（v6）：
+```bash
+ros2 run handeye_sim_bridge auto_calib_v2  # 按 a 开始
+```

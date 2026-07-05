@@ -3,9 +3,10 @@ Panels:
     Help Height: 70
     Name: Displays
     Property Tree Widget:
-      Expanded: ~
+      Expanded:
+        - /TF1/Frames1
       Splitter Ratio: 0.5
-    Tree Height: 237
+    Tree Height: 278
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -118,14 +119,10 @@ Visualization Manager:
       Enabled: true
       Name: CalibMarkers
       Namespaces:
-        endpoints: true
         fov_plane_edge: true
         fov_plane_surface: true
-        intersection_line: true
         plate: true
         plate_edge: true
-        scanline: true
-        sensor_frame: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -369,6 +366,73 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: true
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Filter (blacklist): ""
+      Filter (whitelist): ""
+      Frame Timeout: 15
+      Frames:
+        All Enabled: false
+        J1_link:
+          Value: false
+        J2_link:
+          Value: false
+        J3_link:
+          Value: false
+        J4_link:
+          Value: false
+        J5_link:
+          Value: false
+        J6_link:
+          Value: false
+        base_link:
+          Value: false
+        ee_link:
+          Value: false
+        fanuc_flange:
+          Value: false
+        flange:
+          Value: false
+        gocator_sensor:
+          Value: true
+        world:
+          Value: false
+      Marker Scale: 1
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Tree:
+        world:
+          base_link:
+            J1_link:
+              J2_link:
+                J3_link:
+                  J4_link:
+                    J5_link:
+                      J6_link:
+                        flange:
+                          ee_link:
+                            {}
+                          fanuc_flange:
+                            gocator_sensor:
+                              {}
+      Update Interval: 0
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Max Value: 1
+      Median window: 5
+      Min Value: 0
+      Name: Image
+      Normalize Range: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /gocator/profile_2d
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -408,7 +472,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.946179986000061
+      Distance: 3.5713748931884766
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -423,24 +487,26 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.5950004458427429
+      Pitch: 0.4147966504096985
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 0.07999766618013382
+      Yaw: 1.6231837272644043
     Saved: ~
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1142
+  Height: 1536
   Hide Left Dock: false
   Hide Right Dock: false
+  Image:
+    collapsed: false
   MotionPlanning:
     collapsed: false
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000001c900000420fc0200000005fb000000100044006900730070006c006100790073010000003b0000016e000000c700fffffffb0000000a0056006900650077007301000001af000000ff000000a000fffffffb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000002b4000001a70000016900fffffffb000000280020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff00000000000000000000056f0000042000000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000001c9000005aafc0200000007fb000000100044006900730070006c006100790073010000003b00000197000000c700fffffffb0000000a0056006900650077007301000001d80000011a000000a000fffffffb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000002f80000020a0000016900fffffffb000000280020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000000000000000fb0000000a0049006d00610067006501000004d0000001150000000000000000fb0000000a0049006d0061006700650100000508000000dd0000001600ffffff000007d9000005aa00000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
-  Width: 1854
-  X: 706
-  Y: 222
+  Width: 2472
+  X: 88
+  Y: 27

@@ -25,6 +25,7 @@ SRDF_PATH=/workspace/ros2_ws/src/handeye_sim_bridge/config/fanuc.srdf
 GZ_CTRL_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/gz_controllers.yaml
 SCENE_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/scene_publisher_node.py
 SRDF_PUB_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/srdf_publisher_node.py
+PROFILE_VIZ_BIN=/workspace/ros2_ws/install/handeye_sim_bridge/bin/profile_viz
 
 ./stop.sh 2>/dev/null || true
 sleep 1
@@ -188,6 +189,8 @@ tmux send-keys -t handeye_sim:0.1 "python3 '$SRDF_PUB_EXE' --ros-args -p use_sim
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "python3 '$SCENE_EXE' --ros-args -p use_sim_time:=true" Enter
 sleep 1
+tmux send-keys -t handeye_sim:0.1 "'$PROFILE_VIZ_BIN' --ros-args -p use_sim_time:=true &" Enter
+sleep 1
 tmux send-keys -t handeye_sim:0.1 "echo 'Components started. MoveGroup starting in other pane.'" Enter
 
 sleep 5
@@ -196,7 +199,7 @@ sleep 5
 tmux send-keys -t handeye_sim:0.2 "ros2 run moveit_ros_move_group move_group --ros-args --params-file /tmp/ros_params/mg_params.yaml" Enter
 
 # Pane 3: monitor
-tmux send-keys -t handeye_sim:0.3 "echo 'Monitoring...' && watch -n 3 'echo Topics:; ros2 topic list 2>/dev/null | grep -E \"marker|plan|trajectory|controller\" | head -10; echo; echo Controllers:; ros2 control list_controllers 2>/dev/null; echo; echo Actions:; ros2 action list -t 2>/dev/null | head -10'" Enter
+tmux send-keys -t handeye_sim:0.3 "echo 'Monitoring...' && watch -n 3 'echo Topics:; ros2 topic list 2>/dev/null | grep -E \"marker|plan|trajectory|controller|profile\" | head -10; echo; echo Controllers:; ros2 control list_controllers 2>/dev/null; echo; echo Actions:; ros2 action list -t 2>/dev/null | head -10'" Enter
 
 if $NO_RVIZ; then
     echo "(skipping RViz)"
@@ -248,10 +251,12 @@ echo "[5/7] MoveIt2 move_group..."
 ros2 run moveit_ros_move_group move_group --ros-args --params-file /tmp/ros_params/mg_params.yaml &
 sleep 5
 
-echo "[6/7] SRDF + Scene publishers..."
+echo "[6/7] SRDF + Scene + Profile Viz..."
 python3 "$SRDF_PUB_EXE" --ros-args -p use_sim_time:=true &
 sleep 1
 python3 "$SCENE_EXE" --ros-args -p use_sim_time:=true &
+sleep 1
+"$PROFILE_VIZ_BIN" --ros-args -p use_sim_time:=true &
 sleep 1
 
 if $NO_RVIZ; then

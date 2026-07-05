@@ -377,3 +377,123 @@ if __name__ == '__main__':
 
     print("\n=== FK∘IK 闭环 ===")
     verify_fk_ik(200)
+
+
+# ============================================================================
+# 数值 IK（基于正确 URDF FK，替代错误的 DH-IK）
+# ============================================================================
+
+def forward_kinematics_urdf(joints_rad):
+    """URDF 关节链 FK: base_link → fanuc_flange (与 Gazebo TF 一致)"""
+    q = np.array(joints_rad, dtype=float).copy()
+    
+    c1,s1 = math.cos(q[0]), math.sin(q[0])
+    T01 = np.array([[c1,-s1,0,0],[s1,c1,0,0],[0,0,1,0.425],[0,0,0,1]])
+    
+    c2,s2 = math.cos(q[1]), math.sin(q[1])
+    T12 = np.array([[c2,0,s2,0.075],[0,1,0,0],[-s2,0,c2,0],[0,0,0,1]])
+    
+    c3,s3 = math.cos(-q[2]), math.sin(-q[2])
+    T23 = np.array([[c3,0,s3,0],[0,1,0,0],[-s3,0,c3,0.84],[0,0,0,1]])
+    
+    c4,s4 = math.cos(-q[3]), math.sin(-q[3])
+    T34 = np.array([[1,0,0,0],[0,c4,-s4,0],[0,s4,c4,0.215],[0,0,0,1]])
+    
+    c5,s5 = math.cos(-q[4]), math.sin(-q[4])
+    T45 = np.array([[c5,0,s5,0.89],[0,1,0,0],[-s5,0,c5,0],[0,0,0,1]])
+    
+    c6,s6 = math.cos(-q[5]), math.sin(-q[5])
+    T56 = np.array([[1,0,0,0],[0,c6,-s6,0],[0,s6,c6,0],[0,0,0,1]])
+    
+    T6f = np.array([[1,0,0,0.09],[0,1,0,0],[0,0,1,0],[0,0,0,1]])
+    
+    # flange → fanuc_flange: rpy=(π, -π/2, 0)
+    cp,sp = math.cos(math.pi), math.sin(math.pi)
+    ch,sh = math.cos(-math.pi/2), math.sin(-math.pi/2)
+    Rz = np.array([[cp,-sp,0],[sp,cp,0],[0,0,1]])
+    Ry = np.array([[ch,0,sh],[0,1,0],[-sh,0,ch]])
+    Tff = np.eye(4); Tff[:3,:3] = Rz @ Ry
+    
+    return T01 @ T12 @ T23 @ T34 @ T45 @ T56 @ T6f @ Tff
+
+
+def inverse_kinematics_numeric(T_target, q_init=None, max_iter=50, tol_p=1e-5, tol_r=1e-4):
+    """数值 IK: Newton-Raphson + 数值雅可比, 基于正确 URDF FK
+    
+    Args:
+        T_target: 4x4 目标 fanuc_flange 位姿
+        q_init: 初始关节角 (弧度), None 则用零位
+        max_iter: 最大迭代次数
+        tol_p: 位置收敛阈值 [m]
+        tol_r: 旋转收敛阈值 [rad]
+    
+    Returns:
+        (N,6) array 关节角 (弧度), 或空数组
+    """
+    if q_init is None:
+        q_init = np.array([0.0, 0.5, -1.2, 0.0, 0.0, 0.0])  # 合理初始猜测
+    
+    q = np.array(q_init, dtype=float).copy()
+    eps = 1e-6  # 数值微分步长
+    
+    for iteration in range(max_iter):
+        T_cur = forward_kinematics_urdf(q)
+        
+        # 位置误差
+        e_p = T_target[:3, 3] - T_cur[:3, 3]
+        
+        # 旋转误差 (轴角表示)
+        R_err = T_target[:3, :3] @ T_cur[:3, :3].T
+        tr = np.clip((np.trace(R_err) - 1) / 2, -1, 1)
+        theta_err = math.acos(tr)
+        if theta_err < 1e-10:
+            omega = np.zeros(3)
+        else:
+            omega_hat = (R_err - R_err.T) / (2 * math.sin(theta_err))
+            omega = theta_err * np.array([omega_hat[2,1], omega_hat[0,2], omega_hat[1,0]])
+        
+        e = np.concatenate([e_p, omega])
+        
+        if np.linalg.norm(e_p) < tol_p and theta_err < tol_r:
+            return np.atleast_2d(q)
+        
+        # 数值雅可比 (6x6)
+        J = np.zeros((6, 6))
+        for i in range(6):
+            dq = np.zeros(6); dq[i] = eps
+            T_plus = forward_kinematics_urdf(q + dq)
+            # 平移部分
+            J[:3, i] = (T_plus[:3, 3] - T_cur[:3, 3]) / eps
+            # 旋转部分 (用轴角差)
+            R_diff = T_plus[:3, :3] @ T_cur[:3, :3].T
+            tr_d = np.clip((np.trace(R_diff) - 1) / 2, -1, 1)
+            th_d = math.acos(tr_d)
+            if th_d < 1e-10:
+                J[3:, i] = 0
+            else:
+                wh = (R_diff - R_diff.T) / (2 * math.sin(th_d))
+                J[3:, i] = th_d * np.array([wh[2,1], wh[0,2], wh[1,0]]) / eps
+        
+        # 阻尼最小二乘
+        lam = 0.01 if iteration < 10 else 0.001
+        dq = np.linalg.solve(J.T @ J + lam * np.eye(6), J.T @ e)
+        
+        # 线搜索
+        alpha = 1.0
+        for _ in range(5):
+            q_new = q + alpha * dq
+            T_new = forward_kinematics_urdf(q_new)
+            e_new = np.linalg.norm(T_target[:3,3] - T_new[:3,3])
+            e_old = np.linalg.norm(e_p)
+            if e_new < e_old * 0.95:
+                break
+            alpha *= 0.5
+        
+        q += alpha * dq
+        
+        # 关节限位检查
+        lims_rad = np.deg2rad(JOINT_LIMITS_DEG)
+        for j in range(6):
+            q[j] = np.clip(q[j], lims_rad[j,0], lims_rad[j,1])
+    
+    return np.array([], dtype=float)

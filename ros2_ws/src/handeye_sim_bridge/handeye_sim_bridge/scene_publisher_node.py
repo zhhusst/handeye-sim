@@ -21,7 +21,7 @@ sys.path.insert(0, '/workspace/common')
 
 from fov_geometry import (
     compute_fov_plate_scanline, compute_fov_triangle,
-    build_R_edge, make_transform, rpy_to_matrix,
+    build_R_edge, make_transform, rpy_to_matrix, so3_exp,
 )
 from handeye_sim_bridge.bridge_publisher import CalibPublisher
 from handeye_sim_bridge.fanuc_kinematic import forward_kinematics
@@ -91,7 +91,14 @@ class ScenePublisher(Node):
         # 断点信息发布器（传感器系，正确标记 e1/e2）
         self.endpoint_pub = self.create_publisher(
             Float64MultiArray, '/gocator/endpoints', 10)
-        self.gocator_noise_std = 0.0001  # 0.1mm 高斯噪声（模拟真实传感器）
+        # ── 噪声模型（可配置） ──
+        # 激光测量噪声 σ (m) — Num2 默认 0.055mm
+        self.declare_parameter('laser_noise_std', 0.000055)
+        # 板翘曲幅度 ±mm — 每帧给平板法向量加随机扰动
+        self.declare_parameter('plate_warp_mm', 0.5)
+        # 机器人重复性噪声 σ (m) — 加在末端位姿上
+        self.declare_parameter('robot_repeat_std', 0.0001)
+        self._noise_rng = np.random.default_rng()
 
         # 调试日志节流
         self._debug_frame = 0
@@ -363,9 +370,33 @@ class ScenePublisher(Node):
                 corners_world = [t_vec + R @ c for c in corners_S]
 
                 # 计算 FOV 与平板交线 → 扫描点
+                # ── 注入噪声模型 ──
+                laser_std = self.get_parameter('laser_noise_std').value
+                warp_mm = self.get_parameter('plate_warp_mm').value / 1000.0
+                robot_std = self.get_parameter('robot_repeat_std').value
+                rng = self._noise_rng
+
+                # 机器人重复性：扰动末端位姿
+                if robot_std > 0:
+                    t_noisy = t_vec + rng.normal(0, robot_std, 3)
+                    axis = rng.normal(0, robot_std, 3)
+                    R_noisy = R @ so3_exp(axis * 0.001)  # ~0.06° per 0.1mm
+                else:
+                    R_noisy, t_noisy = R, t_vec
+
+                # 板翘曲：扰动法向量
+                if warp_mm > 0:
+                    warp_angle = warp_mm / max(w, h)  # 弧度
+                    w_axis = rng.normal(0, 1, 3)
+                    w_axis -= np.dot(w_axis, n_B) * n_B  # 投影到板面内
+                    w_axis /= np.linalg.norm(w_axis) + 1e-12
+                    n_warped = so3_exp(w_axis * warp_angle) @ n_B
+                else:
+                    n_warped = n_B
+
                 res = compute_fov_plate_scanline(
-                    R_BS=R, t_BS=t_vec,
-                    C=C, n_B=n_B, u_B=u_B, v_B=v_B,
+                    R_BS=R_noisy, t_BS=t_noisy,
+                    C=C, n_B=n_warped, u_B=u_B, v_B=v_B,
                     pw=w, ph=h,
                     fov_corners_S=self.scene['fov_corners_S'])
 
@@ -395,8 +426,9 @@ class ScenePublisher(Node):
                 ]
                 if res['has_intersection'] and len(res['scan_pts_S']) >= 3:
                     pts_S = res['scan_pts_S']
-                    # 加噪声 (模拟真实传感器)
-                    noise = np.random.normal(0, self.gocator_noise_std, pts_S.shape)
+                    # 加激光噪声 (可配置，默认 0.055mm)
+                    laser_std = self.get_parameter('laser_noise_std').value
+                    noise = np.random.normal(0, laser_std, pts_S.shape)
                     pts_noisy = pts_S + noise
                     # 只保留 X, Z (Y 在传感器系中恒为 0)
                     pts_2d = np.zeros((len(pts_noisy), 3), dtype=np.float32)

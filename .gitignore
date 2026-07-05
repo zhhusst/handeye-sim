@@ -26,3 +26,6 @@ rsp_params.yaml
 .DS_Store
 *.swp
 *.swo
+collected_poses.json\nrecorded_poses.json\ntest_record.txt
+*.json
+test_record.txt
