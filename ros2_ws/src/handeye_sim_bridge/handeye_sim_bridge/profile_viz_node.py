@@ -41,6 +41,13 @@ class ProfileVizNode(Node):
         except Exception:
             return
         if self._latest is not None and len(self._latest) > 0:
+            # Throttle to 10 Hz to avoid flooding RViz
+            now = self.get_clock().now()
+            if not hasattr(self, '_last_viz_time'):
+                self._last_viz_time = now
+            if (now - self._last_viz_time).nanoseconds < 0.1 * 1e9:
+                return
+            self._last_viz_time = now
             self._publish_all()
 
     def _publish_all(self):

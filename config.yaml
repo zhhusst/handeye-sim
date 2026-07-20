@@ -1,0 +1,128 @@
+# ============================================================================
+# 手眼标定仿真配置文件
+# 修改此文件即可调整所有参数，无需改代码
+# ============================================================================
+
+# ── 数据路径 ──────────────────────────────────────────────────────
+data:
+  # 采集输出目录
+  output_dir: "data"
+  # 默认采集输出文件名
+  default_output: "manual_test.json"
+  # 输入数据文件 (用于 solve 命令)
+  input_file: "data/manual_test.json"
+
+# ── 场景参数 (平板 + 手眼真值) ────────────────────────────────────
+scene:
+  # 平板左下角位置 (世界坐标系, 米)
+  plate_corner: [0.5, -0.25, 0.25]
+  # 平板法向量 (朝上)
+  plate_normal: [0.0, 0.0, 1.0]
+  # 平板 u 边方向 (x 方向)
+  plate_u: [1.0, 0.0, 0.0]
+  # 平板 v 边方向 (y 方向)
+  plate_v: [0.0, 1.0, 0.0]
+  # 平板尺寸 (米) [宽 (u方向), 高 (v方向)]
+  plate_size: [0.4, 0.5]
+
+  # 手眼真值 (来自 URDF TF)
+  handeye_gt:
+    R_he: [[0.06048987, 0.88751593, -0.45678927],
+           [-0.98526871, -0.02024626, -0.16981060],
+           [-0.15995789, 0.46033200, 0.87321699]]
+    t_he: [-0.011579, -0.004621, 0.359284]
+
+  # 手眼名义值扰动 (模拟 CAD 估算误差, 用于初始值)
+  handeye_nominal_perturb:
+    R_perturb_deg: 90.0    # 旋转扰动 (°)
+    t_perturb_mm: 1200.0    # 平移扰动 (mm)
+
+  # 噪声模型 (模拟真实传感器)
+  noise:
+    laser_noise_std_mm: 0.2     # 激光测量噪声 σ (mm)
+    plate_warp_mm: 0.5            # 板翘曲 ±mm
+    robot_repeat_std_mm: 0.2      # 机器人重复定位噪声 σ (mm)
+
+# ── 传感器参数 (Gocator 2450) ──────────────────────────────────────
+sensor:
+  # FOV 参数
+  half_fov_deg: 15.0        # 半视场角
+  min_range_m: 0.27         # 最小测量距离
+  max_range_m: 0.82         # 最大测量距离
+  # FOV 角点 (传感器坐标系, 锥尖/右上/左上)
+  fov_corners_S:
+    tip: [0.0, 0.0, 0.0]         # corner 0: 锥尖
+    right_top: [0.22, 0.0, 0.82] # corner 2: 右上
+    left_top: [-0.22, 0.0, 0.82] # corner 3: 左上
+
+# ── 求解器参数 ──────────────────────────────────────────────────────
+solvers:
+  # 默认启用的求解器列表
+  enabled: ["9dof", "12dof-cross", "iterative"]
+
+  # ── 9-DOF (平面 + 边 joint LM) ──
+  dof9:
+    max_iter: 100              # 最大迭代次数
+    lam0: 1.0e-4               # 初始 Levenberg-Marquardt λ
+    lam_min: 1.0e-12           # λ 下限
+    lam_max: 1.0e6             # λ 上限
+    lam_accept_factor: 0.333   # 接受步时 λ *= factor
+    lam_reject_factor: 3.0     # 拒绝步时 λ *= factor
+    eps: 1.0e-6                # 数值微分步长
+    tol: 1.0e-12               # 收敛容差 (cost 变化)
+    w_plane: 0.1               # 平面残差权重
+    w_edge: 1.0                # 边残差权重
+    weight_schemes:            # 多重权重方案 (用于重启)
+      - [0.1, 1.0]             # 方案1: 标准 (plane轻, edge重)
+      - [0.05, 2.0]            # 方案2: edge更重
+      - [0.2, 0.5]             # 方案3: plane更重
+
+  # ── 12-DOF (C-anchored cross-product LM) ──
+  dof12:
+    max_iter: 500              # 最大迭代次数 (单次)
+    lam0: 1.0e-4               # 初始 λ
+    lam_min: 1.0e-12
+    lam_max: 1.0e6
+    lam_accept_factor: 0.333
+    lam_reject_factor: 3.0
+    eps: 1.0e-6
+    tol: 1.0e-12
+    n_restarts: 20            # 多重随机重启次数
+    angle_threshold_deg: 5.0  # 朝向分组阈值 (°)
+
+  # ── Iterative (交替 PCA→LM) ──
+  iterative:
+    max_outer_iter: 5          # 外层交替次数
+    max_inner_iter: 20         # 内层 LM 迭代次数
+    lam0: 1.0e-4
+    lam_min: 1.0e-12
+    lam_max: 1.0e6
+    lam_accept_factor: 0.333
+    lam_reject_factor: 3.0
+    eps: 1.0e-6
+    tol: 1.0e-12
+    plane_weight: 0.1          # 平面权重 (sqrt)
+
+# ── 采集参数 ──────────────────────────────────────────────────────
+collection:
+  # 自动采集
+  auto:
+    n_poses: 8                # 采集位姿数
+    peri_rot_step_deg: 2.0    # 蠕动旋转步长 (°)
+    peri_max_servo: 3         # 最大伺服迭代
+    peri_max_fail: 8          # 最大失败次数
+    edge_start_pose_e1:       # e1 边起始关节角
+      [-0.061, -0.353, -0.530, -0.038, -0.889, 0.078]
+    edge_start_pose_e2:       # e2 边起始关节角
+      [-0.019, -0.760, -1.059, -0.679, -0.940, 2.117]
+
+  # 手动采集
+  manual:
+    keyboard_poll_interval: 0.3  # 键盘轮询间隔 (秒)
+
+# ── 验证/诊断 ──────────────────────────────────────────────────────
+diagnostics:
+  svd_enabled: true           # 输出 Jacobian SVD 分析
+  convergence_scan: false     # 是否运行收敛域扫描
+  tilt_min_deg: 10.0          # Tilt 多样性最低要求 (°)
+  tilt_max_deg: 70.0          # Tilt 上限 (°)

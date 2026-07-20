@@ -8,7 +8,7 @@ calibrate.py — 标定管线：闭式解 + 12-DOF LM 精化
 import json, sys, os, numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'common'))
-from calib_solver import solve_he_closed_form, solve_he_t_cf, _group_poses_by_orientation
+from calib_solver import solve_he_closed_form, solve_he_t_cf
 from calib_solver import solve_12dof_with_restarts
 from fov_geometry import so3_exp, so3_log
 
@@ -103,15 +103,46 @@ def solve_12dof_lm(theta_init, poses, meas, max_iter=500, tol=1e-12, verbose=Fal
     return theta
 
 
-def init_12dof(poses, meas):
-    """从闭式解初始化 12-DOF"""
-    R_cf, cf_info = solve_he_closed_form(poses, meas)
-    if R_cf is None:
-        R_cf = np.eye(3)
+def _group_poses_by_orientation(poses, meas, angle_threshold_deg=5.0):
+    """按法兰朝向分组, 每组返回 (代表R, [(R_i,t_i,m), ...])"""
+    groups = []
+    used = set()
+    for i, ((R_i, t_i), m) in enumerate(zip(poses, meas)):
+        if i in used:
+            continue
+        group = [(R_i, t_i, m)]
+        used.add(i)
+        for j, ((R_j, t_j), m2) in enumerate(zip(poses, meas)):
+            if j in used:
+                continue
+            # 两朝向夹角 < 阈值 → 同组
+            dR = R_i.T @ R_j
+            tr = np.clip((np.trace(dR) - 1) / 2, -1, 1)
+            angle = np.rad2deg(np.arccos(tr))
+            if angle < angle_threshold_deg:
+                group.append((R_j, t_j, m2))
+                used.add(j)
+        groups.append((R_i, group))
+    return groups
 
-    (_, t_cf), t_info = solve_he_t_cf(poses, meas)
-    if np.linalg.norm(t_cf) < 1e-6:
-        t_cf = np.zeros(3)
+
+def init_12dof(poses, meas, R_he_nom=None, t_he_nom=None):
+    """边线交点法初始化 12-DOF (使用名义手眼产线 C)
+    
+    闭式解 solve_he_closed_form / solve_he_t_cf 尚未实现，
+    直接用名义值替代，C 通过边线交点计算。
+    """
+    if R_he_nom is None:
+        R_cf, _ = solve_he_closed_form(poses, meas)
+        if R_cf is None: R_cf = np.eye(3)
+    else:
+        R_cf = R_he_nom
+    
+    if t_he_nom is None:
+        (_, t_cf), _ = solve_he_t_cf(poses, meas, R_cf_in=R_cf)
+        if np.linalg.norm(t_cf) < 1e-6: t_cf = np.zeros(3)
+    else:
+        t_cf = t_he_nom
 
     # 估算边方向和 C
     groups = _group_poses_by_orientation(poses, meas, angle_threshold_deg=5.0)
