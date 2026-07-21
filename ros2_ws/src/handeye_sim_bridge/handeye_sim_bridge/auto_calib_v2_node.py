@@ -249,6 +249,8 @@ class AutoCalibV2Node(Node):
         R_BS, t_BS = self._get_sensor_pose_tf()
         rec = {'R_BH': R_BH, 't_BH': t_BH, 'R_BS': R_BS, 't_BS': t_BS,
                'n_pts': f['n_pts']}
+        if self.latest_joints is not None:
+            rec['J_i'] = self.latest_joints.copy().tolist()
         if f.get('e1'):
             rec['p_S_e1'] = np.array([f['e1'][0], 0.0, f['e1'][1]])
             rec['valid_e1'] = True

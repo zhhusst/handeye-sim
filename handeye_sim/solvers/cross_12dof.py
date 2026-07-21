@@ -45,16 +45,18 @@ def residuals_cross_12dof(theta, poses, meas):
     return np.array(residuals)
 
 
-def solve_cross_12dof_lm(theta_init, poses, meas, max_iter=500):
+def solve_cross_12dof_lm(theta_init, poses, meas, max_iter=500,
+                          lam0=1e-4, lam_min=1e-12, lam_max=1e6,
+                          lam_accept=0.333, lam_reject=3.0,
+                          eps=1e-6, tol=1e-12):
     """LM for C-anchored cross-product"""
     theta = theta_init.copy().astype(float)
-    lam = 1e-4
+    lam = lam0
 
     for _ in range(max_iter):
         r = residuals_cross_12dof(theta, poses, meas)
         cost = 0.5 * np.dot(r, r)
 
-        eps = 1e-6
         J = np.zeros((len(r), 12))
         for k in range(12):
             sp, sm = theta.copy(), theta.copy()
@@ -66,24 +68,24 @@ def solve_cross_12dof_lm(theta_init, poses, meas, max_iter=500):
         try:
             delta = -np.linalg.solve(J.T @ J + lam * np.eye(12), J.T @ r)
         except np.linalg.LinAlgError:
-            lam *= 10; continue
+            lam = min(lam * lam_reject, lam_max); continue
 
         tn = theta + delta
         rn = residuals_cross_12dof(tn, poses, meas)
         cn = 0.5 * np.dot(rn, rn)
 
         if cn < cost:
-            theta = tn; lam = max(lam / 3, 1e-12)
+            theta = tn; lam = max(lam * lam_accept, lam_min)
         else:
-            lam = min(lam * 3, 1e6)
+            lam = min(lam * lam_reject, lam_max)
 
-        if abs(cost - cn) < 1e-12:
+        if abs(cost - cn) < tol:
             break
 
     return theta
 
 
-def init_cross_12dof(poses, meas, R_he_nom=None, t_he_nom=None):
+def init_cross_12dof(poses, meas, R_he_nom=None, t_he_nom=None, angle_threshold=5.0):
     """初始化 12-DOF: PCA 估计 u_B, v_B + 边线交点 C"""
     if R_he_nom is None:
         R_cf = np.eye(3)
@@ -103,7 +105,7 @@ def init_cross_12dof(poses, meas, R_he_nom=None, t_he_nom=None):
         for rep_idx, rep_R in group_reps.items():
             dR = rep_R.T @ R_i
             tr = np.clip((np.trace(dR) - 1) / 2, -1, 1)
-            if np.rad2deg(np.arccos(tr)) < 5.0:
+            if np.rad2deg(np.arccos(tr)) < angle_threshold:
                 groups[rep_idx].append(i)
                 found = True
                 break
@@ -152,18 +154,33 @@ def init_cross_12dof(poses, meas, R_he_nom=None, t_he_nom=None):
 
 
 def calibrate_12dof_cross(poses, meas, R_he_nom=None, t_he_nom=None,
-                           n_restarts=20, seed=42) -> CalibResult:
+                           solver_cfg=None, n_restarts=20, seed=42) -> CalibResult:
     """12-DOF C-anchored cross-product 标定 (多重随机重启)
 
+    Args:
+        solver_cfg: dict, 来自 config.yaml solvers.dof12
+            keys: max_iter, lam0, lam_min, lam_max, lam_accept_factor,
+                  lam_reject_factor, eps, tol, n_restarts, angle_threshold_deg
     Returns: CalibResult
     """
-    theta_nom = init_cross_12dof(poses, meas, R_he_nom, t_he_nom)
+    cfg = solver_cfg or {}
+    _max_iter = cfg.get('max_iter', 500)
+    _lam0 = cfg.get('lam0', 1e-4)
+    _lam_min = cfg.get('lam_min', 1e-12)
+    _lam_max = cfg.get('lam_max', 1e6)
+    _lam_accept = cfg.get('lam_accept_factor', 0.333)
+    _lam_reject = cfg.get('lam_reject_factor', 3.0)
+    _eps = cfg.get('eps', 1e-6)
+    _tol = cfg.get('tol', 1e-12)
+    _n_restarts = cfg.get('n_restarts', n_restarts)
+    _angle_thresh = cfg.get('angle_threshold_deg', 5.0)
+    theta_nom = init_cross_12dof(poses, meas, R_he_nom, t_he_nom, angle_threshold=_angle_thresh)
     rng = np.random.RandomState(seed)
 
     best_cost = float('inf')
     best_theta = None
 
-    for trial in range(n_restarts + 1):
+    for trial in range(_n_restarts + 1):
         if trial == 0:
             ti = theta_nom.copy()
         else:
@@ -171,7 +188,10 @@ def calibrate_12dof_cross(poses, meas, R_he_nom=None, t_he_nom=None,
             ax = rng.randn(3); ax /= np.linalg.norm(ax)
             ti[0:3] += ax * rng.uniform(0, 0.5)
 
-        to = solve_cross_12dof_lm(ti, poses, meas, max_iter=200)
+        to = solve_cross_12dof_lm(ti, poses, meas, max_iter=_max_iter, lam0=_lam0,
+                                   lam_min=_lam_min, lam_max=_lam_max,
+                                   lam_accept=_lam_accept, lam_reject=_lam_reject,
+                                   eps=_eps, tol=_tol)
         cost = 0.5 * np.dot(residuals_cross_12dof(to, poses, meas),
                             residuals_cross_12dof(to, poses, meas))
         if cost < best_cost:

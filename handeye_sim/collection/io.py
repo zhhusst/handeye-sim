@@ -71,7 +71,12 @@ def load_calib_data(filepath: str) -> CalibData:
         if 'scan_pts_S' in p:
             meas.scan_pts_S = [np.array(pt) for pt in p['scan_pts_S']]
 
-        records.append(CalibRecord(pose=pose, meas=meas))
+        # 关节角 (可选, 用于噪声注入)
+        joints = None
+        if 'J_i' in p and p['J_i'] is not None:
+            joints = np.array(p['J_i'])
+
+        records.append(CalibRecord(pose=pose, meas=meas, joints=joints))
 
     scene_gt = None
     if 'scene' in raw:

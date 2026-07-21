@@ -37,11 +37,21 @@ scene:
     R_perturb_deg: 90.0    # 旋转扰动 (°)
     t_perturb_mm: 1200.0    # 平移扰动 (mm)
 
-  # 噪声模型 (模拟真实传感器)
+  # 噪声模型 — 物理模型: 关节角误差 → FK 传播 → 法兰位姿误差
+  # 真实误差源是 6 个关节角的编码器/零偏/挠度,每个关节独立 N(0,σ)
+  # 经 FK 传播后同时产生位置和旋转误差 (幅值由机器人构型决定)
   noise:
-    laser_noise_std_mm: 0.2     # 激光测量噪声 σ (mm)
-    plate_warp_mm: 0.5            # 板翘曲 ±mm
-    robot_repeat_std_mm: 0.2      # 机器人重复定位噪声 σ (mm)
+    enabled: true                       # 是否注入噪声
+    # ── 核心参数: 关节角噪声 ──
+    # FANUC 关节编码器分辨率 ~0.001°/步, 零偏+挠度综合 ~0.01° per joint
+    joint_std_deg: 0.01                # 每个关节角的零偏噪声 σ (°)
+    # ── 传感器噪声 ──
+    laser_std_mm: 0.05                 # Gocator 2450 激光测量噪声 σ (mm)
+    # ── 退化参数 (无关节角数据时使用, 数值由 joint_std_deg=0.01° 经 FK 近似) ──
+    robot_trans_std_mm: 0.3            # task-space 平移 fallback σ (mm)
+    robot_rot_std_deg: 0.03            # task-space 旋转 fallback σ (°)
+    # ── 场景噪声 ──
+    plate_warp_mm: 0.2                 # 板翘曲 ±mm
 
 # ── 传感器参数 (Gocator 2450) ──────────────────────────────────────
 sensor:
@@ -63,12 +73,12 @@ solvers:
   # ── 9-DOF (平面 + 边 joint LM) ──
   dof9:
     max_iter: 100              # 最大迭代次数
-    lam0: 1.0e-4               # 初始 Levenberg-Marquardt λ
+    lam0: 1.0e-04              # 初始 Levenberg-Marquardt λ
     lam_min: 1.0e-12           # λ 下限
-    lam_max: 1.0e6             # λ 上限
+    lam_max: 1.0e+06           # λ 上限
     lam_accept_factor: 0.333   # 接受步时 λ *= factor
     lam_reject_factor: 3.0     # 拒绝步时 λ *= factor
-    eps: 1.0e-6                # 数值微分步长
+    eps: 1.0e-06               # 数值微分步长
     tol: 1.0e-12               # 收敛容差 (cost 变化)
     w_plane: 0.1               # 平面残差权重
     w_edge: 1.0                # 边残差权重
@@ -80,26 +90,35 @@ solvers:
   # ── 12-DOF (C-anchored cross-product LM) ──
   dof12:
     max_iter: 500              # 最大迭代次数 (单次)
-    lam0: 1.0e-4               # 初始 λ
+    lam0: 1.0e-04              # 初始 λ
     lam_min: 1.0e-12
-    lam_max: 1.0e6
+    lam_max: 1.0e+06
     lam_accept_factor: 0.333
     lam_reject_factor: 3.0
-    eps: 1.0e-6
+    eps: 1.0e-06
     tol: 1.0e-12
     n_restarts: 20            # 多重随机重启次数
     angle_threshold_deg: 5.0  # 朝向分组阈值 (°)
+
+  # ── 12-DOF v2 (变量投影 + 标量残差) ──
+  dof12v2:
+    max_nfev: 5000             # scipy least_squares 最大函数求值次数
+    ftol: 1.0e-13              # cost 变化容差
+    xtol: 1.0e-13              # 参数变化容差
+    gtol: 1.0e-13              # 梯度范数容差
+    w_edge: 1.0                # 边残差权重 (v^T·(p-C), u^T·(p-C))
+    w_ep: 1.0                  # 端点平面残差权重 (n^T·(p-C))
 
   # ── Iterative (交替 PCA→LM) ──
   iterative:
     max_outer_iter: 5          # 外层交替次数
     max_inner_iter: 20         # 内层 LM 迭代次数
-    lam0: 1.0e-4
+    lam0: 1.0e-04
     lam_min: 1.0e-12
-    lam_max: 1.0e6
+    lam_max: 1.0e+06
     lam_accept_factor: 0.333
     lam_reject_factor: 3.0
-    eps: 1.0e-6
+    eps: 1.0e-06
     tol: 1.0e-12
     plane_weight: 0.1          # 平面权重 (sqrt)
 

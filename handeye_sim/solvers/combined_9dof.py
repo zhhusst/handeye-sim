@@ -115,7 +115,8 @@ def combined_solve_lm(theta_init, poses, meas, w_plane=0.1, w_edge=1.0,
     return theta
 
 
-def calibrate_9dof(poses, meas, R_he_nom=None, t_he_nom=None) -> CalibResult:
+def calibrate_9dof(poses, meas, R_he_nom=None, t_he_nom=None,
+                   solver_cfg=None) -> CalibResult:
     """运行 9-DOF 标定"""
     if R_he_nom is None:
         w_he_init = np.zeros(3)

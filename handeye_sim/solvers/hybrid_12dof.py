@@ -86,7 +86,7 @@ def _fit_line_through_points(pts):
 
 
 def calibrate_hybrid(poses, meas, R_he_nom=None, t_he_nom=None,
-                     refine_full_12dof=False) -> CalibResult:
+                     refine_full_12dof=False, solver_cfg=None) -> CalibResult:
     """混合 9→12-DOF 标定
 
     Args:

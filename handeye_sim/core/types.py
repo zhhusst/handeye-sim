@@ -45,9 +45,10 @@ class Measurement:
 
 @dataclass
 class CalibRecord:
-    """一次采集记录: 法兰位姿 + 测量"""
+    """一次采集记录: 法兰位姿 + 测量 + (可选) 关节角"""
     pose: Pose
     meas: Measurement
+    joints: Optional[np.ndarray] = None  # (6,) 弧度, J3_display, 噪声注入用
 
 
 @dataclass

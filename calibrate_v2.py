@@ -16,8 +16,21 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from handeye_sim.core.so3 import so3_exp, so3_log, rotation_error_deg, translation_error_mm
 from handeye_sim.core.types import CalibResult
+from handeye_sim.core.noise import apply_noise
 from handeye_sim.collection.io import save_calib_data, load_calib_data
 from handeye_sim.solvers import SOLVER_REGISTRY, run_all_solvers
+
+import json
+
+
+def _check_noise_applied(filepath):
+    """检查数据文件是否已含噪声标记"""
+    try:
+        with open(filepath) as f:
+            d = json.load(f)
+        return d.get('noise_applied', False)
+    except Exception:
+        return False
 
 
 def load_config(path=None):
@@ -69,6 +82,43 @@ def cmd_solve(args):
 
     print(f"Loading data: {input_file}")
     data = load_calib_data(input_file)
+
+    # ── 噪声注入 ──
+    # 检查数据文件是否已含噪声 (Gazebo 仿真数据已含, 纯 Python 生成的不含)
+    noise_already_applied = _check_noise_applied(input_file)
+    if noise_cfg.get('enabled', False) and not noise_already_applied:
+        noise_rng = np.random.default_rng(42)
+
+        # 提取关节角 (如果数据中有)
+        joint_angles = None
+        if all(r.joints is not None for r in data.records):
+            joint_angles = [r.joints for r in data.records]
+
+        if joint_angles is not None:
+            print(f"  Injecting noise (joint-space): joint_σ={noise_cfg.get('joint_std_deg',0.01)}° "
+                  f"laser_σ={noise_cfg.get('laser_std_mm',0.05)}mm")
+        else:
+            print(f"  Injecting noise (task-space fallback): "
+                  f"laser={noise_cfg.get('laser_std_mm',0.05)}mm "
+                  f"robot_trans={noise_cfg.get('robot_trans_std_mm',0.3)}mm "
+                  f"robot_rot={noise_cfg.get('robot_rot_std_deg',0.03)}°")
+
+        _poses_noisy, _meas_noisy = apply_noise(data.get_raw()[0], data.get_raw()[1],
+                                                  noise_cfg, rng=noise_rng,
+                                                  joint_angles=joint_angles)
+        # 回写到 data (需要更新 CalibData 内部结构)
+        for i, rec in enumerate(data.records):
+            rec.pose.R, rec.pose.t = _poses_noisy[i]
+            rec.meas.scan_pts_S = _meas_noisy[i].get('p_S_plane', [])
+            if _meas_noisy[i].get('p_S_e1') is not None:
+                rec.meas.p_S_e1 = _meas_noisy[i]['p_S_e1']
+            if _meas_noisy[i].get('p_S_e2') is not None:
+                rec.meas.p_S_e2 = _meas_noisy[i]['p_S_e2']
+    elif noise_already_applied:
+        print(f"  Noise: already applied (from Gazebo simulation)")
+    elif not noise_cfg.get('enabled', False):
+        print(f"  Noise: disabled (clean data)")
+
     poses, meas = data.get_raw()
     print(f"  {data.n_poses()} poses  (e1={data.n_e1()}, e2={data.n_e2()})")
 
@@ -93,16 +143,28 @@ def cmd_solve(args):
 
     # 运行求解器
     method = args.method
+    solvers_cfg = cfg.get('solvers', {})
+
+    # 方法名 → config 段映射
+    method_to_cfg = {
+        '9dof': solvers_cfg.get('dof9', {}),
+        '12dof-cross': solvers_cfg.get('dof12', {}),
+        '12dof-v2': solvers_cfg.get('dof12v2', {}),
+        'iterative': solvers_cfg.get('iterative', {}),
+    }
+
     print(f"\n{'='*60}")
     if method == 'all':
-        results = run_all_solvers(poses, meas, R_he_nom, t_he_nom)
+        results = run_all_solvers(poses, meas, R_he_nom, t_he_nom,
+                                   solvers_cfg=solvers_cfg, method_to_cfg=method_to_cfg)
     else:
         fn, desc = SOLVER_REGISTRY.get(method, (None, None))
         if fn is None:
             print(f"Unknown method: {method}. Available: {list(SOLVER_REGISTRY.keys())}"); return 1
         print(f"Running {method}: {desc}")
         try:
-            results = {method: fn(poses, meas, R_he_nom, t_he_nom)}
+            solver_cfg = method_to_cfg.get(method, {})
+            results = {method: fn(poses, meas, R_he_nom, t_he_nom, solver_cfg=solver_cfg)}
         except Exception as e:
             print(f"  FAILED: {e}"); import traceback; traceback.print_exc(); return 1
 

@@ -140,7 +140,8 @@ def iterative_refine_he(poses, meas, R_he_init, t_he_init, max_iter=5):
     return R_he, t_he, R_pl, n_B, it + 1
 
 
-def calibrate_iterative(poses, meas, R_he_nom=None, t_he_nom=None) -> CalibResult:
+def calibrate_iterative(poses, meas, R_he_nom=None, t_he_nom=None,
+                         solver_cfg=None) -> CalibResult:
     """交替精化标定"""
     if R_he_nom is None:
         R_he_nom = np.eye(3)

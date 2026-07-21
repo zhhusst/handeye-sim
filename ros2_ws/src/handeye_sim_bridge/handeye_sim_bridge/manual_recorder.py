@@ -117,6 +117,8 @@ class ManualRecorder(Node):
             'scan_pts_S': [p.tolist() for p in scan_pts_S],
             'valid_e1': valid_e1, 'valid_e2': valid_e2,
         }
+        if self.latest_joints is not None:
+            record['J_i'] = self.latest_joints.tolist()  # 6维关节角 (弧度), 用于关节空间噪声注入
         if p_S_e1 is not None: record['p_S_e1'] = p_S_e1.tolist()
         if p_S_e2 is not None: record['p_S_e2'] = p_S_e2.tolist()
 
@@ -128,7 +130,8 @@ class ManualRecorder(Node):
 
     def _save(self):
         data = {'poses': self.records,
-                'scene': {'R_he_gt': self.R_he_gt.tolist(), 't_he_gt': self.t_he_gt.tolist()}}
+                'scene': {'R_he_gt': self.R_he_gt.tolist(), 't_he_gt': self.t_he_gt.tolist()},
+                'noise_applied': True}   # Gazebo 仿真已含噪声，防止 calibrate_v2.py 重复注入
         os.makedirs(os.path.dirname(self.output_path) or '.', exist_ok=True)
         with open(self.output_path, 'w') as f: json.dump(data, f, indent=2)
         self.get_logger().info(f'Saved {len(self.records)} records → {self.output_path}')
