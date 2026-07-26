@@ -1,31 +1,28 @@
-# Build artifacts
-build/
-install/
-log/
+# ROS/Python build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+/log/
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# ROS2 build deps
+# ROS 2 source package archives
 ros-jazzy-*/
 *.tar.gz
 *.tar.xz
 *.dsc
 
-# Temp files
-/tmp/
-/tmp/*.yaml
-/tmp/*.sdf
-
-# Generated params
-mg_params.yaml
-rsp_params.yaml
+# Runtime output
+data/
+ros2_ws/src/handeye_sim_bridge/config/fov_calib.json
 
 # OS
 .DS_Store
 *.swp
 *.swo
-collected_poses.json\nrecorded_poses.json\ntest_record.txt
-*.json
-test_record.txt

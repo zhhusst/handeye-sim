@@ -1,6 +1,7 @@
-from setuptools import find_packages, setup
 import os
 from glob import glob
+
+from setuptools import find_packages, setup
 
 package_name = 'handeye_sim_bridge'
 
@@ -18,13 +19,8 @@ setup(
          glob('rviz/*.rviz')),
         (os.path.join('share', package_name, 'config'),
          glob('config/*')),
-        (os.path.join('lib', package_name),
-         [os.path.join(package_name, 'scene_publisher_node.py'),
-          os.path.join(package_name, 'srdf_publisher_node.py'),
-          os.path.join(package_name, 'auto_calib_v2_node.py'),
-          os.path.join(package_name, 'profile_viz_node.py')]),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'numpy', 'scipy', 'PyYAML'],
     zip_safe=True,
     maintainer='Zhang HaHa',
     maintainer_email='z@z.com',
@@ -34,8 +30,9 @@ setup(
         'console_scripts': [
             'scene_publisher_node = handeye_sim_bridge.scene_publisher_node:main',
             'srdf_publisher_node = handeye_sim_bridge.srdf_publisher_node:main',
-            'auto_calib_v2 = handeye_sim_bridge.auto_calib_v2_node:main',
             'profile_viz = handeye_sim_bridge.profile_viz_node:main',
+            'seed_collection = handeye_sim_bridge.seed_collection_node:main',
+            'calibration_demo = calibration_pipeline.cli:main',
         ],
     },
 )

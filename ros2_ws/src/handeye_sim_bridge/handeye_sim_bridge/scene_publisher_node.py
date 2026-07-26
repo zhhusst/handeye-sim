@@ -16,10 +16,10 @@ from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, Marker
 from std_srvs.srv import Trigger
 
-import sys, os, json
-sys.path.insert(0, '/workspace/common')
+import os
+import json
 
-from fov_geometry import (
+from calibration_pipeline.simulation.scanline import (
     compute_fov_plate_scanline, compute_fov_triangle,
     build_R_edge, make_transform, rpy_to_matrix, so3_exp,
 )
@@ -29,6 +29,7 @@ from interactive_markers.interactive_marker_server import InteractiveMarkerServe
 import tf2_ros
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
+from ament_index_python.packages import get_package_share_directory
 
 JOINT_NAMES = ['J1_joint', 'J2_joint', 'J3_joint',
                'J4_joint', 'J5_joint', 'J6_joint']
@@ -79,11 +80,20 @@ class ScenePublisher(Node):
     def __init__(self):
         super().__init__('scene_publisher')
 
-        self.publisher = CalibPublisher()
+        self.publisher = CalibPublisher(self)
 
-        # FOV 校准持久化路径 — 拖拽后自动保存，重启自动加载
-        # 保存在源码目录的 config/ 下，便于版本控制
-        self._fov_calib_path = '/workspace/ros2_ws/src/handeye_sim_bridge/config/fov_calib.json'
+        # FOV 拖拽校准属于运行数据，不写回源码目录。
+        self.declare_parameter(
+            'fov_calibration_file', '/workspace/data/fov_calib.json'
+        )
+        self._fov_calib_path = str(
+            self.get_parameter('fov_calibration_file').value
+        )
+        self._fov_factory_path = os.path.join(
+            get_package_share_directory('handeye_sim_bridge'),
+            'config',
+            'fov_factory_calib.json',
+        )
 
         # 模拟 GoCator 数据发布器（点云，传感器系 XZ 坐标）
         self.gocator_pub = self.create_publisher(
@@ -92,7 +102,7 @@ class ScenePublisher(Node):
         self.endpoint_pub = self.create_publisher(
             Float64MultiArray, '/gocator/endpoints', 10)
         # ── 噪声模型（可配置） ──
-        # 激光测量噪声 σ (m) — Num2 默认 0.055mm
+        # 激光测量噪声 σ (m)
         self.declare_parameter('laser_noise_std', 0.000055)
         # 板翘曲幅度 ±mm — 每帧给平板法向量加随机扰动
         self.declare_parameter('plate_warp_mm', 0.5)
@@ -114,16 +124,25 @@ class ScenePublisher(Node):
         # latest_joints 需要先初始化，FOV IM 引用它
         self.latest_joints = None
 
-        # 场景 — 固定位置（与 Gazebo 里生出的物理平板一致）
-        C = np.array([0.7, 0.0, 0.25])   # 前上方
-        n_B = np.array([0., 0., 1.])      # 朝上
-        u_B = np.array([1., 0., 0.])
-        v_B = np.array([0., 1., 0.])
-        w, h = 0.4, 0.5
+        # 场景参数与 Gazebo 中的物理平板保持一致。
+        self.declare_parameter('board.corner', [0.7, 0.0, 0.25])
+        self.declare_parameter(
+            'board.rotation',
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+        )
+        self.declare_parameter('board.length_u_m', 0.4)
+        self.declare_parameter('board.length_v_m', 0.5)
+        C = np.asarray(self.get_parameter('board.corner').value, dtype=float)
+        R_plate = np.asarray(
+            self.get_parameter('board.rotation').value, dtype=float
+        ).reshape(3, 3)
+        u_B, v_B, n_B = R_plate[:, 0], R_plate[:, 1], R_plate[:, 2]
+        w = float(self.get_parameter('board.length_u_m').value)
+        h = float(self.get_parameter('board.length_v_m').value)
 
-        # 手眼真值 — gocator_sensor 坐标系原点（在激光平面上）
+        # 手眼真值 — gocator_sensor 原点位于激光平面内，但不在激光窗口上。
         # fanuc_flange → gocator_sensor 关节: xyz=[-0.0116,-0.0046,0.3593] rpy=[0.485,0.161,-1.509]
-        # 注意：gocator_sensor 坐标系定义在激光平面上，visual mesh 的 (0,0,-0.27) 偏移只影响渲染
+        # 激光窗口约位于 z_S=-0.29 m，见 fov_factory_calib.json。
         R_he = np.array([[ 0.99964905,  0.02634223,  0.00280383],
                          [-0.02631765,  0.99961777, -0.00846724],
                          [-0.00302581,  0.00839048,  0.99996022]])
@@ -132,23 +151,9 @@ class ScenePublisher(Node):
         X_gt = make_transform(R_he, t_he)
         R_he, t_he = X_gt[:3, :3], X_gt[:3, 3]
 
-        R_plate = np.eye(3)  # 平板面朝上（与 Gazebo 模型一致）
-
-        # FOV 三角形偏移参数：锥尖在传感器系中的位置
-        # Gocator 2450 的激光窗口位置相对于 sensor frame 原点的偏移
-        fov_tip_offset_x = self.declare_parameter('fov_tip_offset_x', 0.0).value
-        fov_tip_offset_z = self.declare_parameter('fov_tip_offset_z', 0.0).value
-
-        # FOV 激光平面 = gocator_sensor 的 XZ 平面
-        # 4个角点: 0=激光窗口, 1=(同点,退化), 2=右上, 3=左上
-        # tip_offset 让锥尖对准实际激光发射窗口
-        dx, dz = fov_tip_offset_x, fov_tip_offset_z
-        fov_corners_S = [
-            np.array([dx, 0.0, dz]),           # corner 0: 激光窗口锥尖
-            np.array([dx, 0.0, dz]),           # corner 1: 同上（退化形成三角形）
-            np.array([dx + 0.22, 0.0, dz + 0.820]), # corner 2: 右上
-            np.array([dx - 0.22, 0.0, dz + 0.820]), # corner 3: 左上
-        ]
+        # FOV 激光平面 = gocator_sensor 的 XZ 平面。前两个点定义真实激光
+        # 窗口，后两个点定义量程远端；传感器原点位于主 FOV 三角区域内部。
+        fov_corners_S = self._load_factory_fov_corners()
         self.scene = {
             'C': C, 'n_B': n_B, 'u_B': u_B, 'v_B': v_B,
             'w': w, 'h': h,
@@ -158,7 +163,7 @@ class ScenePublisher(Node):
         }
         self.publisher.set_scene(C, n_B, u_B, v_B, w, h)
 
-        # 加载已保存的 FOV 校准（覆盖默认角点）
+        # 加载用户拖拽保存的运行时校准（如存在，则覆盖出厂几何）。
         self._load_fov_calib()
 
         # TF 缓存 — 用于将 gocator_sensor 系坐标转 world 系
@@ -261,7 +266,8 @@ class ScenePublisher(Node):
                              t.transform.translation.z])
         except Exception as e:
             self.get_logger().info(
-                f'等待 TF world→gocator_sensor 就绪... ({e})')
+                f'等待 TF world→gocator_sensor 就绪... ({e})',
+                once=True)
             return False
 
         self.get_logger().info(
@@ -395,9 +401,14 @@ class ScenePublisher(Node):
                     n_warped = n_B
 
                 res = compute_fov_plate_scanline(
-                    R_BS=R_noisy, t_BS=t_noisy,
-                    C=C, n_B=n_warped, u_B=u_B, v_B=v_B,
-                    pw=w, ph=h,
+                    rotation_sensor_base=R_noisy,
+                    translation_sensor_base=t_noisy,
+                    corner=C,
+                    normal=n_warped,
+                    u=u_B,
+                    v=v_B,
+                    width=w,
+                    height=h,
                     fov_corners_S=self.scene['fov_corners_S'])
 
                 # 世界系角点（用户校准的真实激光窗口）
@@ -471,25 +482,48 @@ class ScenePublisher(Node):
                 self.endpoint_pub.publish(ep)
 
             except Exception as e:
-                self.get_logger().warn(f'TF/scene publish error: {e}')
+                self.get_logger().warn(
+                    f'TF/scene publish error: {e}',
+                    throttle_duration_sec=2.0)
                 # TF 失败时只发平板（不画 FOV，因为没 TF 算不准位置）
                 self.publisher.publish_scene_markers(stamp)
         else:
             # 无 joint 数据时只发平板
             self.publisher.publish_scene_markers(stamp)
 
-    def _load_fov_calib(self):
-        """从文件加载已保存的 FOV 校准值"""
+    def _load_factory_fov_corners(self):
+        """Load the immutable laser-window geometry shipped with the package."""
+        fallback = [
+            [-0.019891060683164145, 0.0, -0.2892952979686891],
+            [-0.020634857260870637, 0.0, -0.2922409434429649],
+            [0.22, 0.0, 0.82],
+            [-0.22, 0.0, 0.82],
+        ]
         try:
-            with open(self._fov_calib_path, 'r') as f:
+            with open(self._fov_factory_path, 'r', encoding='utf-8') as stream:
+                data = json.load(stream)
+            corners = np.asarray(data['fov_corners_S'], dtype=float)
+            if corners.shape != (4, 3):
+                raise ValueError('fov_corners_S must have shape (4, 3)')
+            return [corner.copy() for corner in corners]
+        except Exception as error:
+            self.get_logger().error(
+                f'加载出厂 FOV 几何失败，使用内置回退值: {error}')
+            return [np.asarray(corner, dtype=float) for corner in fallback]
+
+    def _load_fov_calib(self):
+        """Load an optional runtime override saved by interactive dragging."""
+        try:
+            with open(self._fov_calib_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             corners = [np.array(c, dtype=float) for c in data['fov_corners_S']]
             if len(corners) == 4:
                 self.scene['fov_corners_S'] = corners
                 self.get_logger().info(
-                    f'已加载 FOV 校准: {[f"[{c[0]:.3f},{c[1]:.3f},{c[2]:.3f}]" for c in corners]}')
+                    f'已加载运行时 FOV 校准: '
+                    f'{[f"[{c[0]:.3f},{c[1]:.3f},{c[2]:.3f}]" for c in corners]}')
         except FileNotFoundError:
-            self.get_logger().info('无已保存的 FOV 校准，使用默认值')
+            self.get_logger().info('无运行时 FOV 校准，使用出厂激光窗口几何')
         except Exception as e:
             self.get_logger().warn(f'加载 FOV 校准失败: {e}')
 
@@ -537,7 +571,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

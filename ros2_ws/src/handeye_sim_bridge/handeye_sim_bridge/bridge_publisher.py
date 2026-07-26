@@ -8,8 +8,6 @@ bridge_publisher.py — 手眼标定仿真 发布节点
   3. 接收采集帧数据并可视化
 """
 
-import rclpy
-from rclpy.node import Node
 import numpy as np
 from geometry_msgs.msg import TransformStamped
 from visualization_msgs.msg import MarkerArray
@@ -25,26 +23,26 @@ from handeye_sim_bridge.calib_visualization import (
 )
 
 
-class CalibPublisher(Node):
-    """标定场景发布器 — TF + Marker"""
+class CalibPublisher:
+    """TF/Marker publishing component owned by an existing ROS node."""
 
-    def __init__(self):
-        super().__init__('calib_publisher')
+    def __init__(self, node):
+        self.node = node
 
         # 参数
-        self.declare_parameter('half_fov_deg', 15.0)
-        self.declare_parameter('max_range', 0.82)
-        self.half_fov_deg = self.get_parameter('half_fov_deg').value
-        self.max_range = self.get_parameter('max_range').value
+        node.declare_parameter('sensor.half_fov_deg', 15.0)
+        node.declare_parameter('sensor.max_range_m', 0.82)
+        self.half_fov_deg = node.get_parameter('sensor.half_fov_deg').value
+        self.max_range = node.get_parameter('sensor.max_range_m').value
 
         # 发布器
-        self.tf_broadcaster = TransformBroadcaster(self)
-        self.marker_pub = self.create_publisher(MarkerArray, '/calib/markers', 10)
+        self.tf_broadcaster = TransformBroadcaster(node)
+        self.marker_pub = node.create_publisher(MarkerArray, '/calib/markers', 10)
 
         # 场景参数 (由 runner 设置)
         self.scene = None
 
-        self.get_logger().info('CalibPublisher 已启动')
+        node.get_logger().info('CalibPublisher 已启动')
 
     def set_scene(self, C, n_B, u_B, v_B, w, h):
         """设置场景参数"""

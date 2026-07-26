@@ -1,0 +1,46 @@
+/**:
+  ros__parameters:
+    # Phase 0a: URDF truth is perturbed only to create a realistic nominal value.
+    handeye_init_rotation_error_deg: 3.0
+    handeye_init_translation_error_mm: 10.0
+
+    board:
+      corner: [0.7, 0.0, 0.25]
+      rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+      length_u_m: 0.4
+      length_v_m: 0.5
+
+    sensor:
+      min_range_m: 0.27
+      max_range_m: 0.82
+      half_fov_deg: 15.0
+      roi_safe_margin_m: 0.01
+
+    seed:
+      target_count: 6
+      rotation_target_deg: 15.0
+      rotation_step_deg: 2.0
+      minimum_rotation_step_deg: 0.5
+      probe_step_m: 0.003
+      x_mid_tolerance_m: 0.003
+      maximum_servo_iterations: 8
+      minimum_rotation_separation_deg: 5.0
+
+    solver:
+      plane_weight: 1.0
+      edge_weight: 1.0
+      endpoint_plane_weight: 1.0
+      max_evaluations: 3000
+      tolerance: 1.0e-11
+
+    nbv:
+      edge_samples: 4
+      edge_margin_m: 0.04
+      alpha_deg: [20.0, 35.0, 50.0]
+      psi_deg: [-15.0, 0.0, 15.0]
+      working_distance_m: [0.4, 0.55, 0.7]
+      minimum_valid_probability: 0.8
+      minimum_poses: 3
+      maximum_total_poses: 20
+      information_gain_threshold: 1.0e-3
+      consecutive_low_gain_limit: 3

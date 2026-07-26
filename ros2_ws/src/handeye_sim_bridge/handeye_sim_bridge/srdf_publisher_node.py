@@ -10,6 +10,8 @@ MoveIt MotionPlanning RViz 显示插件需要订阅 /robot_description_semantic 
 
 import rclpy
 from rclpy.node import Node
+from ament_index_python.packages import get_package_share_directory
+import os
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from std_msgs.msg import String
 import sys
@@ -25,7 +27,9 @@ def main():
     srdf_path = node.get_parameter('srdf_path').value
     if not srdf_path:
         # 默认路径
-        srdf_path = '/workspace/ros2_ws/src/handeye_sim_bridge/config/fanuc.srdf'
+        srdf_path = os.path.join(
+            get_package_share_directory('handeye_sim_bridge'), 'config', 'fanuc.srdf'
+        )
 
     # 读取 SRDF 文件
     try:

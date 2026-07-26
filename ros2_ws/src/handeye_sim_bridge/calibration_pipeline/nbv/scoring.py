@@ -1,0 +1,70 @@
+"""Full variable-projection information scoring for feasible candidates."""
+
+from __future__ import annotations
+
+import numpy as np
+
+from ..models import Candidate, CandidateScore, FlangePose, SensorROI
+from ..v2_backend.information import effective_handeye_information, information_gain
+from ..v2_backend.residual import numerical_jacobian, variable_projection_residual
+from .profile_predictor import predict_candidate
+from .validity import candidate_valid_probability
+
+
+def score_candidates(
+    candidates: list[Candidate],
+    result,
+    poses,
+    measurements,
+    roi: SensorROI,
+    *,
+    minimum_valid_probability: float = 0.8,
+    projection_weights: dict | None = None,
+    maximum_candidates: int | None = None,
+) -> list[CandidateScore]:
+    projection_weights = projection_weights or {}
+    x9 = result.estimate.x9
+    residual = lambda state: variable_projection_residual(
+        state, poses, measurements, **projection_weights
+    )
+    current_jacobian = numerical_jacobian(residual, x9)
+    current_information = effective_handeye_information(current_jacobian)
+    scored: list[CandidateScore] = []
+    iterable = candidates if maximum_candidates is None else candidates[:maximum_candidates]
+    for candidate in iterable:
+        prediction = predict_candidate(candidate, result.estimate, roi)
+        if not prediction.valid or prediction.measurement is None:
+            continue
+        probability = candidate_valid_probability(
+            candidate,
+            result.estimate,
+            poses,
+            measurements,
+            roi,
+            projection_weights=projection_weights,
+        )
+        if probability < minimum_valid_probability:
+            continue
+        flange = candidate.flange_transform_command
+        augmented_poses = poses + [FlangePose(flange[:3, :3], flange[:3, 3])]
+        augmented_measurements = measurements + [prediction.measurement]
+        augmented_residual = lambda state: variable_projection_residual(
+            state, augmented_poses, augmented_measurements, **projection_weights
+        )
+        augmented_jacobian = numerical_jacobian(augmented_residual, x9)
+        augmented_information = effective_handeye_information(augmented_jacobian)
+        eigenvalues = np.linalg.eigvalsh(augmented_information)
+        scored.append(
+            CandidateScore(
+                candidate=candidate,
+                prediction=prediction,
+                valid_probability=float(probability),
+                information_gain=information_gain(current_information, augmented_information),
+                minimum_eigenvalue=float(eigenvalues[0]),
+            )
+        )
+    return sorted(
+        scored,
+        key=lambda item: (item.information_gain, item.minimum_eigenvalue),
+        reverse=True,
+    )

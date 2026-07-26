@@ -19,6 +19,15 @@
     ],
     "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
     "workspaceFolder": "/workspace",
+    "forwardPorts": [
+        6080
+    ],
+    "portsAttributes": {
+        "6080": {
+            "label": "Gazebo + RViz (noVNC)",
+            "onAutoForward": "openBrowser"
+        }
+    },
     "postCreateCommand": "bash /workspace/.devcontainer/post-create.sh",
     "customizations": {
         "vscode": {

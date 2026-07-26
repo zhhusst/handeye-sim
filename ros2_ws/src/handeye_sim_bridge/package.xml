@@ -3,7 +3,7 @@
 <package format="3">
   <name>handeye_sim_bridge</name>
   <version>0.1.0</version>
-  <description>ROS2 桥接 — 手眼标定仿真可视化 (纯数值 FOV 几何 + RViz)</description>
+  <description>双边角点主动手眼标定核心算法与 ROS 2 仿真适配</description>
   <maintainer email="z@z.com">Zhang HaHa</maintainer>
   <license>Apache-2.0</license>
 
@@ -14,6 +14,17 @@
   <depend>tf2_ros</depend>
   <depend>tf2_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>control_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>sensor_msgs_py</depend>
+  <depend>interactive_markers</depend>
+  <depend>ament_index_python</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <test_depend>python3-pytest</test_depend>
 
   <export>
     <build_type>ament_python</build_type>

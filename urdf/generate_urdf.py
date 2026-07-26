@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
-"""
-generate_urdf.py — 从原始宏定义生成 FANUC M-20iD/25 + GoCator URDF
+"""Generate the self-contained FANUC M-20iD/25 + Gocator URDF."""
 
-关节定义直接从焊接工作区的 m20_25-18d_urdf_macro.xacro 复制。
-输出: /workspace/urdf/calib_robot.urdf
-"""
+import math
+from pathlib import Path
 
-import os
+URDF_DIR = Path(__file__).resolve().parent
+MESH = f'file://{URDF_DIR.parent / "meshes"}'
 
-MESH = 'file:///workspace/meshes'
-
+# name, mesh, mass, diagonal inertia.  These inertial values are intentionally
+# kept in the generator: Gazebo removes movable URDF links without inertia.
 LINKS = [
-    ('base_link',   f'{MESH}/base.dae'),
-    ('J1_link',     f'{MESH}/j1.dae'),
-    ('J2_link',     f'{MESH}/j2.dae'),
-    ('J3_link',     f'{MESH}/j3.dae'),
-    ('J4_link',     f'{MESH}/j4.dae'),
-    ('J5_link',     f'{MESH}/j5.dae'),
-    ('J6_link',     f'{MESH}/j6.dae'),
+    ('base_link', f'{MESH}/base.dae', 200.0, (10.0, 10.0, 10.0)),
+    ('J1_link', f'{MESH}/j1.dae', 80.0, (5.0, 5.0, 5.0)),
+    ('J2_link', f'{MESH}/j2.dae', 100.0, (6.0, 6.0, 6.0)),
+    ('J3_link', f'{MESH}/j3.dae', 60.0, (4.0, 4.0, 4.0)),
+    ('J4_link', f'{MESH}/j4.dae', 20.0, (1.0, 1.0, 1.0)),
+    ('J5_link', f'{MESH}/j5.dae', 15.0, (0.5, 0.5, 0.5)),
+    ('J6_link', f'{MESH}/j6.dae', 8.0, (0.3, 0.3, 0.3)),
 ]
 
 # 关节定义: (name, type, xyz, rpy, axis, parent, child, limits)
@@ -58,16 +57,35 @@ def gen():
     w('  <link name="world" />')
 
     # linkages
-    for name, mesh in LINKS:
+    for name, mesh, mass, inertia in LINKS:
+        ixx, iyy, izz = inertia
         w(f'  <link name="{name}">')
-        w(f'    <visual>')
-        w(f'      <origin xyz="0 0 0" rpy="0 0 0" />')
+        w('    <visual>')
+        w('      <origin xyz="0 0 0" rpy="0 0 0" />')
         w(f'      <geometry><mesh filename="{mesh}" /></geometry>')
-        w(f'    </visual>')
+        w('    </visual>')
+        w('    <collision>')
+        w('      <origin xyz="0 0 0" rpy="0 0 0" />')
+        w(f'      <geometry><mesh filename="{mesh}" /></geometry>')
+        w('    </collision>')
+        w('    <inertial>')
+        w(f'      <mass value="{mass}"/>')
+        w(
+            f'      <inertia ixx="{ixx}" ixy="0.0" ixz="0.0" '
+            f'iyy="{iyy}" iyz="0.0" izz="{izz}"/>'
+        )
+        w('    </inertial>')
         w(f'  </link>')
 
     # flanges & end
-    for name in ('flange', 'fanuc_flange', 'ee_link'):
+    w('  <link name="flange">')
+    w('    <inertial>')
+    w('      <mass value="1.0"/>')
+    w('      <inertia ixx="0.1" ixy="0.0" ixz="0.0" '
+      'iyy="0.1" iyz="0.0" izz="0.1"/>')
+    w('    </inertial>')
+    w('  </link>')
+    for name in ('fanuc_flange', 'ee_link'):
         w(f'  <link name="{name}" />')
 
     # GoCator
@@ -76,6 +94,15 @@ def gen():
     w('      <origin xyz="0 0 -0.270" rpy="0 0 0" />')
     w(f'      <geometry><mesh filename="{MESH}/Gocator_2450.dae" /></geometry>')
     w('    </visual>')
+    w('    <collision>')
+    w('      <origin xyz="0 0 -0.270" rpy="0 0 0" />')
+    w('      <geometry><box size="0.065 0.110 0.132" /></geometry>')
+    w('    </collision>')
+    w('    <inertial>')
+    w('      <mass value="1.5"/>')
+    w('      <inertia ixx="0.1" ixy="0.0" ixz="0.0" '
+      'iyy="0.1" iyz="0.0" izz="0.1"/>')
+    w('    </inertial>')
     w('  </link>')
 
     # base_joint: world → base_link
@@ -94,17 +121,53 @@ def gen():
         if axis:
             w(f'    <axis xyz="{axis}" />')
         if limits:
-            lo, hi, effort, vel = limits
-            w(f'    <limit lower="{lo}" upper="{hi}" effort="{effort}" velocity="{vel}" />')
+            lo_deg, hi_deg, effort, velocity_deg = limits
+            lo = math.radians(lo_deg)
+            hi = math.radians(hi_deg)
+            velocity = math.radians(velocity_deg)
+            w(
+                f'    <limit lower="{lo:.9f}" upper="{hi:.9f}" '
+                f'effort="{effort}" velocity="{velocity:.9f}" />'
+            )
         w('  </joint>')
 
+    w('')
+    w('  <!-- ros2_control: Gazebo Sim hardware interface -->')
+    w('  <ros2_control name="GazeboSystem" type="system">')
+    w('    <hardware>')
+    w('      <plugin>gz_ros2_control/GazeboSimSystem</plugin>')
+    w('    </hardware>')
+    for name in ('J1', 'J2', 'J3', 'J4', 'J5', 'J6'):
+        w(f'    <joint name="{name}_joint">')
+        w('      <command_interface name="position"/>')
+        w('      <state_interface name="position"/>')
+        w('      <state_interface name="velocity"/>')
+        w('    </joint>')
+    w('  </ros2_control>')
+    w('')
+    controller_config = (
+        URDF_DIR.parent
+        / 'ros2_ws'
+        / 'src'
+        / 'handeye_sim_bridge'
+        / 'config'
+        / 'gz_controllers.yaml'
+    )
+    w('  <!-- Gazebo Sim plugin loader for ros2_control -->')
+    w('  <gazebo>')
+    w(
+        '    <plugin filename="gz_ros2_control-system" '
+        'name="gz_ros2_control::GazeboSimROS2ControlPlugin">'
+    )
+    w(f'      <parameters>{controller_config}</parameters>')
+    w('    </plugin>')
+    w('  </gazebo>')
     w('</robot>')
-    return '\n'.join(lines)
+    return '\n'.join(lines) + '\n'
 
 
 if __name__ == '__main__':
     urdf = gen()
-    out = '/workspace/urdf/calib_robot.urdf'
-    with open(out, 'w') as f:
-        f.write(urdf)
+    out = URDF_DIR / 'calib_robot.urdf'
+    out.write_text(urdf, encoding='utf-8')
     print(f'URDF generated: {out}  ({len(urdf)} chars)')

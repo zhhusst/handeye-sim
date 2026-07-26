@@ -121,8 +121,6 @@
       <inertia ixx="0.1" ixy="0.0" ixz="0.0" iyy="0.1" iyz="0.0" izz="0.1"/>
     </inertial>
   </link>
-
-  <!-- joints: unchanged from original -->
   <joint name="base_joint" type="fixed">
     <origin xyz="0 0 0" rpy="0 0 0" />
     <parent link="world" />
@@ -133,42 +131,42 @@
     <parent link="base_link" />
     <child link="J1_link" />
     <axis xyz="0 0 1" />
-    <limit lower="-185" upper="185" effort="7000" velocity="210" />
+    <limit lower="-3.228859116" upper="3.228859116" effort="7000" velocity="3.665191429" />
   </joint>
   <joint name="J2_joint" type="revolute">
     <origin xyz=".075 0 0" rpy="0 0 0" />
     <parent link="J1_link" />
     <child link="J2_link" />
     <axis xyz="0 1 0" />
-    <limit lower="-100" upper="160" effort="8000" velocity="210" />
+    <limit lower="-1.745329252" upper="2.792526803" effort="8000" velocity="3.665191429" />
   </joint>
   <joint name="J3_joint" type="revolute">
     <origin xyz="0 0 .84" rpy="0 0 0" />
     <parent link="J2_link" />
     <child link="J3_link" />
     <axis xyz="0 -1 0" />
-    <limit lower="-90" upper="220" effort="4000" velocity="265" />
+    <limit lower="-1.570796327" upper="3.839724354" effort="4000" velocity="4.625122518" />
   </joint>
   <joint name="J4_joint" type="revolute">
     <origin xyz="0 0 .215" rpy="0 0 0" />
     <parent link="J3_link" />
     <child link="J4_link" />
     <axis xyz="-1 0 0" />
-    <limit lower="-200" upper="200" effort="300" velocity="420" />
+    <limit lower="-3.490658504" upper="3.490658504" effort="300" velocity="7.330382858" />
   </joint>
   <joint name="J5_joint" type="revolute">
     <origin xyz=".89 0 0" rpy="0 0 0" />
     <parent link="J4_link" />
     <child link="J5_link" />
     <axis xyz="0 -1 0" />
-    <limit lower="-179.999" upper="179.999" effort="300" velocity="420" />
+    <limit lower="-3.141575200" upper="3.141575200" effort="300" velocity="7.330382858" />
   </joint>
   <joint name="J6_joint" type="revolute">
     <origin xyz="0 0 0" rpy="0 0 0" />
     <parent link="J5_link" />
     <child link="J6_link" />
     <axis xyz="-1 0 0" />
-    <limit lower="-450" upper="450" effort="200" velocity="720" />
+    <limit lower="-7.853981634" upper="7.853981634" effort="200" velocity="12.566370614" />
   </joint>
   <joint name="J6-flange_joint" type="fixed">
     <origin xyz=".09 0 0" rpy="0 0 0" />
@@ -191,7 +189,7 @@
     <child link="ee_link" />
   </joint>
 
-  <!-- ros2_control: Gazebo Sim ros2_control hardware interface -->
+  <!-- ros2_control: Gazebo Sim hardware interface -->
   <ros2_control name="GazeboSystem" type="system">
     <hardware>
       <plugin>gz_ros2_control/GazeboSimSystem</plugin>
