@@ -5,28 +5,42 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import time
 
-import numpy as np
-import rclpy
-import sensor_msgs_py.point_cloud2 as point_cloud2
+from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
+import numpy as np
+import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import JointState, PointCloud2
+import sensor_msgs_py.point_cloud2 as point_cloud2
 from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
+from tf2_ros import Buffer, TransformListener
 
-from calibration_pipeline.geometry import make_transform, so3_exp
-from calibration_pipeline.models import SensorROI
+from calibration_pipeline.geometry import (
+    make_transform,
+    quaternion_to_matrix,
+    so3_exp,
+)
+from calibration_pipeline.models import SensorROI, TrapezoidDomain
 from calibration_pipeline.seed_collection import (
+    InitialPoseCriteria,
+    RotationTarget,
     TranslationServo,
+    adaptive_rotation_plan,
+    assess_initial_pose,
     evaluate_bilateral_feature,
+    local_preflight_is_acceptable,
     rotation_diversity,
-    star_rotation_plan,
+    seed_feature_is_acceptable,
 )
 from handeye_sim_bridge.fanuc_kinematic import (
+    JOINT_LIMITS_DEG,
     forward_kinematics_urdf,
     inverse_kinematics_numeric,
 )
@@ -48,24 +62,68 @@ class SeedCollectionNode(Node):
     def __init__(self) -> None:
         super().__init__("bilateral_seed_collection")
         self.declare_parameter("auto_start", False)
-        self.declare_parameter("seed.rotation_target_deg", 15.0)
+        self.declare_parameter("collection_mode", "automatic")
+        self.declare_parameter("seed.rotation_target_deg", 6.0)
         self.declare_parameter("seed.rotation_step_deg", 2.0)
-        self.declare_parameter("seed.minimum_rotation_step_deg", 0.5)
-        self.declare_parameter("seed.probe_step_m", 0.003)
+        self.declare_parameter("seed.minimum_rotation_step_deg", 0.25)
+        self.declare_parameter("seed.minimum_partial_rotation_deg", 2.5)
+        self.declare_parameter("seed.probe_step_m", 0.001)
         self.declare_parameter("seed.x_mid_tolerance_m", 0.003)
+        self.declare_parameter("seed.maximum_translation_step_m", 0.005)
         self.declare_parameter("seed.maximum_servo_iterations", 8)
-        self.declare_parameter("settling_time_s", 0.5)
+        self.declare_parameter("seed.maximum_target_failures", 3)
+        self.declare_parameter("seed.minimum_profile_points", 5)
+        self.declare_parameter("seed.minimum_rotation_separation_deg", 2.0)
+        self.declare_parameter("seed.target_count", 6)
+        self.declare_parameter("seed.minimum_seed_domain_margin_m", 0.002)
+        self.declare_parameter("seed.initial.maximum_abs_x_mid_m", 0.03)
+        self.declare_parameter("seed.initial.minimum_z_mid_m", 0.30)
+        self.declare_parameter("seed.initial.maximum_z_mid_m", 0.55)
+        self.declare_parameter("seed.initial.minimum_domain_margin_m", 0.020)
+        self.declare_parameter("seed.initial.minimum_profile_length_m", 0.05)
+        self.declare_parameter("seed.initial.maximum_profile_length_m", 0.25)
+        self.declare_parameter(
+            "seed.initial.minimum_absolute_endpoint_depth_delta_m", 0.015
+        )
+        self.declare_parameter(
+            "seed.initial.minimum_normalized_joint_margin", 0.05
+        )
+        self.declare_parameter("seed.initial.minimum_local_ik_directions", 3)
+        self.declare_parameter("seed.initial.local_ik_test_step_deg", 2.0)
+        self.declare_parameter("seed.initial.maximum_local_joint_step_deg", 20.0)
+        self.declare_parameter("seed.preflight.rotation_deg", 2.0)
+        self.declare_parameter("seed.preflight.minimum_domain_margin_m", 0.015)
+        self.declare_parameter("seed.preflight.minimum_feasible_directions", 3)
+        self.declare_parameter("seed.motion_duration_s", 0.65)
+        self.declare_parameter("seed.motion_timeout_s", 4.0)
+        self.declare_parameter("settling_time_s", 0.3)
+        self.declare_parameter("manual_max_joint_speed_rad_s", 0.02)
+        self.declare_parameter("maximum_measurement_skew_s", 0.1)
+        self.declare_parameter("maximum_measurement_age_s", 0.5)
         self.declare_parameter("output_file", "data/seed_measurements.json")
         self.declare_parameter("sensor.min_range_m", 0.27)
         self.declare_parameter("sensor.max_range_m", 0.82)
         self.declare_parameter("sensor.half_fov_deg", 15.0)
         self.declare_parameter("sensor.roi_safe_margin_m", 0.01)
+        self.declare_parameter(
+            "sensor.hard_trapezoid",
+            [-0.292, 0.82, -0.021, -0.22, -0.019, 0.22],
+        )
+        self.declare_parameter(
+            "sensor.safe_trapezoid", [0.27, 0.78, -0.115, -0.19, 0.095, 0.19]
+        )
 
+        hard_values = list(self.get_parameter("sensor.hard_trapezoid").value)
+        safe_values = list(self.get_parameter("sensor.safe_trapezoid").value)
+        hard_domain = TrapezoidDomain(*map(float, hard_values))
+        safe_domain = TrapezoidDomain(*map(float, safe_values))
         self.roi = SensorROI(
             min_range=float(self.get_parameter("sensor.min_range_m").value),
             max_range=float(self.get_parameter("sensor.max_range_m").value),
             half_fov_deg=float(self.get_parameter("sensor.half_fov_deg").value),
             safe_margin=float(self.get_parameter("sensor.roi_safe_margin_m").value),
+            hard_domain=hard_domain,
+            safe_domain=safe_domain,
         )
         self.rotation_target = np.deg2rad(
             float(self.get_parameter("seed.rotation_target_deg").value)
@@ -77,104 +135,475 @@ class SeedCollectionNode(Node):
             float(self.get_parameter("seed.minimum_rotation_step_deg").value)
         )
         self.rotation_step = self.rotation_step_default
+        self.minimum_partial_rotation = np.deg2rad(
+            float(self.get_parameter("seed.minimum_partial_rotation_deg").value)
+        )
         self.probe_step = float(self.get_parameter("seed.probe_step_m").value)
         self.x_tolerance = float(
             self.get_parameter("seed.x_mid_tolerance_m").value
         )
+        self.maximum_translation_step = float(
+            self.get_parameter("seed.maximum_translation_step_m").value
+        )
         self.maximum_servo_iterations = int(
             self.get_parameter("seed.maximum_servo_iterations").value
         )
+        self.maximum_target_failures = int(
+            self.get_parameter("seed.maximum_target_failures").value
+        )
+        self.motion_duration = float(
+            self.get_parameter("seed.motion_duration_s").value
+        )
+        self.motion_timeout_ns = int(
+            float(self.get_parameter("seed.motion_timeout_s").value) * 1e9
+        )
+        self.minimum_profile_points = int(
+            self.get_parameter("seed.minimum_profile_points").value
+        )
+        self.minimum_rotation_separation_deg = float(
+            self.get_parameter("seed.minimum_rotation_separation_deg").value
+        )
+        self.target_count = int(self.get_parameter("seed.target_count").value)
+        self.minimum_seed_domain_margin = float(
+            self.get_parameter("seed.minimum_seed_domain_margin_m").value
+        )
+        self.initial_criteria = InitialPoseCriteria(
+            maximum_abs_x_mid_m=float(
+                self.get_parameter(
+                    "seed.initial.maximum_abs_x_mid_m"
+                ).value
+            ),
+            minimum_z_mid_m=float(
+                self.get_parameter("seed.initial.minimum_z_mid_m").value
+            ),
+            maximum_z_mid_m=float(
+                self.get_parameter("seed.initial.maximum_z_mid_m").value
+            ),
+            minimum_domain_margin_m=float(
+                self.get_parameter(
+                    "seed.initial.minimum_domain_margin_m"
+                ).value
+            ),
+            minimum_profile_length_m=float(
+                self.get_parameter(
+                    "seed.initial.minimum_profile_length_m"
+                ).value
+            ),
+            maximum_profile_length_m=float(
+                self.get_parameter(
+                    "seed.initial.maximum_profile_length_m"
+                ).value
+            ),
+            minimum_absolute_endpoint_depth_delta_m=float(
+                self.get_parameter(
+                    "seed.initial.minimum_absolute_endpoint_depth_delta_m"
+                ).value
+            ),
+            minimum_normalized_joint_margin=float(
+                self.get_parameter(
+                    "seed.initial.minimum_normalized_joint_margin"
+                ).value
+            ),
+            minimum_local_ik_directions=int(
+                self.get_parameter(
+                    "seed.initial.minimum_local_ik_directions"
+                ).value
+            ),
+        )
+        self.initial_ik_test_step = np.deg2rad(
+            float(
+                self.get_parameter(
+                    "seed.initial.local_ik_test_step_deg"
+                ).value
+            )
+        )
+        self.initial_maximum_local_joint_step = np.deg2rad(
+            float(
+                self.get_parameter(
+                    "seed.initial.maximum_local_joint_step_deg"
+                ).value
+            )
+        )
+        self.preflight_rotation = np.deg2rad(
+            float(self.get_parameter("seed.preflight.rotation_deg").value)
+        )
+        self.preflight_minimum_margin = float(
+            self.get_parameter(
+                "seed.preflight.minimum_domain_margin_m"
+            ).value
+        )
+        self.preflight_minimum_directions = int(
+            self.get_parameter(
+                "seed.preflight.minimum_feasible_directions"
+            ).value
+        )
         self.settling_time = float(self.get_parameter("settling_time_s").value)
+        self.manual_max_joint_speed = float(
+            self.get_parameter("manual_max_joint_speed_rad_s").value
+        )
+        self.maximum_measurement_skew_ns = int(
+            float(self.get_parameter("maximum_measurement_skew_s").value) * 1e9
+        )
+        self.maximum_measurement_age_ns = int(
+            float(self.get_parameter("maximum_measurement_age_s").value) * 1e9
+        )
         self.output_file = Path(str(self.get_parameter("output_file").value))
+        self.collection_mode = str(
+            self.get_parameter("collection_mode").value
+        ).strip().lower()
+        if self.collection_mode not in {"automatic", "manual"}:
+            raise ValueError(
+                "collection_mode must be either 'automatic' or 'manual'"
+            )
 
         self.create_subscription(JointState, "/joint_states", self._joint_callback, 10)
         self.create_subscription(PointCloud2, "/gocator/profile", self._profile_callback, 10)
         self.create_subscription(
             Float64MultiArray, "/gocator/endpoints", self._endpoint_callback, 10
         )
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self._trajectory = ActionClient(
             self,
             FollowJointTrajectory,
             "/joint_trajectory_controller/follow_joint_trajectory",
         )
         self.create_service(Trigger, "~/start", self._start_callback)
+        self.create_service(Trigger, "~/capture", self._capture_callback)
         self.create_service(Trigger, "~/status", self._status_callback)
         self.create_timer(0.05, self._tick)
 
         self.latest_joints: np.ndarray | None = None
+        self.latest_joint_speed = float("inf")
         self.latest_profile: np.ndarray | None = None
         self.latest_endpoints: tuple[np.ndarray, np.ndarray] | None = None
+        self.latest_measurement_transform: np.ndarray | None = None
+        self.pending_profiles: dict[tuple[int, int], np.ndarray] = {}
+        self.pending_endpoint_frames: dict[tuple[int, int], list[float]] = {}
+        self.latest_profile_ns = 0
+        self.latest_profile_stamp = None
+        self.latest_endpoints_ns = 0
+        self.latest_joint_wall_ns = 0
+        self.latest_profile_wall_ns = 0
+        self.latest_endpoints_wall_ns = 0
+        self.measurement_not_before_wall_ns = 0
         self.reference_joints: np.ndarray | None = None
         self.reference_transform: np.ndarray | None = None
+        self.reference_measurement_transform: np.ndarray | None = None
+        self.reference_profile: np.ndarray | None = None
+        self.reference_feature = None
         self.last_valid_joints: np.ndarray | None = None
+        self.last_valid_transform: np.ndarray | None = None
+        self.last_valid_profile: np.ndarray | None = None
+        self.last_valid_feature = None
         self.records: list[dict] = []
         self.seed_rotations: list[np.ndarray] = []
-        self.plan = star_rotation_plan()
+        self.plan = adaptive_rotation_plan()
+        self.preflight_plan = (
+            RotationTarget("preflight_rx_negative", ((0, -1),)),
+            RotationTarget("preflight_rx_positive", ((0, 1),)),
+            RotationTarget("preflight_ry_negative", ((1, -1),)),
+            RotationTarget("preflight_ry_positive", ((1, 1),)),
+        )
+        self.collection_phase = "INITIAL"
+        self.preflight_index = 0
+        self.preflight_results: list[dict] = []
+        self.initial_assessment_cache = None
+        self.initial_assessment_cache_wall_ns = 0
+        self.initial_assessment_period_ns = int(0.5e9)
         self.target_index = 0
         self.stage_index = 0
         self.accumulated_angle = 0.0
         self.failure_count = 0
         self.started = bool(self.get_parameter("auto_start").value)
         self.state = "WAIT_MANUAL_INIT"
+        self.failure_reason = ""
         self.settle_until_ns = 0
+        self.motion_deadline_wall_ns = 0
         self.after_settle = ""
         self.pending_rotation = 0.0
         self.probe_axis = 0
         self.probe_base_transform: np.ndarray | None = None
         self.probe_base_feature = None
         self.probe_sensitivities: dict[int, float] = {}
-        self.servo = TranslationServo()
+        self.learned_servo_axis: int | None = None
+        self.learned_servo_sensitivity: float | None = None
+        self.servo = TranslationServo(maximum_step=self.maximum_translation_step)
+        self.servo_from_cache = False
+        self.servo_reprobe_attempted = False
         self.servo_previous_x = 0.0
         self.servo_previous_step = 0.0
         self.servo_iterations = 0
         self.get_logger().info(
             "waiting for one manually positioned, stable bilateral profile; "
-            "call ~/start when ready"
+            f"mode={self.collection_mode}; call ~/start when ready"
         )
 
     def _joint_callback(self, message: JointState) -> None:
         try:
+            indices = [message.name.index(name) for name in JOINT_NAMES]
             self.latest_joints = np.array(
-                [message.position[message.name.index(name)] for name in JOINT_NAMES],
-                dtype=float,
+                [message.position[index] for index in indices], dtype=float
             )
+            if len(message.velocity) > max(indices):
+                self.latest_joint_speed = float(
+                    np.max(np.abs([message.velocity[index] for index in indices]))
+                )
+            else:
+                self.latest_joint_speed = 0.0
+            self.latest_joint_wall_ns = time.monotonic_ns()
         except (ValueError, IndexError):
             return
 
     def _profile_callback(self, message: PointCloud2) -> None:
-        points = list(
-            point_cloud2.read_points(
-                message, field_names=("x", "y", "z"), skip_nans=True
-            )
+        points = point_cloud2.read_points(
+            message, field_names=("x", "y", "z"), skip_nans=True
         )
-        self.latest_profile = np.asarray(points, dtype=float) if points else None
+        if len(points) == 0:
+            self.latest_profile = None
+            return
+        if getattr(points.dtype, "names", None):
+            profile = np.column_stack(
+                tuple(np.asarray(points[name], dtype=float) for name in ("x", "y", "z"))
+            )
+        else:
+            profile = np.asarray(points, dtype=float).reshape(-1, 3)
+        # Keep legacy publishers usable while timestamp matching is preferred.
+        self.latest_profile = profile
+        self.latest_profile_stamp = message.header.stamp
+        key = (int(message.header.stamp.sec), int(message.header.stamp.nanosec))
+        self.pending_profiles[key] = profile
+        endpoint_data = self.pending_endpoint_frames.pop(key, None)
+        if endpoint_data is not None:
+            self.pending_profiles.pop(key, None)
+            self._accept_matched_frame(profile, endpoint_data, message.header.stamp)
+        self._trim_pending_frames()
 
     def _endpoint_callback(self, message: Float64MultiArray) -> None:
         data = list(message.data)
         if len(data) < 9 or not bool(data[4]) or not bool(data[8]):
             self.latest_endpoints = None
             return
+        if len(data) >= 23:
+            key = (int(data[21]), int(data[22]))
+            profile = self.pending_profiles.pop(key, None)
+            if profile is None:
+                self.pending_endpoint_frames[key] = data
+                self._trim_pending_frames()
+                return
+            self._accept_matched_frame(profile, data, None)
+            return
+        self._accept_matched_frame(self.latest_profile, data, None)
+
+    def _accept_matched_frame(self, profile, data, stamp) -> None:
+        if profile is None:
+            return
+        self.latest_profile = np.asarray(profile, dtype=float)
         self.latest_endpoints = (
             np.array(data[1:4], dtype=float),
             np.array(data[5:8], dtype=float),
         )
+        if len(data) >= 21:
+            self.latest_measurement_transform = make_transform(
+                np.asarray(data[9:18], dtype=float).reshape(3, 3),
+                np.asarray(data[18:21], dtype=float),
+            )
+        now = self.get_clock().now().nanoseconds
+        wall_now = time.monotonic_ns()
+        self.latest_profile_ns = now
+        self.latest_endpoints_ns = now
+        self.latest_profile_wall_ns = wall_now
+        self.latest_endpoints_wall_ns = wall_now
+        if stamp is not None:
+            self.latest_profile_stamp = stamp
+
+    def _trim_pending_frames(self) -> None:
+        for pending in (self.pending_profiles, self.pending_endpoint_frames):
+            while len(pending) > 20:
+                pending.pop(next(iter(pending)))
 
     def _start_callback(self, _request, response):
+        if self.state in {"DONE", "FAILED"}:
+            response.success = self.state == "DONE"
+            response.message = f"collection already finished in state {self.state}"
+            return response
         self.started = True
         response.success = True
-        response.message = "seed collection armed; waiting for stable bilateral data"
+        if self.collection_mode == "manual":
+            response.message = (
+                "manual seed collection armed; call ~/capture at each stable pose"
+            )
+        else:
+            response.message = (
+                "automatic seed collection armed; waiting for stable bilateral data"
+            )
+        return response
+
+    def _capture_callback(self, _request, response):
+        if self.collection_mode != "manual":
+            response.success = False
+            response.message = "capture is only available in manual collection mode"
+            return response
+        if not self.started:
+            response.success = False
+            response.message = "manual collection is not armed; call ~/start first"
+            return response
+        if self.state != "WAIT_MANUAL_INIT":
+            response.success = self.state == "DONE"
+            response.message = f"cannot capture while state={self.state}"
+            return response
+        feature = self._feature()
+        transform = self._current_transform()
+        if feature is None or transform is None:
+            response.success = False
+            response.message = (
+                "no synchronized bilateral profile/joint measurement is available"
+            )
+            return response
+        if not feature.safe:
+            response.success = False
+            response.message = (
+                f"bilateral endpoints are outside the safe domain; "
+                f"margin={1000.0 * feature.domain_margin:.2f} mm"
+            )
+            return response
+        if self.latest_joint_speed > self.manual_max_joint_speed:
+            response.success = False
+            response.message = (
+                f"robot is still moving; maximum joint speed is "
+                f"{self.latest_joint_speed:.4f} rad/s"
+            )
+            return response
+        label = (
+            "manual_reference"
+            if not self.records
+            else f"manual_{len(self.records) + 1}"
+        )
+        if not self._save_seed(label, feature):
+            response.success = False
+            response.message = (
+                "pose rejected: rotate the flange farther from all previously "
+                f"captured poses (minimum {self.minimum_rotation_separation_deg:.1f} deg)"
+            )
+            return response
+        if len(self.records) >= self.target_count:
+            self._finish()
+        response.success = True
+        response.message = (
+            f"accepted {label}; seeds={len(self.records)}/{self.target_count}; "
+            f"x_mid={1000.0 * feature.x_mid:.2f} mm; "
+            f"safe_margin={1000.0 * feature.domain_margin:.2f} mm"
+        )
         return response
 
     def _status_callback(self, _request, response):
         response.success = self.state != "FAILED"
+        feature = self._feature()
+        if feature is None:
+            observation = "MISSING"
+            feature_details = (
+                "x_mid_mm=nan; z_mid_mm=nan; safe_margin_mm=nan; "
+                "profile_length_mm=nan; endpoint_depth_delta_mm=nan; "
+                "absolute_endpoint_depth_delta_mm=nan; "
+                "joint_margin_percent=nan; local_ik=0/4; "
+                "initial_ready=false; initial_reasons=measurement_missing"
+            )
+        else:
+            observation = "SAFE" if feature.safe else "UNSAFE"
+            assessment = self._initial_pose_assessment(feature)
+            if assessment is None:
+                initial_ready = False
+                initial_reasons = "joints_missing"
+                joint_margin = float("nan")
+                local_ik_directions = 0
+            else:
+                initial_ready = assessment.accepted
+                initial_reasons = (
+                    "none"
+                    if assessment.accepted
+                    else ",".join(assessment.reasons)
+                )
+                joint_margin = assessment.normalized_joint_margin
+                local_ik_directions = assessment.local_ik_directions
+            feature_details = (
+                f"x_mid_mm={1000.0 * feature.x_mid:.3f}; "
+                f"z_mid_mm={1000.0 * feature.z_mid:.3f}; "
+                f"safe_margin_mm={1000.0 * feature.domain_margin:.3f}; "
+                f"profile_length_mm={1000.0 * feature.profile_length:.3f}; "
+                f"endpoint_depth_delta_mm="
+                f"{1000.0 * (feature.endpoint_v[2] - feature.endpoint_u[2]):.3f}; "
+                f"absolute_endpoint_depth_delta_mm="
+                f"{1000.0 * abs(feature.endpoint_v[2] - feature.endpoint_u[2]):.3f}; "
+                f"joint_margin_percent={100.0 * joint_margin:.2f}; "
+                f"local_ik={local_ik_directions}/4; "
+                f"initial_ready={str(initial_ready).lower()}; "
+                f"initial_reasons={initial_reasons}"
+            )
+        stable = (
+            self.latest_joints is not None
+            and self.latest_joint_speed <= self.manual_max_joint_speed
+            and time.monotonic_ns() - self.latest_joint_wall_ns
+            <= self.maximum_measurement_age_ns
+        )
+        if (
+            self.collection_mode == "automatic"
+            and not self.records
+            and self.state == "WAIT_MANUAL_INIT"
+        ):
+            target_name = "reference"
+        elif (
+            self.collection_mode == "automatic"
+            and self.collection_phase == "PREFLIGHT"
+            and self.preflight_index < len(self.preflight_plan)
+        ):
+            target_name = self.preflight_plan[self.preflight_index].name
+        elif self.collection_mode == "automatic" and self.target_index < len(self.plan):
+            target_name = self.plan[self.target_index].name
+        elif self.collection_mode == "manual":
+            target_name = f"manual_{len(self.records) + 1}"
+        else:
+            target_name = "complete"
+        displayed_rotation_target = (
+            self.preflight_rotation
+            if self.collection_phase == "PREFLIGHT"
+            else self.rotation_target
+        )
         response.message = (
-            f"state={self.state}, seeds={len(self.records)}, "
-            f"target={self.target_index}/{len(self.plan)}"
+            f"state={self.state}; mode={self.collection_mode}; "
+            f"phase={self.collection_phase}; "
+            f"seeds={len(self.records)}/{self.target_count}; "
+            f"target={target_name}; target_index={self.target_index}/{len(self.plan)}; "
+            f"preflight={sum(item['accepted'] for item in self.preflight_results)}/"
+            f"{len(self.preflight_plan)}; "
+            f"target_failures={self.failure_count}/{self.maximum_target_failures}; "
+            f"motion_stage={self.after_settle or '-'}; "
+            f"rotation_deg={np.rad2deg(self.accumulated_angle):.2f}/"
+            f"{np.rad2deg(displayed_rotation_target):.2f}; "
+            f"observation={observation}; stable={str(stable).lower()}; "
+            f"profile_points={0 if self.latest_profile is None else len(self.latest_profile)}; "
+            f"{feature_details}; "
+            f"failure_reason={self.failure_reason.replace(';', ',') or 'none'}"
         )
         return response
 
     def _feature(self):
-        if self.latest_endpoints is None:
+        now_wall_ns = time.monotonic_ns()
+        if (
+            self.latest_endpoints is None
+            or self.latest_profile is None
+            or len(self.latest_profile) < self.minimum_profile_points
+            or self.latest_profile_wall_ns < self.measurement_not_before_wall_ns
+            or self.latest_endpoints_wall_ns < self.measurement_not_before_wall_ns
+            or now_wall_ns - self.latest_profile_wall_ns
+            > self.maximum_measurement_age_ns
+            or now_wall_ns - self.latest_endpoints_wall_ns
+            > self.maximum_measurement_age_ns
+        ):
+            return None
+        if (
+            abs(self.latest_profile_ns - self.latest_endpoints_ns)
+            > self.maximum_measurement_skew_ns
+        ):
             return None
         try:
             return evaluate_bilateral_feature(*self.latest_endpoints, self.roi)
@@ -182,11 +611,86 @@ class SeedCollectionNode(Node):
             return None
 
     def _current_transform(self) -> np.ndarray | None:
-        return (
-            forward_kinematics_urdf(self.latest_joints)
-            if self.latest_joints is not None
-            else None
+        if (
+            self.latest_joints is None
+            or time.monotonic_ns() - self.latest_joint_wall_ns
+            > self.maximum_measurement_age_ns
+        ):
+            return None
+        return forward_kinematics_urdf(self.latest_joints)
+
+    def _measurement_transform(self) -> np.ndarray | None:
+        if self.latest_measurement_transform is not None:
+            return self.latest_measurement_transform.copy()
+        if self.latest_profile_stamp is None:
+            return None
+        try:
+            stamped = self.tf_buffer.lookup_transform(
+                "base_link",
+                "fanuc_flange",
+                Time.from_msg(self.latest_profile_stamp),
+            )
+        except Exception:
+            return None
+        translation = stamped.transform.translation
+        quaternion = stamped.transform.rotation
+        return make_transform(
+            quaternion_to_matrix(
+                np.array(
+                    [
+                        quaternion.x,
+                        quaternion.y,
+                        quaternion.z,
+                        quaternion.w,
+                    ]
+                )
+            ),
+            np.array([translation.x, translation.y, translation.z]),
         )
+
+    def _local_ik_coverage(self) -> int:
+        transform = self._current_transform()
+        if transform is None or self.latest_joints is None:
+            return 0
+        feasible = 0
+        for axis in (0, 1):
+            for sign in (-1, 1):
+                axis_vector = np.zeros(3)
+                axis_vector[axis] = sign * self.initial_ik_test_step
+                target = transform.copy()
+                target[:3, :3] = (
+                    transform[:3, :3] @ so3_exp(axis_vector)
+                )
+                solutions = inverse_kinematics_numeric(
+                    target, q_init=self.latest_joints
+                )
+                if (
+                    len(solutions) > 0
+                    and np.max(np.abs(solutions[0] - self.latest_joints))
+                    <= self.initial_maximum_local_joint_step
+                ):
+                    feasible += 1
+        return feasible
+
+    def _initial_pose_assessment(self, feature):
+        if self.latest_joints is None:
+            return None
+        now_wall_ns = time.monotonic_ns()
+        if (
+            self.initial_assessment_cache is not None
+            and now_wall_ns - self.initial_assessment_cache_wall_ns
+            < self.initial_assessment_period_ns
+        ):
+            return self.initial_assessment_cache
+        self.initial_assessment_cache = assess_initial_pose(
+            feature,
+            self.latest_joints,
+            np.deg2rad(JOINT_LIMITS_DEG),
+            local_ik_directions=self._local_ik_coverage(),
+            criteria=self.initial_criteria,
+        )
+        self.initial_assessment_cache_wall_ns = now_wall_ns
+        return self.initial_assessment_cache
 
     def _command_transform(self, transform: np.ndarray, after_settle: str) -> bool:
         if self.latest_joints is None:
@@ -197,35 +701,86 @@ class SeedCollectionNode(Node):
             return False
         return self._command_joints(solutions[0], after_settle)
 
+    def _reset_servo(self) -> None:
+        """Reuse the measured local sensitivity near the common reference pose."""
+        self.servo = TranslationServo(maximum_step=self.maximum_translation_step)
+        self.servo_from_cache = (
+            self.learned_servo_axis is not None
+            and self.learned_servo_sensitivity is not None
+        )
+        if self.servo_from_cache:
+            self.servo.axis = self.learned_servo_axis
+            self.servo.sensitivity = self.learned_servo_sensitivity
+        self.servo_reprobe_attempted = False
+
     def _command_joints(self, joints: np.ndarray, after_settle: str) -> bool:
-        if not self._trajectory.wait_for_server(timeout_sec=1.0):
+        if not self._trajectory.wait_for_server(timeout_sec=0.5):
             self.get_logger().error("joint trajectory action server is unavailable")
             return False
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = list(JOINT_NAMES)
         point = JointTrajectoryPoint()
         point.positions = [float(value) for value in joints]
-        point.time_from_start = Duration(sec=2)
+        duration_sec = int(self.motion_duration)
+        point.time_from_start = Duration(
+            sec=duration_sec,
+            nanosec=int((self.motion_duration - duration_sec) * 1e9),
+        )
         goal.trajectory.points = [point]
         self.after_settle = after_settle
         self.state = "MOVING"
+        self.motion_deadline_wall_ns = (
+            time.monotonic_ns() + self.motion_timeout_ns
+        )
         self._trajectory.send_goal_async(goal).add_done_callback(self._goal_response)
         return True
 
     def _goal_response(self, future) -> None:
-        handle = future.result()
+        if self.state != "MOVING":
+            return
+        try:
+            handle = future.result()
+        except Exception as error:
+            self._fail(f"trajectory goal request failed: {error}")
+            return
         if not handle.accepted:
             self._fail("trajectory goal was rejected")
             return
         handle.get_result_async().add_done_callback(self._motion_result)
 
-    def _motion_result(self, _future) -> None:
+    def _motion_result(self, future) -> None:
+        if self.state != "MOVING":
+            return
+        try:
+            wrapped_result = future.result()
+        except Exception as error:
+            self._fail(f"trajectory result failed: {error}")
+            return
+        if (
+            wrapped_result.status != GoalStatus.STATUS_SUCCEEDED
+            or wrapped_result.result.error_code
+            != FollowJointTrajectory.Result.SUCCESSFUL
+        ):
+            self._fail(
+                "trajectory execution failed "
+                f"(status={wrapped_result.status}, "
+                f"error={wrapped_result.result.error_code})"
+            )
+            return
         self.settle_until_ns = (
             self.get_clock().now().nanoseconds + int(self.settling_time * 1e9)
         )
+        self.measurement_not_before_wall_ns = time.monotonic_ns()
         self.state = "SETTLING"
 
     def _tick(self) -> None:
+        if self.state == "MOVING":
+            if time.monotonic_ns() >= self.motion_deadline_wall_ns:
+                self._fail(
+                    "trajectory execution timed out; controller or Gazebo "
+                    "communication is unavailable"
+                )
+            return
         if self.state == "SETTLING":
             if self.get_clock().now().nanoseconds >= self.settle_until_ns:
                 next_state = self.after_settle
@@ -233,6 +788,8 @@ class SeedCollectionNode(Node):
                 getattr(self, f"_after_{next_state.lower()}")()
             return
         if not self.started or self.state != "WAIT_MANUAL_INIT":
+            return
+        if self.collection_mode == "manual":
             return
         feature = self._feature()
         transform = self._current_transform()
@@ -243,11 +800,26 @@ class SeedCollectionNode(Node):
             or self.latest_profile is None
         ):
             return
+        assessment = self._initial_pose_assessment(feature)
+        if assessment is None or not assessment.accepted:
+            return
+        measurement_transform = self._measurement_transform()
+        if measurement_transform is None:
+            return
         self.reference_joints = self.latest_joints.copy()
         self.reference_transform = transform.copy()
+        self.reference_measurement_transform = measurement_transform
+        self.reference_profile = self.latest_profile.copy()
+        self.reference_feature = feature
         self.last_valid_joints = self.latest_joints.copy()
-        self._save_seed("reference", feature)
-        self.get_logger().info("reference seed accepted; starting star rotation plan")
+        self._remember_last_valid(feature)
+        self.collection_phase = "PREFLIGHT"
+        self.preflight_index = 0
+        self.preflight_results = []
+        self.get_logger().info(
+            "static initial envelope accepted; starting measured local "
+            "+/-X/+/-Y preflight"
+        )
         self._return_reference()
 
     def _return_reference(self) -> None:
@@ -257,13 +829,76 @@ class SeedCollectionNode(Node):
         self.rotation_step = self.rotation_step_default
         self.accumulated_angle = 0.0
         self.stage_index = 0
-        self._command_joints(self.reference_joints, "RETURN_REFERENCE")
+        self.failure_count = 0
+        if not self._command_joints(self.reference_joints, "RETURN_REFERENCE"):
+            self._fail("cannot return to the reference pose: controller unavailable")
 
     def _after_return_reference(self) -> None:
-        if self.target_index >= len(self.plan):
+        if self.collection_phase == "PREFLIGHT":
+            if self.preflight_index >= len(self.preflight_plan):
+                feasible = [
+                    item for item in self.preflight_results if item["accepted"]
+                ]
+                if not local_preflight_is_acceptable(
+                    self.preflight_results,
+                    minimum_feasible_directions=self.preflight_minimum_directions,
+                ):
+                    details = ",".join(
+                        f"{item['name']}={'pass' if item['accepted'] else 'fail'}"
+                        for item in self.preflight_results
+                    )
+                    self._fail(
+                        "initial pose dynamic preflight failed: need at least "
+                        f"{self.preflight_minimum_directions}/4 safe directions "
+                        f"spanning X and Y; {details}"
+                    )
+                    return
+                current_joints = self.latest_joints
+                current_profile = self.latest_profile
+                self.latest_joints = self.reference_joints
+                self.latest_profile = self.reference_profile
+                try:
+                    reference_saved = (
+                        self.reference_feature is not None
+                        and self._save_seed(
+                            "reference",
+                            self.reference_feature,
+                            transform_override=self.reference_measurement_transform,
+                        )
+                    )
+                finally:
+                    self.latest_joints = current_joints
+                    self.latest_profile = current_profile
+                if not reference_saved:
+                    self._fail("reference seed could not be saved after preflight")
+                    return
+                self.collection_phase = "COLLECT"
+                self.get_logger().info(
+                    f"dynamic preflight accepted "
+                    f"({len(feasible)}/{len(self.preflight_plan)} directions); "
+                    "starting adaptive star rotation plan"
+                )
+                self._return_reference()
+                return
+            self.last_valid_joints = self.latest_joints.copy()
+            feature = self._feature()
+            if feature is not None and feature.safe:
+                self._remember_last_valid(feature)
+            self._reset_servo()
+            target = self.preflight_plan[self.preflight_index]
+            self.get_logger().info(f"preflight target {target.name}")
+            self._issue_micro_rotation()
+            return
+        if len(self.records) >= self.target_count or self.target_index >= len(
+            self.plan
+        ):
             self._finish()
             return
         self.last_valid_joints = self.latest_joints.copy()
+        feature = self._feature()
+        if feature is not None and feature.safe:
+            self._remember_last_valid(feature)
+        self._reset_servo()
         self.get_logger().info(f"target {self.plan[self.target_index].name}")
         self._issue_micro_rotation()
 
@@ -272,8 +907,18 @@ class SeedCollectionNode(Node):
         if current is None:
             self._fail("joint state is unavailable")
             return
-        axis, sign = self.plan[self.target_index].stages[self.stage_index]
-        remaining = self.rotation_target - self.accumulated_angle
+        target = (
+            self.preflight_plan[self.preflight_index]
+            if self.collection_phase == "PREFLIGHT"
+            else self.plan[self.target_index]
+        )
+        axis, sign = target.stages[self.stage_index]
+        target_angle = (
+            self.preflight_rotation
+            if self.collection_phase == "PREFLIGHT"
+            else self.rotation_target
+        )
+        remaining = target_angle - self.accumulated_angle
         magnitude = min(self.rotation_step, remaining)
         delta = sign * magnitude
         axis_vector = np.zeros(3)
@@ -289,13 +934,17 @@ class SeedCollectionNode(Node):
         if feature is None or not feature.safe:
             self._rollback("bilateral feature became unsafe")
             return
-        self.failure_count = 0
         self.accumulated_angle += self.pending_rotation
         self.last_valid_joints = self.latest_joints.copy()
+        self._remember_last_valid(feature)
         if abs(feature.x_mid) <= self.x_tolerance:
             self._continue_after_centered(feature)
             return
-        self._begin_probing(feature)
+        if self.servo.axis is not None and self.servo.sensitivity is not None:
+            self.servo_iterations = 0
+            self._issue_servo()
+        else:
+            self._begin_probing(feature)
 
     def _begin_probing(self, feature) -> None:
         self.servo_iterations = 0
@@ -317,7 +966,12 @@ class SeedCollectionNode(Node):
     def _after_probe_out(self) -> None:
         feature = self._feature()
         if feature is None or not feature.safe:
-            self._rollback("probe lost the bilateral feature")
+            self.probe_sensitivities[self.probe_axis] = 0.0
+            self.get_logger().warning(
+                f"probe axis {self.probe_axis} excluded: unsafe feature response"
+            )
+            if not self._command_transform(self.probe_base_transform, "PROBE_BACK"):
+                self._rollback("unsafe probe return IK failure")
             return
         self.probe_sensitivities[self.probe_axis] = (
             feature.x_mid - self.probe_base_feature.x_mid
@@ -341,10 +995,25 @@ class SeedCollectionNode(Node):
         except ValueError:
             self._rollback("no usable translation-servo axis")
             return
+        self.learned_servo_axis = self.servo.axis
+        self.learned_servo_sensitivity = self.servo.sensitivity
+        self.servo_from_cache = False
         self._issue_servo()
 
     def _issue_servo(self) -> None:
         if self.servo_iterations >= self.maximum_servo_iterations:
+            if self.servo_from_cache and not self.servo_reprobe_attempted:
+                self.get_logger().warning(
+                    "cached translation sensitivity did not converge; "
+                    "re-probing locally"
+                )
+                self.servo_reprobe_attempted = True
+                feature = self._feature()
+                if feature is None:
+                    self._rollback("feature missing before servo re-probe")
+                    return
+                self._begin_probing(feature)
+                return
             self._rollback("translation servo iteration limit reached")
             return
         feature = self._feature()
@@ -369,20 +1038,84 @@ class SeedCollectionNode(Node):
     def _after_servo(self) -> None:
         feature = self._feature()
         if feature is None or not feature.safe:
+            if (
+                self.servo_from_cache
+                and not self.servo_reprobe_attempted
+                and self.last_valid_joints is not None
+            ):
+                self.get_logger().warning(
+                    "cached translation sensitivity left the safe region; "
+                    "returning to the last valid pose and re-probing"
+                )
+                self.learned_servo_axis = None
+                self.learned_servo_sensitivity = None
+                self.servo_from_cache = False
+                self.servo_reprobe_attempted = True
+                if not self._command_joints(
+                    self.last_valid_joints, "CACHED_SERVO_RECOVERY"
+                ):
+                    self._rollback("cached servo recovery command failed")
+                return
             self._rollback("servo left the safe bilateral region")
             return
         self.servo.update(
             feature.x_mid - self.servo_previous_x, self.servo_previous_step
         )
+        self.learned_servo_axis = self.servo.axis
+        self.learned_servo_sensitivity = self.servo.sensitivity
+        self.servo_from_cache = False
         self.last_valid_joints = self.latest_joints.copy()
+        self._remember_last_valid(feature)
         if abs(feature.x_mid) <= self.x_tolerance:
             self._continue_after_centered(feature)
         else:
             self._issue_servo()
 
+    def _after_cached_servo_recovery(self) -> None:
+        feature = self._feature()
+        if feature is None or not feature.safe:
+            self._rollback("cached servo recovery lost bilateral observation")
+            return
+        self._begin_probing(feature)
+
     def _continue_after_centered(self, feature) -> None:
-        if self.accumulated_angle + 1e-10 < self.rotation_target:
+        target_angle = (
+            self.preflight_rotation
+            if self.collection_phase == "PREFLIGHT"
+            else self.rotation_target
+        )
+        if self.accumulated_angle + 1e-10 < target_angle:
             self._issue_micro_rotation()
+            return
+        if self.collection_phase == "PREFLIGHT":
+            target = self.preflight_plan[self.preflight_index]
+            axis, sign = target.stages[0]
+            accepted = seed_feature_is_acceptable(
+                feature,
+                maximum_abs_x_mid_m=self.x_tolerance,
+                minimum_domain_margin_m=self.preflight_minimum_margin,
+            )
+            self.preflight_results.append(
+                {
+                    "name": target.name,
+                    "axis": axis,
+                    "sign": sign,
+                    "accepted": accepted,
+                    "domain_margin_m": float(feature.domain_margin),
+                }
+            )
+            self.get_logger().info(
+                f"{target.name} preflight "
+                f"{'accepted' if accepted else 'rejected'}: "
+                f"margin={1000.0 * feature.domain_margin:.2f} mm"
+            )
+            self.preflight_index += 1
+            if local_preflight_is_acceptable(
+                self.preflight_results,
+                minimum_feasible_directions=self.preflight_minimum_directions,
+            ):
+                self.preflight_index = len(self.preflight_plan)
+            self._return_reference()
             return
         target = self.plan[self.target_index]
         if self.stage_index + 1 < len(target.stages):
@@ -390,18 +1123,55 @@ class SeedCollectionNode(Node):
             self.accumulated_angle = 0.0
             self._issue_micro_rotation()
             return
-        self._save_seed(target.name, feature)
+        if not self._save_seed(target.name, feature):
+            self.get_logger().warning(
+                f"{target.name} reached but was rejected by rotation diversity"
+            )
         self.target_index += 1
         self._return_reference()
 
     def _rollback(self, reason: str) -> None:
+        if self.collection_phase == "PREFLIGHT":
+            target = self.preflight_plan[self.preflight_index]
+            axis, sign = target.stages[0]
+            self.preflight_results.append(
+                {
+                    "name": target.name,
+                    "axis": axis,
+                    "sign": sign,
+                    "accepted": False,
+                    "domain_margin_m": float("-inf"),
+                    "reason": reason,
+                }
+            )
+            self.get_logger().warning(
+                f"{target.name} preflight rejected: {reason}"
+            )
+            self.preflight_index += 1
+            self._return_reference()
+            return
         self.failure_count += 1
         self.rotation_step = max(self.rotation_step / 2.0, self.rotation_step_minimum)
         self.get_logger().warning(
             f"{reason}; rollback, rotation step={np.rad2deg(self.rotation_step):.2f} deg"
         )
-        if self.failure_count >= 6:
-            self.get_logger().warning("target abandoned after repeated failures")
+        if self.failure_count >= self.maximum_target_failures:
+            partial_angle = self._last_valid_relative_rotation()
+            if partial_angle >= self.minimum_partial_rotation:
+                label = f"{self.plan[self.target_index].name}_partial"
+                if self._save_last_valid_seed(label):
+                    self.get_logger().warning(
+                        "target limit not reached; retained centered, safe "
+                        "partial orientation "
+                        f"at {np.rad2deg(partial_angle):.2f} deg"
+                    )
+                else:
+                    self.get_logger().warning(
+                        "partial orientation rejected by centering, safety or "
+                        "rotation-diversity acceptance"
+                    )
+            else:
+                self.get_logger().warning("target abandoned after repeated failures")
             self.failure_count = 0
             self.target_index += 1
             self._return_reference()
@@ -409,7 +1179,11 @@ class SeedCollectionNode(Node):
         if self.last_valid_joints is None:
             self._fail("no valid rollback pose")
             return
-        self._command_joints(self.last_valid_joints, "ROLLBACK")
+        if not self._command_joints(self.last_valid_joints, "ROLLBACK"):
+            self._fail(
+                f"{reason}; cannot execute rollback because the controller "
+                "is unavailable"
+            )
 
     def _after_rollback(self) -> None:
         feature = self._feature()
@@ -418,15 +1192,29 @@ class SeedCollectionNode(Node):
             return
         self._issue_micro_rotation()
 
-    def _save_seed(self, label: str, feature) -> None:
-        transform = self._current_transform()
+    def _save_seed(
+        self,
+        label: str,
+        feature,
+        *,
+        transform_override: np.ndarray | None = None,
+    ) -> bool:
+        transform = (
+            transform_override
+            if transform_override is not None
+            else self._measurement_transform()
+        )
         if transform is None or self.latest_profile is None:
-            return
+            return False
         candidate_rotations = self.seed_rotations + [transform[:3, :3]]
         diversity = rotation_diversity(candidate_rotations)
-        if self.seed_rotations and diversity["minimum_pairwise_deg"] < 5.0:
+        if (
+            self.seed_rotations
+            and diversity["minimum_pairwise_deg"]
+            < self.minimum_rotation_separation_deg
+        ):
             self.get_logger().warning(f"{label} rejected: insufficient rotation diversity")
-            return
+            return False
         self.seed_rotations.append(transform[:3, :3].copy())
         self.records.append(
             {
@@ -438,23 +1226,92 @@ class SeedCollectionNode(Node):
                 "endpoint_u_S": feature.endpoint_u.tolist(),
                 "endpoint_v_S": feature.endpoint_v.tolist(),
                 "x_mid": feature.x_mid,
-                "roi_margin": feature.roi_margin,
+                "domain_margin": feature.domain_margin,
             }
         )
         self.get_logger().info(f"accepted seed {len(self.records)}: {label}")
+        return True
+
+    def _remember_last_valid(self, feature) -> None:
+        transform = self._measurement_transform()
+        if transform is None:
+            transform = self._current_transform()
+        if transform is None or self.latest_profile is None:
+            return
+        self.last_valid_joints = self.latest_joints.copy()
+        self.last_valid_transform = transform.copy()
+        self.last_valid_profile = self.latest_profile.copy()
+        self.last_valid_feature = feature
+
+    def _last_valid_relative_rotation(self) -> float:
+        if self.last_valid_transform is None or self.reference_transform is None:
+            return 0.0
+        relative = self.reference_transform[:3, :3].T @ self.last_valid_transform[:3, :3]
+        cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
+        return float(np.arccos(cosine))
+
+    def _save_last_valid_seed(self, label: str) -> bool:
+        if (
+            self.last_valid_transform is None
+            or self.last_valid_joints is None
+            or self.last_valid_profile is None
+            or self.last_valid_feature is None
+        ):
+            return False
+        if not seed_feature_is_acceptable(
+            self.last_valid_feature,
+            maximum_abs_x_mid_m=self.x_tolerance,
+            minimum_domain_margin_m=self.minimum_seed_domain_margin,
+        ):
+            return False
+        current_joints = self.latest_joints
+        current_profile = self.latest_profile
+        self.latest_joints = self.last_valid_joints
+        self.latest_profile = self.last_valid_profile
+        try:
+            return self._save_seed(
+                label,
+                self.last_valid_feature,
+                transform_override=self.last_valid_transform,
+            )
+        finally:
+            self.latest_joints = current_joints
+            self.latest_profile = current_profile
 
     def _finish(self) -> None:
+        raw_diversity = rotation_diversity(self.seed_rotations)
+        diversity = {
+            key: value.tolist() if isinstance(value, np.ndarray) else value
+            for key, value in raw_diversity.items()
+        }
         self.output_file.parent.mkdir(parents=True, exist_ok=True)
         self.output_file.write_text(
-            json.dumps({"schema_version": 1, "seeds": self.records}, indent=2),
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "collection_mode": self.collection_mode,
+                    "rotation_diversity": diversity,
+                    "seeds": self.records,
+                },
+                indent=2,
+            ),
             encoding="utf-8",
         )
-        self.state = "DONE"
+        self.state = "DONE" if len(self.records) >= self.target_count else "FAILED"
         self.get_logger().info(
             f"seed collection complete: {len(self.records)} records -> {self.output_file}"
         )
+        if self.state == "FAILED":
+            self.failure_reason = (
+                f"only {len(self.records)}/{self.target_count} observable "
+                "seed targets collected"
+            )
+            self.get_logger().error(
+                self.failure_reason
+            )
 
     def _fail(self, reason: str) -> None:
+        self.failure_reason = reason
         self.state = "FAILED"
         self.get_logger().error(reason)
 

@@ -4,11 +4,17 @@ from .candidate_generator import generate_candidates
 from .profile_predictor import predict_candidate, predict_profile
 from .scoring import score_candidates
 from .stopping import StopPolicy
-from .validity import candidate_valid_probability
+from .validity import (
+    ValidityResult,
+    candidate_valid_probability,
+    evaluate_candidate_validity,
+)
 
 __all__ = [
     "StopPolicy",
+    "ValidityResult",
     "candidate_valid_probability",
+    "evaluate_candidate_validity",
     "generate_candidates",
     "predict_candidate",
     "predict_profile",

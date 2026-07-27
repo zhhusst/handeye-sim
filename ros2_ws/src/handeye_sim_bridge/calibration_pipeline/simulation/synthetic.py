@@ -6,10 +6,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..geometry import invert_transform, make_transform, so3_exp
+from ..geometry import invert_transform, make_transform
 from ..models import BoardModel, FlangePose, Measurement, SensorROI
 from ..nbv.candidate_generator import _sensor_transform
 from ..nbv.profile_predictor import predict_profile
+from .scene_truth import HAND_EYE_ROTATION, HAND_EYE_TRANSLATION
 
 
 @dataclass(frozen=True)
@@ -70,8 +71,8 @@ def generate_seed_dataset(
 
 def default_scene() -> SyntheticScene:
     return SyntheticScene(
-        handeye_rotation=so3_exp(np.deg2rad(np.array([2.0, -1.0, 3.0]))),
-        handeye_translation=np.array([-0.011579, -0.004621, 0.359284]),
+        handeye_rotation=HAND_EYE_ROTATION.copy(),
+        handeye_translation=HAND_EYE_TRANSLATION.copy(),
         board=BoardModel(
             corner=np.array([0.7, 0.0, 0.25]),
             rotation=np.eye(3),

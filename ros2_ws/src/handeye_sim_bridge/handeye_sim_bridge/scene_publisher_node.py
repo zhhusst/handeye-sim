@@ -4,32 +4,41 @@
 与 MoveIt 配合使用：MoveIt 控制关节，本节点显示平板/FOV/扫描线。
 """
 
+import json
+import os
+
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import Point, Pose, Quaternion
+from interactive_markers.interactive_marker_server import InteractiveMarkerServer
+from moveit_msgs.msg import CollisionObject
+import numpy as np
 import rclpy
 from rclpy.node import Node
-import numpy as np
 from sensor_msgs.msg import JointState
 from sensor_msgs.msg import PointCloud2, PointField
 import sensor_msgs_py.point_cloud2 as pc2
-from geometry_msgs.msg import Pose, Point, Quaternion
-from std_msgs.msg import Header
+from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import Float64MultiArray, MultiArrayDimension
-from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, Marker
+from std_msgs.msg import Header
 from std_srvs.srv import Trigger
-
-import os
-import json
-
-from calibration_pipeline.simulation.scanline import (
-    compute_fov_plate_scanline, compute_fov_triangle,
-    build_R_edge, make_transform, rpy_to_matrix, so3_exp,
-)
-from handeye_sim_bridge.bridge_publisher import CalibPublisher
-from handeye_sim_bridge.fanuc_kinematic import forward_kinematics
-from interactive_markers.interactive_marker_server import InteractiveMarkerServer
-import tf2_ros
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
-from ament_index_python.packages import get_package_share_directory
+from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, Marker
+
+from calibration_pipeline.simulation.scanline import (
+    compute_fov_plate_scanline,
+    make_transform,
+    so3_exp,
+)
+from calibration_pipeline.simulation.scene_truth import (
+    HAND_EYE_ROTATION,
+    HAND_EYE_TRANSLATION,
+)
+from handeye_sim_bridge.bridge_publisher import CalibPublisher
+from handeye_sim_bridge.fanuc_kinematic import (
+    forward_kinematics,
+    forward_kinematics_urdf,
+)
 
 JOINT_NAMES = ['J1_joint', 'J2_joint', 'J3_joint',
                'J4_joint', 'J5_joint', 'J6_joint']
@@ -101,17 +110,26 @@ class ScenePublisher(Node):
         # 断点信息发布器（传感器系，正确标记 e1/e2）
         self.endpoint_pub = self.create_publisher(
             Float64MultiArray, '/gocator/endpoints', 10)
+        self.collision_pub = self.create_publisher(
+            CollisionObject, '/collision_object', 10
+        )
         # ── 噪声模型（可配置） ──
         # 激光测量噪声 σ (m)
         self.declare_parameter('laser_noise_std', 0.000055)
-        # 板翘曲幅度 ±mm — 每帧给平板法向量加随机扰动
-        self.declare_parameter('plate_warp_mm', 0.5)
-        # 机器人重复性噪声 σ (m) — 加在末端位姿上
-        self.declare_parameter('robot_repeat_std', 0.0001)
+        # Optional frame-wise plane-normal disturbance for stress tests.
+        # The nominal precision benchmark must use a fixed rigid plane,
+        # matching the 12-DOF-V2 measurement model.
+        self.declare_parameter('plate_warp_mm', 0.0)
+        # Optional unobserved flange-repeatability disturbance for stress
+        # tests.  The nominal algorithm benchmark uses the Gazebo/encoder pose
+        # exactly; otherwise a 0.1 mm hidden pose error is incompatible with a
+        # guaranteed sub-0.1 mm hand-eye target.
+        self.declare_parameter('robot_repeat_std', 0.0)
         self._noise_rng = np.random.default_rng()
 
         # 调试日志节流
         self._debug_frame = 0
+        self._collision_publish_counter = 0
 
         # 查询 FOV 角点的服务（用于读取当前拖拽后的值）
         self._fov_query_srv = self.create_service(
@@ -143,10 +161,8 @@ class ScenePublisher(Node):
         # 手眼真值 — gocator_sensor 原点位于激光平面内，但不在激光窗口上。
         # fanuc_flange → gocator_sensor 关节: xyz=[-0.0116,-0.0046,0.3593] rpy=[0.485,0.161,-1.509]
         # 激光窗口约位于 z_S=-0.29 m，见 fov_factory_calib.json。
-        R_he = np.array([[ 0.99964905,  0.02634223,  0.00280383],
-                         [-0.02631765,  0.99961777, -0.00846724],
-                         [-0.00302581,  0.00839048,  0.99996022]])
-        t_he = np.array([-0.011579, -0.004621, 0.359284])
+        R_he = HAND_EYE_ROTATION.copy()
+        t_he = HAND_EYE_TRANSLATION.copy()
 
         X_gt = make_transform(R_he, t_he)
         R_he, t_he = X_gt[:3, :3], X_gt[:3, 3]
@@ -162,6 +178,7 @@ class ScenePublisher(Node):
             'fov_corners_S': fov_corners_S,
         }
         self.publisher.set_scene(C, n_B, u_B, v_B, w, h)
+        self._publish_plate_collision()
 
         # 加载用户拖拽保存的运行时校准（如存在，则覆盖出厂几何）。
         self._load_fov_calib()
@@ -180,8 +197,16 @@ class ScenePublisher(Node):
         self.joint_sub = self.create_subscription(
             JointState, '/joint_states', self.joint_callback, 10)
 
-        # 定时器 — 确保场景 marker 持续发布 (30Hz，配合 robot_state_publisher)
-        self.timer = self.create_timer(0.033, self.timer_callback)
+        # Joint states may arrive at controller rate (50-100 Hz).  Generating
+        # the complete synthetic profile and every RViz marker in that callback
+        # floods DDS and can starve ros2_control.  Keep the callback lightweight
+        # and publish the complete simulation frame at one bounded rate.
+        self.declare_parameter('simulation_publish_rate_hz', 10.0)
+        publish_rate = max(
+            1.0, float(self.get_parameter('simulation_publish_rate_hz').value)
+        )
+        self._collision_publish_period = max(1, int(round(publish_rate)))
+        self.timer = self.create_timer(1.0 / publish_rate, self.timer_callback)
 
         self.get_logger().info("场景发布器已启动 — 等待 joint_states...")
         self.get_logger().info(f"平板中心: {C}")
@@ -200,7 +225,6 @@ class ScenePublisher(Node):
             if not self._fov_im_setup:
                 if self._setup_fov_corner_markers():
                     self._fov_im_setup = True
-            self.publish_all_markers(msg.header.stamp)
         except Exception as e:
             self.get_logger().warn(f"joint_states 回调异常: {e}")
 
@@ -349,6 +373,13 @@ class ScenePublisher(Node):
         try:
             stamp = self.get_clock().now().to_msg()
             self.publish_all_markers(stamp)
+            self._collision_publish_counter += 1
+            if (
+                self._collision_publish_counter
+                % self._collision_publish_period
+                == 0
+            ):
+                self._publish_plate_collision()
         except Exception as e:
             self.get_logger().error(f"timer_callback 异常: {e}")
 
@@ -364,15 +395,16 @@ class ScenePublisher(Node):
         h = self.scene['h']
         corners_S = self.scene['fov_corners_S']
         if self.latest_joints is not None:
-            # 用 TF 将角点从传感器系转换到 world 系
             try:
-                t = self.tf_buffer.lookup_transform(
-                    'world', 'gocator_sensor', rclpy.time.Time())
-                tw = t.transform.translation
-                qw = t.transform.rotation
-                q_arr = np.array([qw.x, qw.y, qw.z, qw.w])
-                R = quat_to_matrix(q_arr)
-                t_vec = np.array([tw.x, tw.y, tw.z])
+                # Use one encoder snapshot for the simulated measurement and
+                # publish that same flange pose with the endpoints.  This
+                # models trigger-synchronized joint/Gocator acquisition.
+                flange_transform = forward_kinematics_urdf(self.latest_joints)
+                sensor_transform = flange_transform @ make_transform(
+                    self.scene['R_he'], self.scene['t_he']
+                )
+                R = sensor_transform[:3, :3]
+                t_vec = sensor_transform[:3, 3]
                 corners_world = [t_vec + R @ c for c in corners_S]
 
                 # 计算 FOV 与平板交线 → 扫描点
@@ -390,7 +422,9 @@ class ScenePublisher(Node):
                 else:
                     R_noisy, t_noisy = R, t_vec
 
-                # 板翘曲：扰动法向量
+                # Stress mode only: frame-wise board-normal disturbance.  This
+                # is intentionally disabled for the nominal precision test
+                # because it violates the fixed rigid-plane model.
                 if warp_mm > 0:
                     warp_angle = warp_mm / max(w, h)  # 弧度
                     w_axis = rng.normal(0, 1, 3)
@@ -465,9 +499,18 @@ class ScenePublisher(Node):
 
                 # 发布断点信息（传感器系，正确标记 e1/e2）
                 ep = Float64MultiArray()
-                ep.layout.dim = [MultiArrayDimension(label='endpoints', size=9, stride=9)]
+                ep.layout.dim = [
+                    MultiArrayDimension(
+                        label='endpoints_flange_pose_and_stamp',
+                        size=23,
+                        stride=23,
+                    )
+                ]
                 ep.layout.data_offset = 0
-                ep_data = [0.0] * 9  # [n_endpoints, e1_x, e1_y, e1_z, e1_valid, e2_x, e2_y, e2_z, e2_valid]
+                # First 9 values retain the legacy endpoint layout.  The
+                # remaining values are R_BF row-major and t_BF from the exact
+                # encoder snapshot used to render this profile.
+                ep_data = [0.0] * 23
                 eps_S = res.get('endpoints_S', [])
                 ep_data[0] = float(len(eps_S))
                 e1_valid, e2_valid = 0.0, 0.0
@@ -478,6 +521,12 @@ class ScenePublisher(Node):
                         ep_data[5:8] = pt; e2_valid = 1.0
                 ep_data[4] = e1_valid
                 ep_data[8] = e2_valid
+                ep_data[9:18] = flange_transform[:3, :3].reshape(-1).tolist()
+                ep_data[18:21] = flange_transform[:3, 3].tolist()
+                # Match this endpoint/encoder snapshot to the PointCloud2
+                # frame without relying on DDS callback arrival order.
+                ep_data[21] = float(stamp.sec)
+                ep_data[22] = float(stamp.nanosec)
                 ep.data = ep_data
                 self.endpoint_pub.publish(ep)
 
@@ -490,6 +539,35 @@ class ScenePublisher(Node):
         else:
             # 无 joint 数据时只发平板
             self.publisher.publish_scene_markers(stamp)
+
+    def _publish_plate_collision(self):
+        """Keep the Gazebo plate and MoveIt collision world geometrically aligned."""
+        scene = self.scene
+        collision = CollisionObject()
+        collision.header.frame_id = 'world'
+        collision.id = 'calibration_plate'
+        primitive = SolidPrimitive()
+        primitive.type = SolidPrimitive.BOX
+        primitive.dimensions = [scene['w'], scene['h'], 0.01]
+        pose = Pose()
+        center = (
+            scene['C']
+            + 0.5 * scene['w'] * scene['u_B']
+            + 0.5 * scene['h'] * scene['v_B']
+            - 0.005 * scene['n_B']
+        )
+        pose.position = Point(x=float(center[0]), y=float(center[1]), z=float(center[2]))
+        quaternion = matrix_to_quat(scene['R_plate'])
+        pose.orientation = Quaternion(
+            x=float(quaternion[0]),
+            y=float(quaternion[1]),
+            z=float(quaternion[2]),
+            w=float(quaternion[3]),
+        )
+        collision.primitives = [primitive]
+        collision.primitive_poses = [pose]
+        collision.operation = CollisionObject.ADD
+        self.collision_pub.publish(collision)
 
     def _load_factory_fov_corners(self):
         """Load the immutable laser-window geometry shipped with the package."""

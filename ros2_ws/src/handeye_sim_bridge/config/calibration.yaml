@@ -3,6 +3,13 @@
     # Phase 0a: URDF truth is perturbed only to create a realistic nominal value.
     handeye_init_rotation_error_deg: 3.0
     handeye_init_translation_error_mm: 10.0
+    # Sixteen high-ranked feasible candidates keep each simulation NBV cycle
+    # bounded while retaining a diverse fallback set for MoveIt.
+    maximum_scored_candidates: 16
+    maximum_planning_candidates: 32
+    # Phase 0b can be switched to "manual" by the interactive console.
+    collection_mode: automatic
+    manual_max_joint_speed_rad_s: 0.02
 
     board:
       corner: [0.7, 0.0, 0.25]
@@ -11,6 +18,10 @@
       length_v_m: 0.5
 
     sensor:
+      # v5: both polygons use the metric X_S-Z_S coordinates published by Gocator.
+      hard_trapezoid: [-0.292, 0.82, -0.021, -0.22, -0.019, 0.22]
+      safe_trapezoid: [0.27, 0.78, -0.115, -0.19, 0.095, 0.19]
+      # Legacy fields remain for compatibility with older launch files.
       min_range_m: 0.27
       max_range_m: 0.82
       half_fov_deg: 15.0
@@ -18,29 +29,88 @@
 
     seed:
       target_count: 6
-      rotation_target_deg: 15.0
+      # The current narrow-FOV simulation uses 5 deg; the adaptive signed and
+      # reordered branches retain six-pose diversity without extra motion.
+      rotation_target_deg: 5.0
+      # v5 recommends 2-3 deg micro-rotations. Start at 2 deg and halve on
+      # unsafe feedback so a safe branch is fast without losing rollback.
       rotation_step_deg: 2.0
-      minimum_rotation_step_deg: 0.5
-      probe_step_m: 0.003
+      minimum_rotation_step_deg: 0.25
+      minimum_partial_rotation_deg: 2.5
+      probe_step_m: 0.001
       x_mid_tolerance_m: 0.003
+      maximum_translation_step_m: 0.005
       maximum_servo_iterations: 8
-      minimum_rotation_separation_deg: 5.0
+      maximum_target_failures: 3
+      minimum_profile_points: 5
+      minimum_rotation_separation_deg: 2.0
+      minimum_seed_domain_margin_m: 0.002
+      # Conservative sufficient envelope for the manually selected reference.
+      # It is expressed only with measured profile, joints and local IK.
+      initial:
+        maximum_abs_x_mid_m: 0.03
+        minimum_z_mid_m: 0.30
+        maximum_z_mid_m: 0.55
+        minimum_domain_margin_m: 0.020
+        minimum_profile_length_m: 0.05
+        maximum_profile_length_m: 0.25
+        # Physical edge identity is fixed, but either signed depth ordering is
+        # valid. Only the magnitude is needed to avoid a nearly level profile.
+        minimum_absolute_endpoint_depth_delta_m: 0.015
+        minimum_normalized_joint_margin: 0.05
+        # Three of four signed directions necessarily cover both local axes;
+        # the following measured preflight remains the final admission test.
+        minimum_local_ik_directions: 3
+        local_ik_test_step_deg: 2.0
+        maximum_local_joint_step_deg: 20.0
+      preflight:
+        rotation_deg: 2.0
+        minimum_domain_margin_m: 0.015
+        minimum_feasible_directions: 3
+      # Simulation-only trajectory timing; real hardware must use its own
+      # velocity/acceleration limits.
+      motion_duration_s: 0.55
+      motion_timeout_s: 4.0
+
+    settling_time_s: 0.2
+    maximum_measurement_age_s: 0.5
 
     solver:
       plane_weight: 1.0
       edge_weight: 1.0
       endpoint_plane_weight: 1.0
+      handeye_rotation_scale_deg: 10.0
+      handeye_translation_scale_m: 0.1
+      plane_rotation_scale_deg: 10.0
+      maximum_condition_number: 1.0e12
       max_evaluations: 3000
       tolerance: 1.0e-11
 
     nbv:
       edge_samples: 4
       edge_margin_m: 0.04
-      alpha_deg: [20.0, 35.0, 50.0]
+      # The verified initial bilateral view is near 74 deg. Shallow 20 deg
+      # laser/plate angles place the sensor far sideways in this layout.
+      alpha_deg: [55.0, 65.0, 75.0]
       psi_deg: [-15.0, 0.0, 15.0]
-      working_distance_m: [0.4, 0.55, 0.7]
+      working_distance_m: [0.33, 0.4, 0.5]
+      minimum_sensor_side_clearance_m: 0.15
+      minimum_nominal_roi_margin_m: 0.01
+      maximum_joint_step_deg: 70.0
+      maximum_joint_distance_rad: 1.6
+      motion_cost_weight: 1.0
+      maximum_execution_retries_per_pose: 3
+      # Do not spend another NBV on the same or an almost identical joint pose.
+      minimum_committed_joint_separation_rad: 0.10
+      # Submit independent trigger-synchronized frames as one NBV transaction;
+      # every frame retains its own encoder pose.
+      measurement_batch_size: 5
       minimum_valid_probability: 0.8
       minimum_poses: 3
       maximum_total_poses: 20
       information_gain_threshold: 1.0e-3
       consecutive_low_gain_limit: 3
+      # One-sigma targets are set below half of the requested truth-error
+      # acceptance (0.05 deg / 0.1 mm); truth itself is never used to stop.
+      maximum_rotation_std_deg: 0.025
+      maximum_translation_std_m: 0.00005

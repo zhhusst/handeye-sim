@@ -7,7 +7,7 @@ from itertools import product
 import numpy as np
 
 from ..geometry import invert_transform, make_transform
-from ..models import BoardModel, CalibrationEstimate, Candidate
+from ..models import CalibrationEstimate, Candidate, Measurement, SensorROI
 
 
 def _sensor_transform(
@@ -20,21 +20,34 @@ def _sensor_transform(
     branch: int,
 ) -> np.ndarray | None:
     line = point_v - point_u
-    if np.linalg.norm(line) < 1e-10:
+    profile_length = np.linalg.norm(line)
+    if profile_length < 1e-10:
         return None
-    line /= np.linalg.norm(line)
+    line /= profile_length
     tangent_normal = np.cross(board_normal, line)
-    tangent_normal /= np.linalg.norm(tangent_normal)
-    laser_normal = np.cos(alpha) * board_normal + branch * np.sin(alpha) * tangent_normal
-    laser_normal /= np.linalg.norm(laser_normal)
-    in_plane = np.cross(laser_normal, line)
-    if np.linalg.norm(in_plane) < 1e-10:
+    tangent_norm = np.linalg.norm(tangent_normal)
+    if tangent_norm < 1e-10:
         return None
-    in_plane /= np.linalg.norm(in_plane)
-    sensor_z = np.cos(psi) * in_plane + np.sin(psi) * line
-    sensor_z /= np.linalg.norm(sensor_z)
-    sensor_x = np.cross(laser_normal, sensor_z)
+    tangent_normal /= tangent_norm
+    laser_normal = (
+        np.cos(alpha) * board_normal + branch * np.sin(alpha) * tangent_normal
+    )
+    laser_normal /= np.linalg.norm(laser_normal)
+    sensor_x_zero = line
+    sensor_z_zero = np.cross(sensor_x_zero, laser_normal)
+    if np.linalg.norm(sensor_z_zero) < 1e-10:
+        return None
+    sensor_z_zero /= np.linalg.norm(sensor_z_zero)
+    sensor_x = np.cos(psi) * sensor_x_zero + np.sin(psi) * sensor_z_zero
+    sensor_z = -np.sin(psi) * sensor_x_zero + np.cos(psi) * sensor_z_zero
     sensor_x /= np.linalg.norm(sensor_x)
+    sensor_z /= np.linalg.norm(sensor_z)
+    sensor_y = laser_normal
+    # Remove round-off while retaining x/y labels from the construction.
+    sensor_x -= sensor_y * float(sensor_y @ sensor_x)
+    sensor_x /= np.linalg.norm(sensor_x)
+    sensor_z = np.cross(sensor_x, sensor_y)
+    sensor_z /= np.linalg.norm(sensor_z)
     sensor_y = np.cross(sensor_z, sensor_x)
     sensor_y /= np.linalg.norm(sensor_y)
     midpoint = 0.5 * (point_u + point_v)
@@ -45,11 +58,15 @@ def _sensor_transform(
 def generate_candidates(
     estimate: CalibrationEstimate,
     *,
+    roi: SensorROI | None = None,
     edge_samples: int = 4,
     edge_margin: float = 0.04,
     alphas_deg: tuple[float, ...] = (20.0, 35.0, 50.0),
     psis_deg: tuple[float, ...] = (-15.0, 0.0, 15.0),
     working_distances: tuple[float, ...] = (0.4, 0.55, 0.7),
+    profile_samples: int = 40,
+    minimum_alpha_deg: float = 5.0,
+    minimum_profile_length: float = 0.02,
 ) -> list[Candidate]:
     board = estimate.board
     if edge_margin * 2.0 >= min(board.length_u, board.length_v):
@@ -61,6 +78,8 @@ def generate_candidates(
     for a, b, alpha_deg, psi_deg, distance, branch in product(
         a_values, b_values, alphas_deg, psis_deg, working_distances, (-1, 1)
     ):
+        if abs(alpha_deg) < minimum_alpha_deg:
+            continue
         point_u = board.corner + a * board.u
         point_v = board.corner + b * board.v
         sensor_transform = _sensor_transform(
@@ -74,6 +93,23 @@ def generate_candidates(
         )
         if sensor_transform is None:
             continue
+        rotation_sensor_base = sensor_transform[:3, :3].T
+        translation_sensor_base = sensor_transform[:3, 3]
+        endpoint_u = rotation_sensor_base @ (point_u - translation_sensor_base)
+        endpoint_v = rotation_sensor_base @ (point_v - translation_sensor_base)
+        profile_length = float(np.linalg.norm(endpoint_u - endpoint_v))
+        if profile_length < minimum_profile_length:
+            continue
+        fractions = np.linspace(0.0, 1.0, profile_samples)
+        profile = endpoint_u[None, :] + fractions[:, None] * (
+            endpoint_v - endpoint_u
+        )[None, :]
+        virtual_measurement = Measurement(profile, endpoint_u, endpoint_v)
+        nominal_margin = float("inf")
+        if roi is not None:
+            nominal_margin = min(roi.margin(endpoint_u), roi.margin(endpoint_v))
+            if nominal_margin < 0.0:
+                continue
         flange_transform = sensor_transform @ invert_transform(estimate.handeye_transform)
         candidates.append(
             Candidate(
@@ -86,6 +122,8 @@ def generate_candidates(
                 branch=int(branch),
                 sensor_transform_nominal=sensor_transform,
                 flange_transform_command=flange_transform,
+                virtual_measurement=virtual_measurement,
+                nominal_margin=float(nominal_margin),
             )
         )
         serial += 1

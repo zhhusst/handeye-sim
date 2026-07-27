@@ -3,7 +3,8 @@
   <model name="calibration_plate">
     <static>true</static>
     <link name="plate_link">
-      <pose>0.7 0.0 0.25 0 0 0</pose>
+      <!-- board.corner is the u0/v0 top-surface corner; box pose is its center -->
+      <pose>0.9 0.25 0.245 0 0 0</pose>
       <visual name="visual">
         <geometry>
           <box>

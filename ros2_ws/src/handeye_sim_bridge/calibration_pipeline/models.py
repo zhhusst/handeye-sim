@@ -106,21 +106,90 @@ class BoardModel:
 
 
 @dataclass(frozen=True)
-class SensorROI:
-    min_range: float = 0.27
-    max_range: float = 0.82
-    half_fov_deg: float = 15.0
-    safe_margin: float = 0.01
+class TrapezoidDomain:
+    """A calibrated polygon in the Gocator ``X_S-Z_S`` measurement plane."""
+
+    z_near: float
+    z_far: float
+    x_left_near: float
+    x_left_far: float
+    x_right_near: float
+    x_right_far: float
+
+    def __post_init__(self) -> None:
+        if self.z_far <= self.z_near:
+            raise ValueError("z_far must be greater than z_near")
+        if self.x_left_near >= self.x_right_near:
+            raise ValueError("near trapezoid width must be positive")
+        if self.x_left_far >= self.x_right_far:
+            raise ValueError("far trapezoid width must be positive")
+
+    def x_limits(self, z: float) -> tuple[float, float]:
+        fraction = (float(z) - self.z_near) / (self.z_far - self.z_near)
+        left = (1.0 - fraction) * self.x_left_near + fraction * self.x_left_far
+        right = (1.0 - fraction) * self.x_right_near + fraction * self.x_right_far
+        return float(left), float(right)
+
+    def margin(self, point_sensor: np.ndarray) -> float:
+        x, _, z = _vector(point_sensor, "point_sensor")
+        left, right = self.x_limits(z)
+        return float(min(z - self.z_near, self.z_far - z, x - left, right - x))
 
     def contains(self, point_sensor: np.ndarray) -> bool:
         return self.margin(point_sensor) >= 0.0
 
-    def margin(self, point_sensor: np.ndarray) -> float:
-        x, _, z = _vector(point_sensor, "point_sensor")
-        if z <= 0.0:
-            return float(z - self.min_range)
-        half_width = z * np.tan(np.deg2rad(self.half_fov_deg))
-        return float(min(z - self.min_range, self.max_range - z, half_width - abs(x)))
+
+@dataclass(frozen=True)
+class SensorROI:
+    """Outer valid and inner planning-safe Gocator measurement domains.
+
+    ``min_range``/``max_range``/``half_fov_deg`` remain as a compatibility
+    input.  New configurations should provide explicit, possibly asymmetric,
+    hard and safe trapezoids in the same metric sensor coordinates as profiles.
+    """
+
+    min_range: float = 0.27
+    max_range: float = 0.82
+    half_fov_deg: float = 15.0
+    safe_margin: float = 0.01
+    hard_domain: TrapezoidDomain | None = None
+    safe_domain: TrapezoidDomain | None = None
+
+    def __post_init__(self) -> None:
+        if self.hard_domain is None:
+            tangent = float(np.tan(np.deg2rad(self.half_fov_deg)))
+            hard = TrapezoidDomain(
+                self.min_range,
+                self.max_range,
+                -self.min_range * tangent,
+                -self.max_range * tangent,
+                self.min_range * tangent,
+                self.max_range * tangent,
+            )
+            object.__setattr__(self, "hard_domain", hard)
+        if self.safe_domain is None:
+            hard = self.hard_domain
+            assert hard is not None
+            safe = TrapezoidDomain(
+                hard.z_near + self.safe_margin,
+                hard.z_far - self.safe_margin,
+                hard.x_left_near + self.safe_margin,
+                hard.x_left_far + self.safe_margin,
+                hard.x_right_near - self.safe_margin,
+                hard.x_right_far - self.safe_margin,
+            )
+            object.__setattr__(self, "safe_domain", safe)
+
+    def contains(self, point_sensor: np.ndarray, *, safe: bool = True) -> bool:
+        return self.margin(point_sensor, safe=safe) >= 0.0
+
+    def margin(self, point_sensor: np.ndarray, *, safe: bool = True) -> float:
+        domain = self.safe_domain if safe else self.hard_domain
+        assert domain is not None
+        return domain.margin(point_sensor)
+
+    def hard_margin(self, point_sensor: np.ndarray) -> float:
+        return self.margin(point_sensor, safe=False)
 
 
 @dataclass(frozen=True)
@@ -155,6 +224,7 @@ class SolverDiagnostics:
     condition_number: float
     residual_variance: float
     effective_handeye_information: np.ndarray
+    weakest_direction: np.ndarray
 
 
 @dataclass(frozen=True)
@@ -178,6 +248,8 @@ class Candidate:
     branch: int
     sensor_transform_nominal: np.ndarray
     flange_transform_command: np.ndarray
+    virtual_measurement: Measurement | None = None
+    nominal_margin: float = float("-inf")
 
 
 @dataclass(frozen=True)
@@ -189,6 +261,7 @@ class Prediction:
     roi_margin: float = float("-inf")
     edge_margin: float = float("-inf")
     profile_length: float = 0.0
+    intersection_margin: float = float("-inf")
 
 
 @dataclass

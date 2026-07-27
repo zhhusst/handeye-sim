@@ -32,6 +32,7 @@ setup(
             'srdf_publisher_node = handeye_sim_bridge.srdf_publisher_node:main',
             'profile_viz = handeye_sim_bridge.profile_viz_node:main',
             'seed_collection = handeye_sim_bridge.seed_collection_node:main',
+            'active_calibration_sim = handeye_sim_bridge.active_calibration_sim_node:main',
             'calibration_demo = calibration_pipeline.cli:main',
         ],
     },

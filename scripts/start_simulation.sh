@@ -67,7 +67,7 @@ ensure_gazebo_gui() {
     fi
 
     echo "Gazebo GUI failed to start." >&2
-    rg -m 5 \
+    grep -E -m 5 \
         "No protocol specified|could not connect to display|Could not load the Qt|RenderingAPIException|Unable to create" \
         /tmp/gazebo_gui.log >&2 || true
     /workspace/scripts/stop_simulation.sh >/dev/null 2>&1
@@ -117,7 +117,7 @@ move_to_initial_observation_pose() {
         sed -n '1,20p' /tmp/handeye_initial_pose.log >&2
         return 1
     fi
-    if ! rg -q "status: SUCCEEDED|Goal finished with status: SUCCEEDED" \
+    if ! grep -E -q "status: SUCCEEDED|Goal finished with status: SUCCEEDED" \
         /tmp/handeye_initial_pose.log; then
         echo "Initial observation pose was not reached." >&2
         sed -n '1,30p' /tmp/handeye_initial_pose.log >&2
@@ -127,6 +127,7 @@ move_to_initial_observation_pose() {
 
 cd /workspace
 source /opt/ros/jazzy/setup.bash
+export FASTDDS_DEFAULT_PROFILES_FILE=/workspace/ros2_ws/src/handeye_sim_bridge/config/fastdds_udp_only.xml
 if [[ ! -f /workspace/ros2_ws/install/setup.bash ]]; then
     echo "ROS 2 workspace is not built; run ./scripts/build.sh first." >&2
     exit 1

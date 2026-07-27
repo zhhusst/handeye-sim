@@ -1,7 +1,13 @@
 import numpy as np
 
-from calibration_pipeline.models import CalibrationEstimate
-from calibration_pipeline.nbv import generate_candidates, predict_candidate, score_candidates
+from calibration_pipeline.geometry import transform_point
+from calibration_pipeline.models import CalibrationEstimate, SensorROI, TrapezoidDomain
+from calibration_pipeline.nbv import (
+    StopPolicy,
+    generate_candidates,
+    predict_candidate,
+    score_candidates,
+)
 from calibration_pipeline.simulation.synthetic import default_scene, generate_seed_dataset
 from calibration_pipeline.solvers import TwelveDofV2Solver
 
@@ -34,6 +40,53 @@ def test_generated_candidate_hits_only_target_adjacent_edges():
     assert all(prediction.edge_labels == ("u0", "v0") or set(prediction.edge_labels) == {"u0", "v0"} for prediction in valid)
 
 
+def test_candidate_matches_v5_closed_form_virtual_endpoints():
+    scene, _, _, result = _calibrated_fixture()
+    candidate = generate_candidates(
+        result.estimate,
+        roi=scene.roi,
+        edge_samples=2,
+        alphas_deg=(35.0,),
+        psis_deg=(12.0,),
+        working_distances=(0.55,),
+    )[0]
+    measurement = candidate.virtual_measurement
+    assert measurement is not None
+    profile_length = np.hypot(candidate.a, candidate.b)
+    psi = candidate.psi
+    expected_u = np.array(
+        [
+            -0.5 * profile_length * np.cos(psi),
+            0.0,
+            candidate.working_distance + 0.5 * profile_length * np.sin(psi),
+        ]
+    )
+    expected_v = np.array(
+        [
+            0.5 * profile_length * np.cos(psi),
+            0.0,
+            candidate.working_distance - 0.5 * profile_length * np.sin(psi),
+        ]
+    )
+    assert np.allclose(measurement.endpoint_u, expected_u, atol=1e-10)
+    assert np.allclose(measurement.endpoint_v, expected_v, atol=1e-10)
+    assert np.allclose(
+        transform_point(candidate.sensor_transform_nominal, measurement.endpoint_u),
+        result.estimate.board.corner + candidate.a * result.estimate.board.u,
+        atol=1e-10,
+    )
+
+
+def test_asymmetric_safe_trapezoid_uses_metric_sensor_coordinates():
+    roi = SensorROI(
+        hard_domain=TrapezoidDomain(0.2, 0.8, -0.2, -0.3, 0.1, 0.25),
+        safe_domain=TrapezoidDomain(0.3, 0.7, -0.15, -0.22, 0.07, 0.18),
+    )
+    assert roi.contains(np.array([0.06, 0.0, 0.3]))
+    assert not roi.contains(np.array([0.08, 0.0, 0.3]))
+    assert roi.contains(np.array([0.08, 0.0, 0.3]), safe=False)
+
+
 def test_information_scoring_recomputes_augmented_varproj_model():
     scene, poses, measurements, result = _calibrated_fixture()
     candidates = generate_candidates(
@@ -63,3 +116,33 @@ def test_information_scoring_recomputes_augmented_varproj_model():
     )
     assert scored
     assert np.isfinite(scored[0].information_gain)
+
+
+def test_stop_policy_requires_physical_covariance_target():
+    policy = StopPolicy(
+        minimum_nbv_poses=1,
+        consecutive_low_gain_limit=1,
+        information_gain_threshold=1.0,
+        minimum_effective_eigenvalue=1e-8,
+    )
+    stop, _ = policy.evaluate(
+        total_poses=7,
+        nbv_poses=1,
+        effective_rank=6,
+        best_information_gain=0.0,
+        minimum_effective_eigenvalue=1.0,
+        handeye_covariance=None,
+    )
+    assert not stop
+    stop, reason = policy.evaluate(
+        total_poses=7,
+        nbv_poses=1,
+        effective_rank=6,
+        best_information_gain=0.0,
+        minimum_effective_eigenvalue=1.0,
+        handeye_covariance=np.diag(
+            [np.deg2rad(0.01) ** 2] * 3 + [1e-4**2] * 3
+        ),
+    )
+    assert stop
+    assert reason == "information gain saturated"

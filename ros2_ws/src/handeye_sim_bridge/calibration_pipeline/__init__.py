@@ -13,6 +13,7 @@ from .models import (
     Measurement,
     Prediction,
     SensorROI,
+    TrapezoidDomain,
 )
 from .pipeline import ActiveCalibrationPipeline, PipelineStage
 
@@ -27,4 +28,5 @@ __all__ = [
     "PipelineStage",
     "Prediction",
     "SensorROI",
+    "TrapezoidDomain",
 ]

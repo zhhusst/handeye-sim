@@ -29,10 +29,23 @@ class ProfileVizNode(Node):
             Image, '/gocator/profile_2d', 10)
 
         self._latest = None
+        self.declare_parameter('visualization_rate_hz', 3.0)
+        rate = max(
+            0.5, float(self.get_parameter('visualization_rate_hz').value)
+        )
+        self._visualization_period_ns = int(1e9 / rate)
+        self._last_viz_time = None
 
         self.get_logger().info('Profile Viz ready — /gocator/profile_viz + /gocator/profile_2d')
 
     def _cb(self, msg):
+        now = self.get_clock().now()
+        if (
+            self._last_viz_time is not None
+            and (now - self._last_viz_time).nanoseconds
+            < self._visualization_period_ns
+        ):
+            return
         from sensor_msgs_py.point_cloud2 import read_points
         try:
             pts = [list(p) for p in read_points(
@@ -41,12 +54,6 @@ class ProfileVizNode(Node):
         except Exception:
             return
         if self._latest is not None and len(self._latest) > 0:
-            # Throttle to 10 Hz to avoid flooding RViz
-            now = self.get_clock().now()
-            if not hasattr(self, '_last_viz_time'):
-                self._last_viz_time = now
-            if (now - self._last_viz_time).nanoseconds < 0.1 * 1e9:
-                return
             self._last_viz_time = now
             self._publish_all()
 

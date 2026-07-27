@@ -2,6 +2,11 @@ import importlib.util
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+import numpy as np
+from scipy.spatial.transform import Rotation
+
+from calibration_pipeline.simulation.synthetic import default_scene
+
 
 def test_generated_urdf_is_current_and_uses_radians():
     generator_path = Path("urdf/generate_urdf.py")
@@ -32,3 +37,19 @@ def test_generated_urdf_is_current_and_uses_radians():
     for child_name in moving_children:
         assert links[child_name].find("inertial") is not None
         assert links[child_name].find("collision") is not None
+
+
+def test_simulation_truth_matches_urdf_fixed_handeye_joint():
+    root = ET.fromstring(Path("urdf/calib_robot.urdf").read_text(encoding="utf-8"))
+    joint = root.find("./joint[@name='fanuc_flange-gocator_sensor_joint']")
+    assert joint is not None
+    origin = joint.find("origin")
+    assert origin is not None
+    xyz = np.fromstring(origin.attrib["xyz"], sep=" ")
+    rpy = np.fromstring(origin.attrib["rpy"], sep=" ")
+    scene = default_scene()
+    assert np.allclose(scene.handeye_translation, xyz)
+    assert np.allclose(
+        scene.handeye_rotation,
+        Rotation.from_euler("xyz", rpy).as_matrix(),
+    )

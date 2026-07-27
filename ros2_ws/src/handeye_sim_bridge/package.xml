@@ -16,9 +16,12 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>control_msgs</depend>
+  <depend>action_msgs</depend>
   <depend>trajectory_msgs</depend>
   <depend>sensor_msgs_py</depend>
   <depend>interactive_markers</depend>
+  <depend>moveit_msgs</depend>
+  <depend>shape_msgs</depend>
   <depend>ament_index_python</depend>
 
   <exec_depend>python3-numpy</exec_depend>

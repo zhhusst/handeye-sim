@@ -71,6 +71,22 @@ def make_transform(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
     return transform
 
 
+def quaternion_to_matrix(quaternion_xyzw: np.ndarray) -> np.ndarray:
+    """Convert a normalized-or-near-normalized ``[x, y, z, w]`` quaternion."""
+    x, y, z, w = np.asarray(quaternion_xyzw, dtype=float)
+    norm = float(np.linalg.norm([x, y, z, w]))
+    if norm < 1e-12:
+        raise ValueError("quaternion norm must be non-zero")
+    x, y, z, w = np.array([x, y, z, w]) / norm
+    return np.array(
+        [
+            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+            [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+            [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+        ]
+    )
+
+
 def invert_transform(transform: np.ndarray) -> np.ndarray:
     rotation = np.asarray(transform[:3, :3], dtype=float)
     translation = np.asarray(transform[:3, 3], dtype=float)
