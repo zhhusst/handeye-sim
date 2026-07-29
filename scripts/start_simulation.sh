@@ -137,6 +137,7 @@ source /workspace/ros2_ws/install/setup.bash
 URDF_PATH=/workspace/urdf/calib_robot.urdf
 SRDF_PATH=/workspace/ros2_ws/src/handeye_sim_bridge/config/fanuc.srdf
 GZ_CTRL_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/gz_controllers.yaml
+CALIBRATION_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/calibration.yaml
 SCENE_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/scene_publisher_node
 SRDF_PUB_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/srdf_publisher_node
 PROFILE_VIZ_BIN=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/profile_viz
@@ -148,7 +149,7 @@ echo "=========================================="
 echo "  Gazebo + MoveIt2  手眼标定仿真 "
 echo "=========================================="
 
-if ! ros2 pkg list 2>/dev/null | grep -q ros_gz_bridge; then
+if ! ros2 pkg prefix ros_gz_bridge >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq ros-jazzy-ros-gz-bridge
 fi
 if [ ! -f "$URDF_PATH" ]; then echo "URDF not found"; exit 1; fi
@@ -313,7 +314,7 @@ echo "Restoring GitHub initial observation pose..."
 move_to_initial_observation_pose
 tmux send-keys -t handeye_sim:0.1 "'$SRDF_PUB_EXE' --ros-args -p use_sim_time:=true" Enter
 sleep 1
-tmux send-keys -t handeye_sim:0.1 "'$SCENE_EXE' --ros-args -p use_sim_time:=true" Enter
+tmux send-keys -t handeye_sim:0.1 "'$SCENE_EXE' --ros-args --params-file '$CALIBRATION_CONFIG' -p use_sim_time:=true" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "'$PROFILE_VIZ_BIN' --ros-args -p use_sim_time:=true &" Enter
 sleep 1
@@ -394,7 +395,7 @@ sleep 5
 echo "[6/7] SRDF + Scene + Profile Viz..."
 "$SRDF_PUB_EXE" --ros-args -p use_sim_time:=true &
 sleep 1
-"$SCENE_EXE" --ros-args -p use_sim_time:=true &
+"$SCENE_EXE" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
 sleep 1
 "$PROFILE_VIZ_BIN" --ros-args -p use_sim_time:=true &
 sleep 1

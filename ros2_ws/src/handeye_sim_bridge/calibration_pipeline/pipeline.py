@@ -44,6 +44,9 @@ class ActiveCalibrationPipeline:
         maximum_update_rotation_deg: float = 5.0,
         maximum_update_translation_m: float = 0.05,
         maximum_board_rotation_deg: float = 10.0,
+        initial_maximum_update_rotation_deg: float | None = None,
+        initial_maximum_update_translation_m: float | None = None,
+        initial_maximum_board_rotation_deg: float | None = None,
     ) -> None:
         self.coarse_handeye_rotation_init = np.asarray(
             nominal_handeye_rotation, dtype=float
@@ -62,6 +65,45 @@ class ActiveCalibrationPipeline:
         self.maximum_update_rotation_deg = float(maximum_update_rotation_deg)
         self.maximum_update_translation_m = float(maximum_update_translation_m)
         self.maximum_board_rotation_deg = float(maximum_board_rotation_deg)
+        # The six-seed solution can be deliberately coarse under a demanding
+        # disturbance test.  Its first independent NBV is therefore allowed
+        # to make a larger correction, bounded by the configured Phase-0a
+        # uncertainty.  Once one NBV has been committed, the tighter
+        # transactional limits apply again.
+        self.initial_maximum_update_rotation_deg = float(
+            maximum_update_rotation_deg
+            if initial_maximum_update_rotation_deg is None
+            else initial_maximum_update_rotation_deg
+        )
+        self.initial_maximum_update_translation_m = float(
+            maximum_update_translation_m
+            if initial_maximum_update_translation_m is None
+            else initial_maximum_update_translation_m
+        )
+        self.initial_maximum_board_rotation_deg = float(
+            maximum_board_rotation_deg
+            if initial_maximum_board_rotation_deg is None
+            else initial_maximum_board_rotation_deg
+        )
+        for name, value in (
+            ("maximum_update_rotation_deg", self.maximum_update_rotation_deg),
+            ("maximum_update_translation_m", self.maximum_update_translation_m),
+            ("maximum_board_rotation_deg", self.maximum_board_rotation_deg),
+            (
+                "initial_maximum_update_rotation_deg",
+                self.initial_maximum_update_rotation_deg,
+            ),
+            (
+                "initial_maximum_update_translation_m",
+                self.initial_maximum_update_translation_m,
+            ),
+            (
+                "initial_maximum_board_rotation_deg",
+                self.initial_maximum_board_rotation_deg,
+            ),
+        ):
+            if not np.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
         self.stage = PipelineStage.WAIT_MANUAL_INIT
         self.poses: list[FlangePose] = []
         self.measurements: list[Measurement] = []
@@ -72,10 +114,22 @@ class ActiveCalibrationPipeline:
         self.gain_history: list[float] = []
 
     def append_seed(self, pose: FlangePose, measurement: Measurement) -> None:
+        self.append_seed_batch([pose], [measurement])
+
+    def append_seed_batch(
+        self,
+        poses: list[FlangePose],
+        measurements: list[Measurement],
+    ) -> None:
+        """Append all synchronized frames from one physical seed pose."""
         if self.stage not in {PipelineStage.WAIT_MANUAL_INIT, PipelineStage.COLLECT_SEEDS}:
             raise RuntimeError(f"cannot append a seed during {self.stage.name}")
-        self.poses.append(pose)
-        self.measurements.append(measurement)
+        if not poses or len(poses) != len(measurements):
+            raise ValueError(
+                "seed batch must contain equal non-empty pose/measurement lists"
+            )
+        self.poses.extend(poses)
+        self.measurements.extend(measurements)
         self.seed_count += 1
         self.stage = (
             PipelineStage.INITIALIZE_12DOF_V2
@@ -117,6 +171,8 @@ class ActiveCalibrationPipeline:
         self,
         *,
         maximum_candidates: int | None = None,
+        minimum_valid_probability: float = 0.8,
+        virtual_batch_size: int = 1,
         candidate_filter=None,
         candidate_options: dict | None = None,
     ):
@@ -144,6 +200,8 @@ class ActiveCalibrationPipeline:
             self.poses,
             self.measurements,
             self.roi,
+            minimum_valid_probability=minimum_valid_probability,
+            virtual_batch_size=virtual_batch_size,
             maximum_candidates=None,
             projection_weights=self.solver.weights,
             state_scale=self.solver.state_scale,
@@ -219,15 +277,34 @@ class ActiveCalibrationPipeline:
         board_jump = rotation_distance_deg(
             previous.estimate.board.rotation, trial.estimate.board.rotation
         )
+        first_nbv = self.nbv_count == 0
+        rotation_limit = (
+            self.initial_maximum_update_rotation_deg
+            if first_nbv
+            else self.maximum_update_rotation_deg
+        )
+        translation_limit = (
+            self.initial_maximum_update_translation_m
+            if first_nbv
+            else self.maximum_update_translation_m
+        )
+        board_limit = (
+            self.initial_maximum_board_rotation_deg
+            if first_nbv
+            else self.maximum_board_rotation_deg
+        )
         if (
-            rotation_jump > self.maximum_update_rotation_deg
-            or translation_jump > self.maximum_update_translation_m
-            or board_jump > self.maximum_board_rotation_deg
+            rotation_jump > rotation_limit
+            or translation_jump > translation_limit
+            or board_jump > board_limit
         ):
             raise RuntimeError(
                 "NBV observation rejected: transactional update jump "
                 f"(handeye={rotation_jump:.3f} deg/{translation_jump:.4f} m, "
-                f"board={board_jump:.3f} deg)"
+                f"board={board_jump:.3f} deg; "
+                f"limits={rotation_limit:.3f} deg/{translation_limit:.4f} m/"
+                f"{board_limit:.3f} deg; "
+                f"phase={'first-NBV correction' if first_nbv else 'rolling update'})"
             )
         self.poses = trial_poses
         self.measurements = trial_measurements

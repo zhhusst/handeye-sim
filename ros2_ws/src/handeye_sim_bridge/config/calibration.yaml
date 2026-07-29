@@ -1,11 +1,11 @@
 /**:
   ros__parameters:
     # Phase 0a: URDF truth is perturbed only to create a realistic nominal value.
-    handeye_init_rotation_error_deg: 3.0
-    handeye_init_translation_error_mm: 10.0
-    # Sixteen high-ranked feasible candidates keep each simulation NBV cycle
+    handeye_init_rotation_error_deg: 15.0
+    handeye_init_translation_error_mm: 200.0
+    # Eight uniformly distributed feasible candidates keep each NBV cycle
     # bounded while retaining a diverse fallback set for MoveIt.
-    maximum_scored_candidates: 16
+    maximum_scored_candidates: 8
     maximum_planning_candidates: 32
     # Phase 0b can be switched to "manual" by the interactive console.
     collection_mode: automatic
@@ -16,6 +16,37 @@
       rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
       length_u_m: 0.4
       length_v_m: 0.5
+
+    # Simulation-only disturbance model. All distances use metres, angles use
+    # degrees and time uses seconds. Set every standard deviation/probability
+    # to zero for an ideal-data baseline. Restart the simulation after editing.
+    simulation_noise:
+      # Fixed seed makes repeated robustness runs directly comparable.
+      # Use -1 only when intentionally requesting a non-repeatable sequence.
+      random_seed: 20260728
+      # Profile sampling and endpoint extraction are distinct estimators.
+      profile_gaussian_std_m: 0.000055  # 轮廓高斯标准差
+      endpoint_gaussian_std_m: 0.0008   # 断点提取高斯标准差 0.8mm
+      # Hidden physical flange error; the reported encoder pose is not changed.
+      # Robot/plate model mismatch remains simulated at the validated
+      # background level, but is deliberately not estimated by 12-DOF-V2.
+      # This robustness campaign isolates the 0.8 mm endpoint-extraction case.
+      robot_translation_std_m: 0.00003  # 机器人平移标准差
+      robot_rotation_std_deg: 0.003     # 机器人旋转标准差
+      # RMS amplitude of one fixed spatial height field on the board.
+      board_flatness_rms_m: 0.00003         # 固定板面度RMS
+      # The profile is paired with a delayed encoder history sample.
+      sync_delay_mean_s: 0.0                # 同步延迟均值
+      sync_jitter_std_s: 0.001              # 同步抖动标准差
+      # Sparse large errors, independent of the Gaussian extraction error.
+      point_outlier_probability: 0.002      # 轮廓点离群概率
+      point_outlier_std_m: 0.0008           # 轮廓点离群幅度
+      endpoint_outlier_probability: 0.001   # 断点离群概率
+      endpoint_outlier_std_m: 0.0008        # 断点离群幅度
+      # Point loss, complete-frame loss, and endpoint-specific missed detection.
+      point_dropout_probability: 0.01       # 轮廓点漏检概率
+      frame_dropout_probability: 0.001      # 整帧漏检概率
+      endpoint_dropout_probability: 0.002   # 单断点漏检概率
 
     sensor:
       # v5: both polygons use the metric X_S-Z_S coordinates published by Gocator.
@@ -38,9 +69,29 @@
       minimum_rotation_step_deg: 0.25
       minimum_partial_rotation_deg: 2.5
       probe_step_m: 0.001
-      x_mid_tolerance_m: 0.003
-      maximum_translation_step_m: 0.005
+      # Exact optical-axis centering is not a calibration constraint. Keeping
+      # the endpoints safely inside the ROI is sufficient and avoids dozens
+      # of low-value servo moves from difficult initial views.
+      x_mid_tolerance_m: 0.010
+      maximum_translation_step_m: 0.012
+      # Between 2-degree micro-rotations, continue directly while the
+      # observation retains this conservative envelope; center only when the
+      # envelope becomes tight or the target orientation is reached.
+      rotation_continue_max_abs_x_mid_m: 0.025
+      rotation_continue_minimum_domain_margin_m: 0.015
       maximum_servo_iterations: 8
+      # A single simulated/real frame may be dropped. After every motion, wait
+      # briefly for the next synchronized bilateral frame before rejecting it.
+      measurement_retry_timeout_s: 1.0
+      # Each of the six physical seed poses is now a stationary synchronized
+      # frame batch. Endpoint MAD screening rejects whole bad frames. Schema 3
+      # retains every synchronized flange pose; the seed solve uses their
+      # translation/SO(3) mean as one representative physical pose.
+      measurement_batch_size: 20
+      minimum_batch_inliers: 15
+      maximum_batch_frames: 40
+      measurement_batch_timeout_s: 6.0
+      endpoint_mad_multiplier: 3.5
       maximum_target_failures: 3
       minimum_profile_points: 5
       minimum_rotation_separation_deg: 2.0
@@ -65,26 +116,41 @@
         maximum_local_joint_step_deg: 20.0
       preflight:
         rotation_deg: 2.0
+        # Preflight proves that a signed direction stays inside the usable
+        # envelope. The tighter 3 mm target is reserved for saved seed poses.
+        maximum_abs_x_mid_m: 0.030
         minimum_domain_margin_m: 0.015
         minimum_feasible_directions: 3
       # Simulation-only trajectory timing; real hardware must use its own
       # velocity/acceleration limits.
-      motion_duration_s: 0.55
+      motion_duration_s: 0.45
       motion_timeout_s: 4.0
 
-    settling_time_s: 0.2
+    settling_time_s: 0.15
     maximum_measurement_age_s: 0.5
 
     solver:
       plane_weight: 1.0
-      edge_weight: 1.0
-      endpoint_plane_weight: 1.0
+      # Residual whitening for 0.055 mm profile noise versus 0.8 mm endpoint
+      # noise: (0.055/0.8)^2 = 0.00473, rounded conservatively to 0.005.
+      edge_weight: 0.005
+      endpoint_plane_weight: 0.005
       handeye_rotation_scale_deg: 10.0
       handeye_translation_scale_m: 0.1
       plane_rotation_scale_deg: 10.0
       maximum_condition_number: 1.0e12
       max_evaluations: 3000
       tolerance: 1.0e-11
+
+    # Truth-independent admission test for the critical six-seed V2 solution.
+    # Frames are resampled within each fixed physical pose; an unstable
+    # solution is rejected before NBV candidate generation.
+    initial_validation:
+      bootstrap_trials: 4
+      random_seed: 20260728
+      maximum_rotation_p95_deg: 1.0
+      maximum_translation_p95_m: 0.010
+      minimum_converged_fraction: 0.8
 
     nbv:
       edge_samples: 4
@@ -102,15 +168,32 @@
       maximum_execution_retries_per_pose: 3
       # Do not spend another NBV on the same or an almost identical joint pose.
       minimum_committed_joint_separation_rad: 0.10
-      # Submit independent trigger-synchronized frames as one NBV transaction;
-      # every frame retains its own encoder pose.
-      measurement_batch_size: 5
+      # This file currently selects the high-noise stress regime above.
+      # Fifteen synchronized frames retain multi-frame averaging while
+      # reducing both acquisition time and the O(N) rolling solve/score cost.
+      measurement_batch_size: 15
+      # Batch timeout is automatically at least batch_size/rate + 1 second.
+      minimum_measurement_frame_rate_hz: 2.0
       minimum_valid_probability: 0.8
       minimum_poses: 3
-      maximum_total_poses: 20
+      # Six seeds plus at most six NBVs. Longer runs were slower while truth
+      # error merely fluctuated under the current 0.8 mm endpoint stress.
+      maximum_total_poses: 12
       information_gain_threshold: 1.0e-3
       consecutive_low_gain_limit: 3
-      # One-sigma targets are set below half of the requested truth-error
-      # acceptance (0.05 deg / 0.1 mm); truth itself is never used to stop.
+      minimum_effective_eigenvalue: 1.0e-6
+      # The covariance is still optimistic under 0.8 mm endpoint stress.
+      # Keep its one-sigma stop target below half the requested truth-error
+      # target; the six-NBV protection limit bounds runtime independently.
       maximum_rotation_std_deg: 0.025
       maximum_translation_std_m: 0.00005
+      # Transactional update guards. The first accepted NBV is a correction
+      # of the noisy six-seed estimate, so its negative values below mean:
+      # automatically use at least the declared Phase-0a hand-eye uncertainty.
+      # Later NBVs always return to the tighter rolling-update limits.
+      maximum_update_rotation_deg: 5.0
+      maximum_update_translation_m: 0.05
+      maximum_board_rotation_deg: 10.0
+      initial_maximum_update_rotation_deg: -1.0
+      initial_maximum_update_translation_m: -1.0
+      initial_maximum_board_rotation_deg: -1.0

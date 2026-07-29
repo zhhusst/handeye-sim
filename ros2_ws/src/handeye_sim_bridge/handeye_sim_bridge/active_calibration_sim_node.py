@@ -22,7 +22,11 @@ from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 from tf2_ros import Buffer, TransformListener
 
-from calibration_pipeline.dataset_io import load_seed_dataset, save_result
+from calibration_pipeline.dataset_io import (
+    aggregate_seed_group,
+    load_seed_dataset_grouped,
+    save_result,
+)
 from calibration_pipeline.geometry import (
     make_transform,
     quaternion_to_matrix,
@@ -34,6 +38,10 @@ from calibration_pipeline.models import (
     Measurement,
     SensorROI,
     TrapezoidDomain,
+)
+from calibration_pipeline.initial_validation import (
+    bootstrap_initial_stability,
+    inflate_handeye_covariance_from_stability,
 )
 from calibration_pipeline.nbv.stopping import StopPolicy
 from calibration_pipeline.pipeline import ActiveCalibrationPipeline
@@ -56,6 +64,27 @@ JOINT_NAMES = (
     "J5_joint",
     "J6_joint",
 )
+
+
+def effective_measurement_timeout_s(
+    configured_timeout_s: float,
+    measurement_batch_size: int,
+    minimum_frame_rate_hz: float,
+) -> float:
+    """Give a requested frame batch enough time under a loaded simulation."""
+    if configured_timeout_s <= 0.0:
+        raise ValueError("measurement_timeout_s must be positive")
+    if measurement_batch_size < 1:
+        raise ValueError("measurement_batch_size must be positive")
+    if minimum_frame_rate_hz <= 0.0:
+        raise ValueError("minimum_frame_rate_hz must be positive")
+    # One extra second covers settling-to-callback and matched-topic latency.
+    return max(
+        float(configured_timeout_s),
+        float(measurement_batch_size) / float(minimum_frame_rate_hz) + 1.0,
+    )
+
+
 class ActiveCalibrationSimNode(Node):
     """Run only against the repository's Gazebo/Gocator simulation topics."""
 
@@ -77,6 +106,7 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("nbv.maximum_joint_step_deg", 70.0)
         self.declare_parameter("nbv.maximum_joint_distance_rad", 1.6)
         self.declare_parameter("nbv.motion_cost_weight", 1.0)
+        self.declare_parameter("nbv.minimum_valid_probability", 0.8)
         self.declare_parameter("nbv.maximum_execution_retries_per_pose", 3)
         self.declare_parameter(
             "nbv.minimum_committed_joint_separation_rad", 0.10
@@ -89,8 +119,17 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("nbv.minimum_effective_eigenvalue", 1e-6)
         self.declare_parameter("nbv.maximum_rotation_std_deg", 0.025)
         self.declare_parameter("nbv.maximum_translation_std_m", 0.00005)
+        self.declare_parameter("nbv.maximum_update_rotation_deg", 5.0)
+        self.declare_parameter("nbv.maximum_update_translation_m", 0.05)
+        self.declare_parameter("nbv.maximum_board_rotation_deg", 10.0)
+        # Non-positive means derive the first-NBV correction bound from the
+        # declared Phase-0a hand-eye uncertainty.
+        self.declare_parameter("nbv.initial_maximum_update_rotation_deg", -1.0)
+        self.declare_parameter("nbv.initial_maximum_update_translation_m", -1.0)
+        self.declare_parameter("nbv.initial_maximum_board_rotation_deg", -1.0)
         self.declare_parameter("settling_time_s", 0.75)
         self.declare_parameter("measurement_timeout_s", 5.0)
+        self.declare_parameter("nbv.minimum_measurement_frame_rate_hz", 2.0)
         self.declare_parameter("board.length_u_m", 0.4)
         self.declare_parameter("board.length_v_m", 0.5)
         self.declare_parameter("handeye_init_rotation_error_deg", 3.0)
@@ -104,6 +143,17 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("solver.handeye_translation_scale_m", 0.1)
         self.declare_parameter("solver.plane_rotation_scale_deg", 10.0)
         self.declare_parameter("solver.maximum_condition_number", 1e12)
+        self.declare_parameter("initial_validation.bootstrap_trials", 4)
+        self.declare_parameter("initial_validation.random_seed", 20260728)
+        self.declare_parameter(
+            "initial_validation.maximum_rotation_p95_deg", 1.0
+        )
+        self.declare_parameter(
+            "initial_validation.maximum_translation_p95_m", 0.010
+        )
+        self.declare_parameter(
+            "initial_validation.minimum_converged_fraction", 0.8
+        )
         self.declare_parameter(
             "sensor.hard_trapezoid",
             [-0.292, 0.82, -0.021, -0.22, -0.019, 0.22],
@@ -151,6 +201,11 @@ class ActiveCalibrationSimNode(Node):
         self.motion_cost_weight = float(
             self.get_parameter("nbv.motion_cost_weight").value
         )
+        self.minimum_valid_probability = float(
+            self.get_parameter("nbv.minimum_valid_probability").value
+        )
+        if not 0.0 <= self.minimum_valid_probability <= 1.0:
+            raise ValueError("nbv.minimum_valid_probability must be in [0, 1]")
         self.maximum_execution_retries = int(
             self.get_parameter("nbv.maximum_execution_retries_per_pose").value
         )
@@ -189,7 +244,16 @@ class ActiveCalibrationSimNode(Node):
         )
         self.settling_time = float(self.get_parameter("settling_time_s").value)
         self.measurement_timeout_ns = int(
-            float(self.get_parameter("measurement_timeout_s").value) * 1e9
+            effective_measurement_timeout_s(
+                float(self.get_parameter("measurement_timeout_s").value),
+                self.measurement_batch_size,
+                float(
+                    self.get_parameter(
+                        "nbv.minimum_measurement_frame_rate_hz"
+                    ).value
+                ),
+            )
+            * 1e9
         )
         self.roi = SensorROI(
             hard_domain=TrapezoidDomain(
@@ -272,6 +336,8 @@ class ActiveCalibrationSimNode(Node):
         self.rejection_counts: dict[str, int] = {}
         self.execution_failures_since_commit = 0
         self.execution_failure_history: list[dict] = []
+        self.initial_stability_report = None
+        self.seed_observation_count = 0
         self.committed_nbv_joints: list[np.ndarray] = []
         self.measurement_batch: list[
             tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
@@ -475,11 +541,18 @@ class ActiveCalibrationSimNode(Node):
 
     def _initialize_from_seeds(self) -> None:
         try:
-            poses, measurements = load_seed_dataset(self.seed_file)
-            count = len(poses)
+            dataset = load_seed_dataset_grouped(self.seed_file)
+            count = dataset.physical_seed_count
             if count < 6:
-                self.get_logger().warning(f"seed file has only {count}/6 observations")
+                self.get_logger().warning(
+                    f"seed file has only {count}/6 physical poses"
+                )
                 return
+            self.get_logger().info(
+                f"loaded {count} physical seeds with "
+                f"{dataset.observation_count} synchronized observations"
+            )
+            self.seed_observation_count = dataset.observation_count
             angle = np.deg2rad(
                 float(self.get_parameter("handeye_init_rotation_error_deg").value)
             )
@@ -495,19 +568,63 @@ class ActiveCalibrationSimNode(Node):
             nominal_translation = (
                 HAND_EYE_TRANSLATION + translation_axis * translation_error
             )
+            maximum_update_rotation_deg = float(
+                self.get_parameter("nbv.maximum_update_rotation_deg").value
+            )
+            maximum_update_translation_m = float(
+                self.get_parameter("nbv.maximum_update_translation_m").value
+            )
+            maximum_board_rotation_deg = float(
+                self.get_parameter("nbv.maximum_board_rotation_deg").value
+            )
+            initial_rotation_limit = float(
+                self.get_parameter(
+                    "nbv.initial_maximum_update_rotation_deg"
+                ).value
+            )
+            initial_translation_limit = float(
+                self.get_parameter(
+                    "nbv.initial_maximum_update_translation_m"
+                ).value
+            )
+            initial_board_limit = float(
+                self.get_parameter(
+                    "nbv.initial_maximum_board_rotation_deg"
+                ).value
+            )
+            board_dimensions = (
+                float(self.get_parameter("board.length_u_m").value),
+                float(self.get_parameter("board.length_v_m").value),
+            )
             self.pipeline = ActiveCalibrationPipeline(
                 nominal_rotation,
                 nominal_translation,
-                (
-                    float(self.get_parameter("board.length_u_m").value),
-                    float(self.get_parameter("board.length_v_m").value),
-                ),
+                board_dimensions,
                 roi=self.roi,
                 solver=self.solver,
                 stop_policy=self.stop_policy,
                 minimum_seed_poses=count,
+                maximum_update_rotation_deg=maximum_update_rotation_deg,
+                maximum_update_translation_m=maximum_update_translation_m,
+                maximum_board_rotation_deg=maximum_board_rotation_deg,
+                initial_maximum_update_rotation_deg=(
+                    max(maximum_update_rotation_deg, np.rad2deg(angle))
+                    if initial_rotation_limit <= 0.0
+                    else initial_rotation_limit
+                ),
+                initial_maximum_update_translation_m=(
+                    max(maximum_update_translation_m, translation_error)
+                    if initial_translation_limit <= 0.0
+                    else initial_translation_limit
+                ),
+                initial_maximum_board_rotation_deg=(
+                    maximum_board_rotation_deg
+                    if initial_board_limit <= 0.0
+                    else initial_board_limit
+                ),
             )
-            for pose, measurement in zip(poses, measurements):
+            for group in dataset.groups:
+                pose, measurement = aggregate_seed_group(group)
                 self.pipeline.append_seed(pose, measurement)
             result = self.pipeline.initialize()
             if not result.converged:
@@ -517,6 +634,41 @@ class ActiveCalibrationSimNode(Node):
                     f"condition={result.diagnostics.condition_number:.3e}"
                 )
                 return
+            self.initial_stability_report = bootstrap_initial_stability(
+                dataset.groups,
+                self.solver,
+                result,
+                board_dimensions=board_dimensions,
+                trials=int(
+                    self.get_parameter(
+                        "initial_validation.bootstrap_trials"
+                    ).value
+                ),
+                random_seed=int(
+                    self.get_parameter(
+                        "initial_validation.random_seed"
+                    ).value
+                ),
+                maximum_rotation_p95_deg=float(
+                    self.get_parameter(
+                        "initial_validation.maximum_rotation_p95_deg"
+                    ).value
+                ),
+                maximum_translation_p95_m=float(
+                    self.get_parameter(
+                        "initial_validation.maximum_translation_p95_m"
+                    ).value
+                ),
+                minimum_converged_fraction=float(
+                    self.get_parameter(
+                        "initial_validation.minimum_converged_fraction"
+                    ).value
+                ),
+            )
+            result = inflate_handeye_covariance_from_stability(
+                result, self.initial_stability_report
+            )
+            self.pipeline.result = result
             self.get_logger().info(
                 "12-DOF-V2 initialized: "
                 f"rank={result.diagnostics.rank}, "
@@ -524,8 +676,28 @@ class ActiveCalibrationSimNode(Node):
                 f"rotation_error={rotation_distance_deg(result.estimate.handeye_rotation, HAND_EYE_ROTATION):.4f} deg, "
                 f"translation_error={1000.0 * np.linalg.norm(result.estimate.handeye_translation - HAND_EYE_TRANSLATION):.4f} mm"
             )
+            stability = self.initial_stability_report
+            if stability.available:
+                self.get_logger().info(
+                    "seed bootstrap stability: "
+                    f"converged={stability.trials_converged}/"
+                    f"{stability.trials_requested}, "
+                    f"rotation_p95={stability.rotation_p95_deg:.4f} deg, "
+                    f"translation_p95="
+                    f"{1000.0 * stability.translation_p95_m:.4f} mm"
+                )
             self._record_iteration("initial", result)
+            self.iteration_history[-1]["initial_stability"] = (
+                stability.as_dict()
+            )
             self._write_result("INITIALIZED")
+            if not stability.accepted:
+                self._fail(
+                    "seed initialization is not bootstrap-stable: "
+                    f"{stability.reason}; recollect seeds or increase "
+                    "seed.measurement_batch_size"
+                )
+                return
             self._rank_and_plan()
         except Exception as error:
             self._fail(f"initialization failed: {error}")
@@ -547,6 +719,8 @@ class ActiveCalibrationSimNode(Node):
         }
         self.ranked = self.pipeline.rank_candidates(
             maximum_candidates=self.maximum_scored,
+            minimum_valid_probability=self.minimum_valid_probability,
+            virtual_batch_size=self.measurement_batch_size,
             candidate_filter=self._candidate_kinematic_filter,
             candidate_options=self.candidate_options,
         )
@@ -1015,6 +1189,12 @@ class ActiveCalibrationSimNode(Node):
                 "mode": "gazebo_only",
                 "status": status,
                 "seed_count": self.pipeline.seed_count,
+                "seed_observation_count": self.seed_observation_count,
+                "initial_stability": (
+                    None
+                    if self.initial_stability_report is None
+                    else self.initial_stability_report.as_dict()
+                ),
                 "nbv_count": self.pipeline.nbv_count,
                 "rotation_error_deg": rotation_distance_deg(
                     result.estimate.handeye_rotation, HAND_EYE_ROTATION

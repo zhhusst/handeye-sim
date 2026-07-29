@@ -36,6 +36,7 @@ from calibration_pipeline.seed_collection import (
     assess_initial_pose,
     evaluate_bilateral_feature,
     local_preflight_is_acceptable,
+    robust_endpoint_inliers,
     rotation_diversity,
     seed_feature_is_acceptable,
 )
@@ -69,8 +70,20 @@ class SeedCollectionNode(Node):
         self.declare_parameter("seed.minimum_partial_rotation_deg", 2.5)
         self.declare_parameter("seed.probe_step_m", 0.001)
         self.declare_parameter("seed.x_mid_tolerance_m", 0.003)
-        self.declare_parameter("seed.maximum_translation_step_m", 0.005)
+        self.declare_parameter(
+            "seed.rotation_continue_max_abs_x_mid_m", 0.025
+        )
+        self.declare_parameter(
+            "seed.rotation_continue_minimum_domain_margin_m", 0.015
+        )
+        self.declare_parameter("seed.maximum_translation_step_m", 0.008)
         self.declare_parameter("seed.maximum_servo_iterations", 8)
+        self.declare_parameter("seed.measurement_retry_timeout_s", 1.0)
+        self.declare_parameter("seed.measurement_batch_size", 20)
+        self.declare_parameter("seed.minimum_batch_inliers", 15)
+        self.declare_parameter("seed.maximum_batch_frames", 40)
+        self.declare_parameter("seed.measurement_batch_timeout_s", 6.0)
+        self.declare_parameter("seed.endpoint_mad_multiplier", 3.5)
         self.declare_parameter("seed.maximum_target_failures", 3)
         self.declare_parameter("seed.minimum_profile_points", 5)
         self.declare_parameter("seed.minimum_rotation_separation_deg", 2.0)
@@ -92,6 +105,7 @@ class SeedCollectionNode(Node):
         self.declare_parameter("seed.initial.local_ik_test_step_deg", 2.0)
         self.declare_parameter("seed.initial.maximum_local_joint_step_deg", 20.0)
         self.declare_parameter("seed.preflight.rotation_deg", 2.0)
+        self.declare_parameter("seed.preflight.maximum_abs_x_mid_m", 0.030)
         self.declare_parameter("seed.preflight.minimum_domain_margin_m", 0.015)
         self.declare_parameter("seed.preflight.minimum_feasible_directions", 3)
         self.declare_parameter("seed.motion_duration_s", 0.65)
@@ -142,12 +156,57 @@ class SeedCollectionNode(Node):
         self.x_tolerance = float(
             self.get_parameter("seed.x_mid_tolerance_m").value
         )
+        self.rotation_continue_max_abs_x_mid = float(
+            self.get_parameter(
+                "seed.rotation_continue_max_abs_x_mid_m"
+            ).value
+        )
+        self.rotation_continue_minimum_domain_margin = float(
+            self.get_parameter(
+                "seed.rotation_continue_minimum_domain_margin_m"
+            ).value
+        )
         self.maximum_translation_step = float(
             self.get_parameter("seed.maximum_translation_step_m").value
         )
         self.maximum_servo_iterations = int(
             self.get_parameter("seed.maximum_servo_iterations").value
         )
+        self.measurement_retry_timeout_ns = int(
+            float(
+                self.get_parameter(
+                    "seed.measurement_retry_timeout_s"
+                ).value
+            )
+            * 1e9
+        )
+        self.seed_measurement_batch_size = int(
+            self.get_parameter("seed.measurement_batch_size").value
+        )
+        self.minimum_batch_inliers = int(
+            self.get_parameter("seed.minimum_batch_inliers").value
+        )
+        self.maximum_batch_frames = int(
+            self.get_parameter("seed.maximum_batch_frames").value
+        )
+        self.measurement_batch_timeout_ns = int(
+            float(
+                self.get_parameter("seed.measurement_batch_timeout_s").value
+            )
+            * 1e9
+        )
+        self.endpoint_mad_multiplier = float(
+            self.get_parameter("seed.endpoint_mad_multiplier").value
+        )
+        if (
+            self.seed_measurement_batch_size < 1
+            or self.minimum_batch_inliers < 1
+            or self.minimum_batch_inliers > self.seed_measurement_batch_size
+            or self.maximum_batch_frames < self.seed_measurement_batch_size
+            or self.measurement_batch_timeout_ns <= 0
+            or self.endpoint_mad_multiplier <= 0.0
+        ):
+            raise ValueError("invalid stationary seed measurement batch configuration")
         self.maximum_target_failures = int(
             self.get_parameter("seed.maximum_target_failures").value
         )
@@ -227,6 +286,11 @@ class SeedCollectionNode(Node):
         self.preflight_rotation = np.deg2rad(
             float(self.get_parameter("seed.preflight.rotation_deg").value)
         )
+        self.preflight_maximum_abs_x_mid = float(
+            self.get_parameter(
+                "seed.preflight.maximum_abs_x_mid_m"
+            ).value
+        )
         self.preflight_minimum_margin = float(
             self.get_parameter(
                 "seed.preflight.minimum_domain_margin_m"
@@ -287,6 +351,7 @@ class SeedCollectionNode(Node):
         self.latest_profile_wall_ns = 0
         self.latest_endpoints_wall_ns = 0
         self.measurement_not_before_wall_ns = 0
+        self.measurement_retry_deadline_wall_ns = 0
         self.reference_joints: np.ndarray | None = None
         self.reference_transform: np.ndarray | None = None
         self.reference_measurement_transform: np.ndarray | None = None
@@ -298,6 +363,13 @@ class SeedCollectionNode(Node):
         self.last_valid_feature = None
         self.records: list[dict] = []
         self.seed_rotations: list[np.ndarray] = []
+        self.seed_capture_frames: list[dict] = []
+        self.seed_capture_label = ""
+        self.seed_capture_continuation = ""
+        self.seed_capture_started_wall_ns = 0
+        self.seed_capture_deadline_wall_ns = 0
+        self.seed_capture_last_diagnostics = None
+        self.pending_partial_label = ""
         self.plan = adaptive_rotation_plan()
         self.preflight_plan = (
             RotationTarget("preflight_rx_negative", ((0, -1),)),
@@ -416,6 +488,8 @@ class SeedCollectionNode(Node):
         self.latest_endpoints_wall_ns = wall_now
         if stamp is not None:
             self.latest_profile_stamp = stamp
+        if self.state == "CAPTURING_SEED":
+            self._collect_seed_frame(wall_now)
 
     def _trim_pending_frames(self) -> None:
         for pending in (self.pending_profiles, self.pending_endpoint_frames):
@@ -479,20 +553,14 @@ class SeedCollectionNode(Node):
             if not self.records
             else f"manual_{len(self.records) + 1}"
         )
-        if not self._save_seed(label, feature):
+        if not self._begin_seed_capture(label, "MANUAL"):
             response.success = False
-            response.message = (
-                "pose rejected: rotate the flange farther from all previously "
-                f"captured poses (minimum {self.minimum_rotation_separation_deg:.1f} deg)"
-            )
+            response.message = "cannot start synchronized seed frame capture"
             return response
-        if len(self.records) >= self.target_count:
-            self._finish()
         response.success = True
         response.message = (
-            f"accepted {label}; seeds={len(self.records)}/{self.target_count}; "
-            f"x_mid={1000.0 * feature.x_mid:.2f} mm; "
-            f"safe_margin={1000.0 * feature.domain_margin:.2f} mm"
+            f"capturing {self.seed_measurement_batch_size} synchronized frames "
+            f"for {label}"
         )
         return response
 
@@ -545,7 +613,9 @@ class SeedCollectionNode(Node):
             and time.monotonic_ns() - self.latest_joint_wall_ns
             <= self.maximum_measurement_age_ns
         )
-        if (
+        if self.state == "CAPTURING_SEED" and self.seed_capture_label:
+            target_name = self.seed_capture_label
+        elif (
             self.collection_mode == "automatic"
             and not self.records
             and self.state == "WAIT_MANUAL_INIT"
@@ -577,6 +647,8 @@ class SeedCollectionNode(Node):
             f"{len(self.preflight_plan)}; "
             f"target_failures={self.failure_count}/{self.maximum_target_failures}; "
             f"motion_stage={self.after_settle or '-'}; "
+            f"seed_batch={len(self.seed_capture_frames)}/"
+            f"{self.seed_measurement_batch_size}; "
             f"rotation_deg={np.rad2deg(self.accumulated_angle):.2f}/"
             f"{np.rad2deg(displayed_rotation_target):.2f}; "
             f"observation={observation}; stable={str(stable).lower()}; "
@@ -771,6 +843,10 @@ class SeedCollectionNode(Node):
             self.get_clock().now().nanoseconds + int(self.settling_time * 1e9)
         )
         self.measurement_not_before_wall_ns = time.monotonic_ns()
+        self.measurement_retry_deadline_wall_ns = (
+            self.measurement_not_before_wall_ns
+            + self.measurement_retry_timeout_ns
+        )
         self.state = "SETTLING"
 
     def _tick(self) -> None:
@@ -784,8 +860,38 @@ class SeedCollectionNode(Node):
         if self.state == "SETTLING":
             if self.get_clock().now().nanoseconds >= self.settle_until_ns:
                 next_state = self.after_settle
+                measurement_stages = {
+                    "MICRO_ROTATION",
+                    "PROBE_OUT",
+                    "PROBE_BACK",
+                    "SERVO",
+                    "CACHED_SERVO_RECOVERY",
+                    "ROLLBACK",
+                    "RETURN_REFERENCE",
+                    "PARTIAL_CAPTURE_READY",
+                }
+                if (
+                    next_state in measurement_stages
+                    and self._feature() is None
+                    and time.monotonic_ns()
+                    < self.measurement_retry_deadline_wall_ns
+                ):
+                    return
                 self.after_settle = ""
                 getattr(self, f"_after_{next_state.lower()}")()
+            return
+        if self.state == "CAPTURING_SEED":
+            if len(self.seed_capture_frames) >= self.seed_measurement_batch_size:
+                if self._try_finish_seed_capture():
+                    return
+            if time.monotonic_ns() >= self.seed_capture_deadline_wall_ns:
+                if not self._try_finish_seed_capture(force=True):
+                    self._complete_seed_capture(
+                        False,
+                        "stationary seed batch timed out: "
+                        f"raw={len(self.seed_capture_frames)}, "
+                        f"required_inliers={self.minimum_batch_inliers}",
+                    )
             return
         if not self.started or self.state != "WAIT_MANUAL_INIT":
             return
@@ -853,32 +959,14 @@ class SeedCollectionNode(Node):
                         f"spanning X and Y; {details}"
                     )
                     return
-                current_joints = self.latest_joints
-                current_profile = self.latest_profile
-                self.latest_joints = self.reference_joints
-                self.latest_profile = self.reference_profile
-                try:
-                    reference_saved = (
-                        self.reference_feature is not None
-                        and self._save_seed(
-                            "reference",
-                            self.reference_feature,
-                            transform_override=self.reference_measurement_transform,
-                        )
-                    )
-                finally:
-                    self.latest_joints = current_joints
-                    self.latest_profile = current_profile
-                if not reference_saved:
-                    self._fail("reference seed could not be saved after preflight")
+                if not self._begin_seed_capture("reference", "REFERENCE"):
+                    self._fail("reference multi-frame capture could not start")
                     return
-                self.collection_phase = "COLLECT"
                 self.get_logger().info(
                     f"dynamic preflight accepted "
                     f"({len(feasible)}/{len(self.preflight_plan)} directions); "
-                    "starting adaptive star rotation plan"
+                    "collecting the reference stationary frame batch"
                 )
-                self._return_reference()
                 return
             self.last_valid_joints = self.latest_joints.copy()
             feature = self._feature()
@@ -937,7 +1025,21 @@ class SeedCollectionNode(Node):
         self.accumulated_angle += self.pending_rotation
         self.last_valid_joints = self.latest_joints.copy()
         self._remember_last_valid(feature)
-        if abs(feature.x_mid) <= self.x_tolerance:
+        target_angle = (
+            self.preflight_rotation
+            if self.collection_phase == "PREFLIGHT"
+            else self.rotation_target
+        )
+        if (
+            self.accumulated_angle + 1e-10 < target_angle
+            and abs(feature.x_mid)
+            <= self.rotation_continue_max_abs_x_mid
+            and feature.domain_margin
+            >= self.rotation_continue_minimum_domain_margin
+        ):
+            self._issue_micro_rotation()
+            return
+        if abs(feature.x_mid) <= self._centering_tolerance():
             self._continue_after_centered(feature)
             return
         if self.servo.axis is not None and self.servo.sensitivity is not None:
@@ -1021,10 +1123,19 @@ class SeedCollectionNode(Node):
         if feature is None or current is None:
             self._rollback("servo input unavailable")
             return
-        if abs(feature.x_mid) <= self.x_tolerance:
+        if abs(feature.x_mid) <= self._centering_tolerance():
             self._continue_after_centered(feature)
             return
         step = self.servo.correction(feature.x_mid)
+        self.get_logger().info(
+            "translation servo: "
+            f"x_mid={1000.0 * feature.x_mid:.2f} mm, "
+            f"axis={self.servo.axis}, "
+            f"sensitivity={self.servo.sensitivity:.4f}, "
+            f"step={1000.0 * step:.2f} mm, "
+            f"iteration={self.servo_iterations + 1}/"
+            f"{self.maximum_servo_iterations}"
+        )
         local = np.zeros(3)
         local[self.servo.axis] = step
         target = current.copy()
@@ -1063,10 +1174,9 @@ class SeedCollectionNode(Node):
         )
         self.learned_servo_axis = self.servo.axis
         self.learned_servo_sensitivity = self.servo.sensitivity
-        self.servo_from_cache = False
         self.last_valid_joints = self.latest_joints.copy()
         self._remember_last_valid(feature)
-        if abs(feature.x_mid) <= self.x_tolerance:
+        if abs(feature.x_mid) <= self._centering_tolerance():
             self._continue_after_centered(feature)
         else:
             self._issue_servo()
@@ -1077,6 +1187,12 @@ class SeedCollectionNode(Node):
             self._rollback("cached servo recovery lost bilateral observation")
             return
         self._begin_probing(feature)
+
+    def _centering_tolerance(self) -> float:
+        """Preflight verifies the working envelope; seeds require centering."""
+        if self.collection_phase == "PREFLIGHT":
+            return self.preflight_maximum_abs_x_mid
+        return self.x_tolerance
 
     def _continue_after_centered(self, feature) -> None:
         target_angle = (
@@ -1092,7 +1208,7 @@ class SeedCollectionNode(Node):
             axis, sign = target.stages[0]
             accepted = seed_feature_is_acceptable(
                 feature,
-                maximum_abs_x_mid_m=self.x_tolerance,
+                maximum_abs_x_mid_m=self.preflight_maximum_abs_x_mid,
                 minimum_domain_margin_m=self.preflight_minimum_margin,
             )
             self.preflight_results.append(
@@ -1123,12 +1239,12 @@ class SeedCollectionNode(Node):
             self.accumulated_angle = 0.0
             self._issue_micro_rotation()
             return
-        if not self._save_seed(target.name, feature):
+        if not self._begin_seed_capture(target.name, "TARGET"):
             self.get_logger().warning(
-                f"{target.name} reached but was rejected by rotation diversity"
+                f"{target.name} stationary frame capture could not start"
             )
-        self.target_index += 1
-        self._return_reference()
+            self.target_index += 1
+            self._return_reference()
 
     def _rollback(self, reason: str) -> None:
         if self.collection_phase == "PREFLIGHT":
@@ -1158,18 +1274,24 @@ class SeedCollectionNode(Node):
         if self.failure_count >= self.maximum_target_failures:
             partial_angle = self._last_valid_relative_rotation()
             if partial_angle >= self.minimum_partial_rotation:
-                label = f"{self.plan[self.target_index].name}_partial"
-                if self._save_last_valid_seed(label):
+                self.pending_partial_label = (
+                    f"{self.plan[self.target_index].name}_partial"
+                )
+                if (
+                    self.last_valid_joints is not None
+                    and self._command_joints(
+                        self.last_valid_joints, "PARTIAL_CAPTURE_READY"
+                    )
+                ):
                     self.get_logger().warning(
-                        "target limit not reached; retained centered, safe "
-                        "partial orientation "
+                        "target limit not reached; returning to the last "
+                        "centered safe partial orientation for multi-frame capture "
                         f"at {np.rad2deg(partial_angle):.2f} deg"
                     )
-                else:
-                    self.get_logger().warning(
-                        "partial orientation rejected by centering, safety or "
-                        "rotation-diversity acceptance"
-                    )
+                    return
+                self.get_logger().warning(
+                    "partial orientation could not be restored for capture"
+                )
             else:
                 self.get_logger().warning("target abandoned after repeated failures")
             self.failure_count = 0
@@ -1192,21 +1314,142 @@ class SeedCollectionNode(Node):
             return
         self._issue_micro_rotation()
 
-    def _save_seed(
-        self,
-        label: str,
-        feature,
-        *,
-        transform_override: np.ndarray | None = None,
-    ) -> bool:
-        transform = (
-            transform_override
-            if transform_override is not None
-            else self._measurement_transform()
-        )
-        if transform is None or self.latest_profile is None:
+    def _after_partial_capture_ready(self) -> None:
+        feature = self._feature()
+        if (
+            feature is None
+            or not seed_feature_is_acceptable(
+                feature,
+                maximum_abs_x_mid_m=self.x_tolerance,
+                minimum_domain_margin_m=self.minimum_seed_domain_margin,
+            )
+        ):
+            self.get_logger().warning(
+                "restored partial orientation is not acceptable for seed capture"
+            )
+            self.target_index += 1
+            self._return_reference()
+            return
+        label = self.pending_partial_label
+        self.pending_partial_label = ""
+        if not self._begin_seed_capture(label, "PARTIAL"):
+            self.get_logger().warning(
+                "partial stationary frame capture could not start"
+            )
+            self.target_index += 1
+            self._return_reference()
+
+    def _begin_seed_capture(self, label: str, continuation: str) -> bool:
+        if (
+            not label
+            or self.latest_joints is None
+            or self._measurement_transform() is None
+        ):
             return False
-        candidate_rotations = self.seed_rotations + [transform[:3, :3]]
+        self.seed_capture_frames = []
+        self.seed_capture_label = label
+        self.seed_capture_continuation = continuation
+        now = time.monotonic_ns()
+        self.seed_capture_started_wall_ns = now
+        self.seed_capture_deadline_wall_ns = (
+            now + self.measurement_batch_timeout_ns
+        )
+        self.seed_capture_last_diagnostics = None
+        self.state = "CAPTURING_SEED"
+        self.get_logger().info(
+            f"stationary seed capture started: {label}, "
+            f"frames={self.seed_measurement_batch_size}, "
+            f"minimum_inliers={self.minimum_batch_inliers}"
+        )
+        return True
+
+    def _collect_seed_frame(self, wall_now: int) -> None:
+        if (
+            wall_now <= self.seed_capture_started_wall_ns
+            or len(self.seed_capture_frames) >= self.maximum_batch_frames
+            or self.latest_profile is None
+            or self.latest_endpoints is None
+            or self.latest_measurement_transform is None
+            or self.latest_joints is None
+            or self.latest_joint_speed > self.manual_max_joint_speed
+            or len(self.latest_profile) < self.minimum_profile_points
+        ):
+            return
+        endpoint_u, endpoint_v = self.latest_endpoints
+        try:
+            feature = evaluate_bilateral_feature(
+                endpoint_u, endpoint_v, self.roi
+            )
+        except ValueError:
+            return
+        if not feature.safe:
+            return
+        self.seed_capture_frames.append(
+            {
+                "R_BF": self.latest_measurement_transform[:3, :3].copy(),
+                "t_BF": self.latest_measurement_transform[:3, 3].copy(),
+                "joints": self.latest_joints.copy(),
+                "profile_points_S": self.latest_profile.copy(),
+                "endpoint_u_S": endpoint_u.copy(),
+                "endpoint_v_S": endpoint_v.copy(),
+            }
+        )
+
+    def _try_finish_seed_capture(self, *, force: bool = False) -> bool:
+        if len(self.seed_capture_frames) < self.minimum_batch_inliers:
+            return False
+        endpoints_u = np.asarray(
+            [frame["endpoint_u_S"] for frame in self.seed_capture_frames]
+        )
+        endpoints_v = np.asarray(
+            [frame["endpoint_v_S"] for frame in self.seed_capture_frames]
+        )
+        inliers, diagnostics = robust_endpoint_inliers(
+            endpoints_u,
+            endpoints_v,
+            mad_multiplier=self.endpoint_mad_multiplier,
+        )
+        self.seed_capture_last_diagnostics = diagnostics
+        inlier_frames = [
+            frame
+            for frame, accepted in zip(self.seed_capture_frames, inliers)
+            if accepted
+        ]
+        if len(inlier_frames) < self.minimum_batch_inliers:
+            if (
+                not force
+                and len(self.seed_capture_frames) < self.maximum_batch_frames
+            ):
+                return False
+            return False
+        if self._save_seed_batch(
+            self.seed_capture_label, inlier_frames, diagnostics
+        ):
+            self._complete_seed_capture(True, "")
+        else:
+            self._complete_seed_capture(
+                False,
+                "pose rejected by rotation diversity after stationary capture",
+            )
+        return True
+
+    @staticmethod
+    def _frame_payload(frame: dict) -> dict:
+        return {
+            "R_BF": frame["R_BF"].tolist(),
+            "t_BF": frame["t_BF"].tolist(),
+            "joints": frame["joints"].tolist(),
+            "profile_points_S": frame["profile_points_S"].tolist(),
+            "endpoint_u_S": frame["endpoint_u_S"].tolist(),
+            "endpoint_v_S": frame["endpoint_v_S"].tolist(),
+        }
+
+    def _save_seed_batch(
+        self, label: str, frames: list[dict], diagnostics
+    ) -> bool:
+        representative = frames[len(frames) // 2]
+        transform_rotation = representative["R_BF"]
+        candidate_rotations = self.seed_rotations + [transform_rotation]
         diversity = rotation_diversity(candidate_rotations)
         if (
             self.seed_rotations
@@ -1215,22 +1458,63 @@ class SeedCollectionNode(Node):
         ):
             self.get_logger().warning(f"{label} rejected: insufficient rotation diversity")
             return False
-        self.seed_rotations.append(transform[:3, :3].copy())
+        aggregate_feature = evaluate_bilateral_feature(
+            diagnostics.median_u, diagnostics.median_v, self.roi
+        )
+        self.seed_rotations.append(transform_rotation.copy())
         self.records.append(
             {
                 "label": label,
-                "R_BF": transform[:3, :3].tolist(),
-                "t_BF": transform[:3, 3].tolist(),
-                "joints": self.latest_joints.tolist(),
-                "profile_points_S": self.latest_profile.tolist(),
-                "endpoint_u_S": feature.endpoint_u.tolist(),
-                "endpoint_v_S": feature.endpoint_v.tolist(),
-                "x_mid": feature.x_mid,
-                "domain_margin": feature.domain_margin,
+                # A representative observation keeps the file inspectable by
+                # older tools; schema-v3 consumers use every frame below.
+                **self._frame_payload(representative),
+                "endpoint_u_S": diagnostics.median_u.tolist(),
+                "endpoint_v_S": diagnostics.median_v.tolist(),
+                "x_mid": float(aggregate_feature.x_mid),
+                "domain_margin": float(aggregate_feature.domain_margin),
+                "batch_diagnostics": diagnostics.as_dict(),
+                "frames": [
+                    self._frame_payload(frame) for frame in frames
+                ],
             }
         )
-        self.get_logger().info(f"accepted seed {len(self.records)}: {label}")
+        self.get_logger().info(
+            f"accepted physical seed {len(self.records)}: {label}; "
+            f"endpoint inliers={len(frames)}/{diagnostics.raw_count}"
+        )
         return True
+
+    def _complete_seed_capture(self, success: bool, reason: str) -> None:
+        continuation = self.seed_capture_continuation
+        label = self.seed_capture_label
+        self.seed_capture_frames = []
+        self.seed_capture_label = ""
+        self.seed_capture_continuation = ""
+        if not success:
+            self.get_logger().warning(f"{label} capture rejected: {reason}")
+        if continuation == "REFERENCE":
+            if not success:
+                self._fail(f"reference seed capture failed: {reason}")
+                return
+            self.collection_phase = "COLLECT"
+            self.get_logger().info(
+                "reference multi-frame seed accepted; starting adaptive "
+                "star rotation plan"
+            )
+            self._return_reference()
+            return
+        if continuation in {"TARGET", "PARTIAL"}:
+            self.failure_count = 0
+            self.target_index += 1
+            self._return_reference()
+            return
+        if continuation == "MANUAL":
+            if success and len(self.records) >= self.target_count:
+                self._finish()
+            else:
+                self.state = "WAIT_MANUAL_INIT"
+            return
+        self._fail(f"unknown seed capture continuation {continuation}")
 
     def _remember_last_valid(self, feature) -> None:
         transform = self._measurement_transform()
@@ -1250,34 +1534,6 @@ class SeedCollectionNode(Node):
         cosine = float(np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0))
         return float(np.arccos(cosine))
 
-    def _save_last_valid_seed(self, label: str) -> bool:
-        if (
-            self.last_valid_transform is None
-            or self.last_valid_joints is None
-            or self.last_valid_profile is None
-            or self.last_valid_feature is None
-        ):
-            return False
-        if not seed_feature_is_acceptable(
-            self.last_valid_feature,
-            maximum_abs_x_mid_m=self.x_tolerance,
-            minimum_domain_margin_m=self.minimum_seed_domain_margin,
-        ):
-            return False
-        current_joints = self.latest_joints
-        current_profile = self.latest_profile
-        self.latest_joints = self.last_valid_joints
-        self.latest_profile = self.last_valid_profile
-        try:
-            return self._save_seed(
-                label,
-                self.last_valid_feature,
-                transform_override=self.last_valid_transform,
-            )
-        finally:
-            self.latest_joints = current_joints
-            self.latest_profile = current_profile
-
     def _finish(self) -> None:
         raw_diversity = rotation_diversity(self.seed_rotations)
         diversity = {
@@ -1288,8 +1544,14 @@ class SeedCollectionNode(Node):
         self.output_file.write_text(
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "collection_mode": self.collection_mode,
+                    "physical_seed_count": len(self.records),
+                    "observation_count": sum(
+                        len(record.get("frames", []))
+                        for record in self.records
+                    ),
+                    "measurement_batch_size": self.seed_measurement_batch_size,
                     "rotation_diversity": diversity,
                     "seeds": self.records,
                 },
@@ -1323,6 +1585,12 @@ def main(args=None) -> None:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except RuntimeError:
+        # Some rmw/rclpy combinations can race a subscription take with the
+        # console's SIGINT after DONE. Do not turn a completed collection into
+        # a misleading process failure, but preserve real runtime failures.
+        if node.state != "DONE" and rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():

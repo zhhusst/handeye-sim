@@ -118,18 +118,57 @@ def test_information_scoring_recomputes_augmented_varproj_model():
     assert np.isfinite(scored[0].information_gain)
 
 
-def test_stop_policy_requires_physical_covariance_target():
+def test_virtual_information_matches_configured_measurement_batch():
+    scene, poses, measurements, result = _calibrated_fixture()
+    candidates = generate_candidates(
+        result.estimate,
+        edge_samples=2,
+        alphas_deg=(35.0,),
+        psis_deg=(0.0,),
+        working_distances=(0.55,),
+    )
+    estimate = CalibrationEstimate(
+        result.estimate.handeye_rotation,
+        result.estimate.handeye_translation,
+        result.estimate.board,
+        result.estimate.x9,
+        np.eye(9) * 1e-10,
+    )
+    synthetic_result = type("Result", (), {"estimate": estimate})()
+    one = score_candidates(
+        candidates[:1],
+        synthetic_result,
+        poses,
+        measurements,
+        scene.roi,
+        minimum_valid_probability=0.5,
+        virtual_batch_size=1,
+    )
+    five = score_candidates(
+        candidates[:1],
+        synthetic_result,
+        poses,
+        measurements,
+        scene.roi,
+        minimum_valid_probability=0.5,
+        virtual_batch_size=5,
+    )
+    assert one and five
+    assert five[0].information_gain > one[0].information_gain
+
+
+def test_stop_policy_accepts_physical_covariance_target_without_low_gain():
     policy = StopPolicy(
         minimum_nbv_poses=1,
-        consecutive_low_gain_limit=1,
-        information_gain_threshold=1.0,
+        consecutive_low_gain_limit=3,
+        information_gain_threshold=1e-6,
         minimum_effective_eigenvalue=1e-8,
     )
     stop, _ = policy.evaluate(
         total_poses=7,
         nbv_poses=1,
         effective_rank=6,
-        best_information_gain=0.0,
+        best_information_gain=10.0,
         minimum_effective_eigenvalue=1.0,
         handeye_covariance=None,
     )
@@ -138,11 +177,31 @@ def test_stop_policy_requires_physical_covariance_target():
         total_poses=7,
         nbv_poses=1,
         effective_rank=6,
-        best_information_gain=0.0,
+        best_information_gain=10.0,
         minimum_effective_eigenvalue=1.0,
         handeye_covariance=np.diag(
             [np.deg2rad(0.01) ** 2] * 3 + [1e-4**2] * 3
         ),
     )
+    assert stop
+    assert reason == "hand-eye uncertainty target reached"
+
+
+def test_stop_policy_accepts_saturated_gain_without_covariance_target():
+    policy = StopPolicy(
+        minimum_nbv_poses=1,
+        consecutive_low_gain_limit=2,
+        information_gain_threshold=1.0,
+        minimum_effective_eigenvalue=1e-8,
+    )
+    for _ in range(2):
+        stop, reason = policy.evaluate(
+            total_poses=7,
+            nbv_poses=1,
+            effective_rank=6,
+            best_information_gain=0.0,
+            minimum_effective_eigenvalue=1.0,
+            handeye_covariance=None,
+        )
     assert stop
     assert reason == "information gain saturated"

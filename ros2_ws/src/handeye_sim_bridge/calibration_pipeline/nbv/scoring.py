@@ -22,7 +22,10 @@ def score_candidates(
     projection_weights: dict | None = None,
     maximum_candidates: int | None = None,
     state_scale: np.ndarray | None = None,
+    virtual_batch_size: int = 1,
 ) -> list[CandidateScore]:
+    if virtual_batch_size < 1:
+        raise ValueError("virtual_batch_size must be positive")
     projection_weights = projection_weights or {}
     x9 = result.estimate.x9
     residual = lambda state: variable_projection_residual(
@@ -49,9 +52,12 @@ def score_candidates(
         if probability < minimum_valid_probability:
             continue
         flange = candidate.flange_transform_command
-        augmented_poses = poses + [FlangePose(flange[:3, :3], flange[:3, 3])]
+        virtual_pose = FlangePose(flange[:3, :3], flange[:3, 3])
+        augmented_poses = poses + [virtual_pose] * virtual_batch_size
         fixed_virtual_measurement = candidate.virtual_measurement or prediction.measurement
-        augmented_measurements = measurements + [fixed_virtual_measurement]
+        augmented_measurements = measurements + [
+            fixed_virtual_measurement
+        ] * virtual_batch_size
         augmented_residual = lambda state: variable_projection_residual(
             state, augmented_poses, augmented_measurements, **projection_weights
         )

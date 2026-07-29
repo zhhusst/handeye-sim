@@ -1,6 +1,9 @@
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
+from calibration_pipeline.geometry import so3_exp
 from calibration_pipeline.models import (
     FlangePose,
     Measurement,
@@ -10,6 +13,9 @@ from calibration_pipeline.models import (
 from calibration_pipeline.nbv import generate_candidates, predict_candidate
 from calibration_pipeline.pipeline import ActiveCalibrationPipeline, PipelineStage
 from calibration_pipeline.simulation.synthetic import default_scene, generate_seed_dataset
+from handeye_sim_bridge.active_calibration_sim_node import (
+    effective_measurement_timeout_s,
+)
 
 
 def test_candidate_budget_covers_the_full_grid_instead_of_prefix_only():
@@ -19,6 +25,11 @@ def test_candidate_budget_covers_the_full_grid_instead_of_prefix_only():
     assert subset[0] == 0
     assert subset[-1] == 100
     assert len({value // 25 for value in subset}) >= 4
+
+
+def test_measurement_timeout_scales_with_large_batches():
+    assert effective_measurement_timeout_s(5.0, 5, 2.0) == 5.0
+    assert effective_measurement_timeout_s(5.0, 20, 2.0) == 11.0
 
 
 def test_pipeline_reaches_active_nbv_after_required_seeds():
@@ -37,6 +48,26 @@ def test_pipeline_reaches_active_nbv_after_required_seeds():
     result = pipeline.initialize()
     assert result.converged
     assert pipeline.stage is PipelineStage.ACTIVE_NBV
+
+
+def test_seed_batch_adds_many_observations_but_one_physical_seed():
+    scene = default_scene()
+    poses, measurements = generate_seed_dataset(scene, count=8)
+    pipeline = ActiveCalibrationPipeline(
+        scene.handeye_rotation,
+        scene.handeye_translation,
+        (scene.board.length_u, scene.board.length_v),
+        roi=scene.roi,
+        minimum_seed_poses=2,
+    )
+    pipeline.append_seed_batch(poses[:4], measurements[:4])
+    assert pipeline.seed_count == 1
+    assert len(pipeline.poses) == 4
+    assert pipeline.stage is PipelineStage.COLLECT_SEEDS
+    pipeline.append_seed_batch(poses[4:], measurements[4:])
+    assert pipeline.seed_count == 2
+    assert len(pipeline.poses) == 8
+    assert pipeline.stage is PipelineStage.INITIALIZE_12DOF_V2
 
 
 def test_failed_nbv_trial_does_not_mutate_dataset():
@@ -79,6 +110,54 @@ def test_failed_nbv_trial_does_not_mutate_dataset():
             perturbed,
         )
     assert (len(pipeline.poses), len(pipeline.measurements), pipeline.nbv_count) == before
+
+
+def test_first_nbv_may_use_a_wider_correction_bound_only_once():
+    scene = default_scene()
+    poses, measurements = generate_seed_dataset(scene, count=6)
+    pipeline = ActiveCalibrationPipeline(
+        scene.handeye_rotation,
+        scene.handeye_translation,
+        (scene.board.length_u, scene.board.length_v),
+        roi=scene.roi,
+        minimum_seed_poses=6,
+        maximum_update_rotation_deg=5.0,
+        initial_maximum_update_rotation_deg=10.0,
+    )
+    for pose, measurement in zip(poses, measurements):
+        pipeline.append_seed(pose, measurement)
+    initialized = pipeline.initialize()
+
+    class FixedSolver:
+        def __init__(self, result):
+            self.result = result
+
+        def solve(self, *_args, **_kwargs):
+            return self.result
+
+    first_estimate = replace(
+        initialized.estimate,
+        handeye_rotation=(
+            initialized.estimate.handeye_rotation
+            @ so3_exp(np.deg2rad(np.array([8.0, 0.0, 0.0])))
+        ),
+    )
+    fixed_solver = FixedSolver(replace(initialized, estimate=first_estimate))
+    pipeline.solver = fixed_solver
+    pipeline.append_nbv(poses[0], measurements[0])
+    assert pipeline.nbv_count == 1
+
+    second_estimate = replace(
+        first_estimate,
+        handeye_rotation=(
+            first_estimate.handeye_rotation
+            @ so3_exp(np.deg2rad(np.array([8.0, 0.0, 0.0])))
+        ),
+    )
+    fixed_solver.result = replace(initialized, estimate=second_estimate)
+    with pytest.raises(RuntimeError, match="rolling update"):
+        pipeline.append_nbv(poses[0], measurements[0])
+    assert pipeline.nbv_count == 1
 
 
 def test_real_nbv_may_cross_safe_boundary_but_must_remain_in_hard_domain():

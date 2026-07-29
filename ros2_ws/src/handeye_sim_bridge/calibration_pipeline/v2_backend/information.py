@@ -59,10 +59,21 @@ def covariance_from_jacobian(
     damping: float = 1e-9,
     variance_floor: float = 1e-12,
     state_scale: np.ndarray | None = None,
+    fitted_nuisance_parameters: int = 0,
 ) -> tuple[np.ndarray, float]:
+    if fitted_nuisance_parameters < 0:
+        raise ValueError("fitted_nuisance_parameters must be non-negative")
     scale = validate_state_scale(state_scale, jacobian.shape[1])
     jacobian_scaled = scaled_jacobian(jacobian, scale)
-    dof = max(len(residual) - jacobian.shape[1], 1)
+    # Variable projection removes linear parameters from the nonlinear state,
+    # but they were still fitted from the same residuals and must therefore
+    # be included in the residual-variance degrees of freedom.
+    dof = max(
+        len(residual)
+        - jacobian.shape[1]
+        - int(fitted_nuisance_parameters),
+        1,
+    )
     variance = max(float(residual @ residual / dof), variance_floor)
     covariance_scaled = variance * np.linalg.pinv(
         jacobian_scaled.T @ jacobian_scaled + damping * np.eye(jacobian.shape[1])

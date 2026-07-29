@@ -26,11 +26,18 @@ RUNS_DIR = WORKSPACE / "data/calibration_runs"
 LEGACY_SEED_FILE = WORKSPACE / "data/seed_measurements_v5.json"
 SIM_ROTATION_ERROR_TARGET_DEG = 0.05
 SIM_TRANSLATION_ERROR_TARGET_MM = 0.1
+VALIDATED_NOISE_BASELINE = {
+    "endpoint_gaussian_std_m": 0.000080,
+    "robot_translation_std_m": 0.000030,
+    "robot_rotation_std_deg": 0.003,
+    "board_flatness_rms_m": 0.000030,
+}
 
 STATE_NAMES = {
     "WAIT_MANUAL_INIT": "等待人工设置初始位姿",
     "MOVING": "机器人运动中",
     "SETTLING": "等待机器人稳定",
+    "CAPTURING_SEED": "定点采集同步帧",
     "WAIT_SEEDS": "等待种子数据",
     "WAIT_JOINTS": "等待关节状态",
     "RANKING": "生成候选并计算信息增益",
@@ -93,6 +100,25 @@ def parse_key_values(message: str) -> dict[str, str]:
         key, value = item.strip().split("=", 1)
         fields[key.strip()] = value.strip()
     return fields
+
+
+def noise_regime_exceedances(noise: dict) -> list[tuple[str, float]]:
+    """Return factors outside the end-to-end validated noise regime."""
+    labels = {
+        "endpoint_gaussian_std_m": "断点提取",
+        "robot_translation_std_m": "机器人平移",
+        "robot_rotation_std_deg": "机器人旋转",
+        "board_flatness_rms_m": "平板平面度",
+    }
+    exceedances: list[tuple[str, float]] = []
+    for name, baseline in VALIDATED_NOISE_BASELINE.items():
+        try:
+            ratio = float(noise[name]) / baseline
+        except (KeyError, TypeError, ValueError):
+            continue
+        if ratio > 1.5:
+            exceedances.append((labels[name], ratio))
+    return exceedances
 
 
 def extract_trigger_response(output: str) -> tuple[bool, str]:
@@ -264,7 +290,10 @@ class CalibrationConsole:
             "/profile_viz_node",
         }
         required_topics = {"/joint_states", "/gocator/profile", "/gocator/endpoints"}
-        required_services = {"/controller_manager/list_controllers"}
+        required_services = {
+            "/controller_manager/list_controllers",
+            "/scene_publisher/noise_status",
+        }
         missing_nodes = sorted(required_nodes - nodes)
         missing_topics = sorted(required_topics - topics)
         missing_services = sorted(required_services - services)
@@ -295,6 +324,44 @@ class CalibrationConsole:
             print("请先在之前的标定终端按 Ctrl+C，再重新运行本控制台。")
             return False
         print("环境正常：MoveIt、关节状态和双边轮廓话题均已发现。")
+        success, message = call_trigger("/scene_publisher/noise_status")
+        if success:
+            try:
+                noise = json.loads(message)
+                print(
+                    "仿真噪声："
+                    f"轮廓 {1e3 * noise['profile_gaussian_std_m']:.3f} mm；"
+                    f"断点 {1e3 * noise['endpoint_gaussian_std_m']:.3f} mm；"
+                    f"机器人 {1e3 * noise['robot_translation_std_m']:.3f} mm/"
+                    f"{noise['robot_rotation_std_deg']:.4f}°；"
+                    f"平面度 {1e3 * noise['board_flatness_rms_m']:.3f} mm RMS；"
+                    f"同步抖动 {1e3 * noise['sync_jitter_std_s']:.3f} ms"
+                )
+                print(
+                    "           "
+                    f"点离群 {100 * noise['point_outlier_probability']:.2f}%；"
+                    f"断点离群 {100 * noise['endpoint_outlier_probability']:.2f}%；"
+                    f"点漏检 {100 * noise['point_dropout_probability']:.2f}%；"
+                    f"帧漏检 {100 * noise['frame_dropout_probability']:.2f}%；"
+                    f"断点漏检 {100 * noise['endpoint_dropout_probability']:.2f}%"
+                )
+                exceedances = noise_regime_exceedances(noise)
+                if exceedances:
+                    details = "；".join(
+                        f"{label}为已验证基线的{ratio:.1f}倍"
+                        for label, ratio in exceedances
+                    )
+                    print(
+                        "精度适用性警告：" + details + "。"
+                    )
+                    print(
+                        "  当前属于压力测试区；流程可以继续，但不能预期单次运行"
+                        "必然达到0.05°/0.1 mm。建议逐项消融后再组合。"
+                    )
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                print("仿真噪声状态：" + message)
+        else:
+            print("警告：无法读取仿真噪声状态：" + message)
         return True
 
     @staticmethod
@@ -358,7 +425,10 @@ class CalibrationConsole:
             print(f"已保留种子文件：{seed_file}")
             return
         maximum_nbv = ask_integer(
-            "最多执行多少个主动 NBV 位姿", default=5, minimum=1, maximum=20
+            "最多执行多少个主动 NBV 位姿（3分钟目标建议5，上限6）",
+            default=5,
+            minimum=1,
+            maximum=6,
         )
         self._run_active(seed_file, result_file, run_directory, maximum_nbv)
 
@@ -508,10 +578,12 @@ class CalibrationConsole:
             rotation = fields.get("rotation_deg", "?")
             target_failures = fields.get("target_failures", "0/3")
             preflight = fields.get("preflight", "0/4")
+            seed_batch = fields.get("seed_batch", "0/?")
             elapsed = time.monotonic() - started_at
             line = (
                 f"[自动种子] {progress_bar(count, 6)} {count_text} | "
                 f"{target_cn} | {state_cn} | 旋转 {rotation}° | "
+                f"定点帧 {seed_batch} | "
                 f"预检 {preflight} | 本目标失败 {target_failures} | "
                 f"已用 {elapsed:.0f}s"
             )
@@ -537,10 +609,39 @@ class CalibrationConsole:
 
     def _capture_manual_seed(self, index: int) -> bool:
         success, message = call_trigger("/bilateral_seed_collection/capture")
-        if success:
-            print(f"  ✓ 第 {index}/6 个种子保存成功：{message}")
-            return True
-        print(f"  ✗ 当前位姿未保存：{message}")
+        if not success:
+            print(f"  ✗ 当前位姿未开始采集：{message}")
+            return False
+        print(f"  正在定点采集同步帧：{message}")
+        deadline = time.monotonic() + 12.0
+        while time.monotonic() < deadline:
+            status_success, fields, raw = self._status(
+                "/bilateral_seed_collection/status"
+            )
+            count_text = fields.get("seeds", "0/6")
+            try:
+                count = int(count_text.split("/", 1)[0])
+            except ValueError:
+                count = 0
+            batch = fields.get("seed_batch", "?")
+            print(
+                f"\r  定点多帧进度：{batch}；鲁棒筛选后保存",
+                end="",
+                flush=True,
+            )
+            if count >= index:
+                print(f"\n  ✓ 第 {index}/6 个物理种子多帧保存成功")
+                return True
+            if fields.get("state") == "FAILED" or (
+                not status_success and not fields
+            ):
+                print(f"\n  ✗ 多帧采集失败：{raw}")
+                return False
+            if fields.get("state") == "WAIT_MANUAL_INIT":
+                print("\n  ✗ 本批次有效内点不足，请保持位姿稳定后重试。")
+                return False
+            time.sleep(0.25)
+        print("\n  ✗ 多帧采集等待超时。")
         return False
 
     def _collect_manual_seeds(
@@ -589,7 +690,22 @@ class CalibrationConsole:
             diversity = payload.get("rotation_diversity", {})
             print("\n种子数据摘要")
             print(f"  文件：{seed_file}")
-            print(f"  数量：{len(records)}")
+            observation_count = int(
+                payload.get(
+                    "observation_count",
+                    sum(
+                        len(record.get("frames", [record]))
+                        for record in records
+                    ),
+                )
+            )
+            print(f"  物理位姿数量：{len(records)}")
+            print(f"  同步观测总数：{observation_count}")
+            if payload.get("measurement_batch_size"):
+                print(
+                    "  每物理位姿目标帧数："
+                    f"{int(payload['measurement_batch_size'])}"
+                )
             print(
                 "  标签："
                 + ", ".join(str(record.get("label", "?")) for record in records)
@@ -626,7 +742,10 @@ class CalibrationConsole:
             return
         self._print_seed_summary(seed_file)
         maximum_nbv = ask_integer(
-            "最多执行多少个主动 NBV 位姿", default=5, minimum=1, maximum=20
+            "最多执行多少个主动 NBV 位姿（3分钟目标建议5，上限6）",
+            default=5,
+            minimum=1,
+            maximum=6,
         )
         run_directory = self.make_run_directory()
         result_file = run_directory / "calibration_result.json"
@@ -794,6 +913,20 @@ class CalibrationConsole:
                     f"旋转≤{record.get('maximum_rotation_std_deg', 0.0):.4f}°；"
                     f"平移≤{record.get('maximum_translation_std_mm', 0.0):.4f} mm"
                 )
+            stability = record.get("initial_stability")
+            if phase == "initial" and isinstance(stability, dict):
+                if stability.get("available"):
+                    print(
+                        "  │ 重采样稳定性（不使用真值）："
+                        f"{stability.get('trials_converged', 0)}/"
+                        f"{stability.get('trials_requested', 0)} 收敛；"
+                        f"旋转P95 {stability.get('rotation_p95_deg', 0.0):.4f}°；"
+                        f"平移P95 "
+                        f"{stability.get('translation_p95_mm', 0.0):.4f} mm；"
+                        f"{'通过' if stability.get('accepted') else '不通过'}"
+                    )
+                else:
+                    print("  │ 重采样稳定性：旧版单帧种子，不可评估")
             print(
                 "  └─ 仿真真值误差："
                 f"旋转 {record.get('rotation_error_deg', 0.0):.4f}°，"

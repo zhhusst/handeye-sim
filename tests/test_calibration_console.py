@@ -28,3 +28,18 @@ def test_progress_bar_is_bounded():
     assert CONSOLE.progress_bar(0, 6) == "[------------------]"
     assert CONSOLE.progress_bar(3, 6) == "[#########---------]"
     assert CONSOLE.progress_bar(9, 6) == "[##################]"
+
+
+def test_noise_regime_exceedances_identify_the_modified_dominant_terms():
+    noise = {
+        "endpoint_gaussian_std_m": 0.0008,
+        "robot_translation_std_m": 0.0005,
+        "robot_rotation_std_deg": 0.03,
+        "board_flatness_rms_m": 0.0005,
+    }
+    assert CONSOLE.noise_regime_exceedances(noise) == [
+        ("断点提取", 10.0),
+        ("机器人平移", 0.0005 / 0.000030),
+        ("机器人旋转", 10.0),
+        ("平板平面度", 0.0005 / 0.000030),
+    ]

@@ -49,11 +49,16 @@ class StopPolicy:
                     standard_deviations[3:6] <= self.maximum_translation_std_m
                 )
             )
-        ready = (
+        observable = (
             nbv_poses >= self.minimum_nbv_poses
             and effective_rank == 6
             and minimum_effective_eigenvalue >= self.minimum_effective_eigenvalue
-            and self._low_gain_count >= self.consecutive_low_gain_limit
-            and covariance_ready
         )
-        return (True, "information gain saturated") if ready else (False, "continue")
+        if observable and covariance_ready:
+            return True, "hand-eye uncertainty target reached"
+        if (
+            observable
+            and self._low_gain_count >= self.consecutive_low_gain_limit
+        ):
+            return True, "information gain saturated"
+        return False, "continue"

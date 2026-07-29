@@ -156,7 +156,10 @@ class TwelveDofV2Solver:
         residual = residual_function(state)
         jacobian = numerical_jacobian(residual_function, state)
         covariance, residual_variance = covariance_from_jacobian(
-            jacobian, residual, state_scale=self.state_scale
+            jacobian,
+            residual,
+            state_scale=self.state_scale,
+            fitted_nuisance_parameters=3,
         )
         singular_values, rank, condition = observability(
             jacobian, state_scale=self.state_scale

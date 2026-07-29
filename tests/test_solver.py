@@ -3,7 +3,10 @@ import numpy as np
 from calibration_pipeline.geometry import rotation_distance_deg, so3_exp
 from calibration_pipeline.simulation.synthetic import default_scene, generate_seed_dataset
 from calibration_pipeline.solvers import TwelveDofV2Solver
-from calibration_pipeline.v2_backend.information import scaled_jacobian
+from calibration_pipeline.v2_backend.information import (
+    covariance_from_jacobian,
+    scaled_jacobian,
+)
 
 
 def test_twelve_dof_v2_recovers_noise_free_scene():
@@ -79,3 +82,16 @@ def test_dimensionless_jacobian_is_invariant_to_metre_or_millimetre_units():
         scaled_jacobian(jacobian_m, scale_m),
         scaled_jacobian(jacobian_mm, scale_mm),
     )
+
+
+def test_projected_corner_is_counted_in_residual_variance_dof():
+    jacobian = np.eye(9)
+    jacobian = np.vstack((jacobian, np.ones((6, 9))))
+    residual = np.ones(15) * 0.1
+    _, variance = covariance_from_jacobian(
+        jacobian,
+        residual,
+        fitted_nuisance_parameters=3,
+    )
+    # 15 residuals - 9 nonlinear states - 3 projected corner coordinates.
+    assert np.isclose(variance, float(residual @ residual) / 3.0)

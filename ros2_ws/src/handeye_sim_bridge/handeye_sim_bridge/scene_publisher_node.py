@@ -6,6 +6,7 @@
 
 import json
 import os
+import time
 
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Point, Pose, Quaternion
@@ -28,7 +29,11 @@ from visualization_msgs.msg import InteractiveMarker, InteractiveMarkerControl, 
 from calibration_pipeline.simulation.scanline import (
     compute_fov_plate_scanline,
     make_transform,
-    so3_exp,
+)
+from calibration_pipeline.simulation.noise import (
+    JointSnapshotBuffer,
+    SimulationNoiseConfig,
+    SimulationNoiseModel,
 )
 from calibration_pipeline.simulation.scene_truth import (
     HAND_EYE_ROTATION,
@@ -113,19 +118,22 @@ class ScenePublisher(Node):
         self.collision_pub = self.create_publisher(
             CollisionObject, '/collision_object', 10
         )
-        # ── 噪声模型（可配置） ──
-        # 激光测量噪声 σ (m)
-        self.declare_parameter('laser_noise_std', 0.000055)
-        # Optional frame-wise plane-normal disturbance for stress tests.
-        # The nominal precision benchmark must use a fixed rigid plane,
-        # matching the 12-DOF-V2 measurement model.
-        self.declare_parameter('plate_warp_mm', 0.0)
-        # Optional unobserved flange-repeatability disturbance for stress
-        # tests.  The nominal algorithm benchmark uses the Gazebo/encoder pose
-        # exactly; otherwise a 0.1 mm hidden pose error is incompatible with a
-        # guaranteed sub-0.1 mm hand-eye target.
-        self.declare_parameter('robot_repeat_std', 0.0)
-        self._noise_rng = np.random.default_rng()
+        # All simulation disturbances are injected before publishing the
+        # profile/endpoints.  The calibration nodes receive no truth flag and
+        # therefore exercise the same rejection and estimation path as a real
+        # sensor.
+        noise_defaults = SimulationNoiseConfig()
+        noise_values = {}
+        for name, default in noise_defaults.as_dict().items():
+            parameter = f'simulation_noise.{name}'
+            self.declare_parameter(parameter, default)
+            noise_values[name] = self.get_parameter(parameter).value
+        self.noise_config = SimulationNoiseConfig(**noise_values)
+        self.noise_model = SimulationNoiseModel(self.noise_config)
+        self.joint_history = JointSnapshotBuffer()
+        self._noise_status_srv = self.create_service(
+            Trigger, '~/noise_status', self._noise_status_cb
+        )
 
         # 调试日志节流
         self._debug_frame = 0
@@ -211,6 +219,15 @@ class ScenePublisher(Node):
         self.get_logger().info("场景发布器已启动 — 等待 joint_states...")
         self.get_logger().info(f"平板中心: {C}")
         self.get_logger().info(f"手眼 GT: t_he={t_he}")
+        self.get_logger().info(
+            "仿真噪声已启用: "
+            f"profile={1e3 * self.noise_config.profile_gaussian_std_m:.3f} mm, "
+            f"endpoint={1e3 * self.noise_config.endpoint_gaussian_std_m:.3f} mm, "
+            f"robot_t={1e3 * self.noise_config.robot_translation_std_m:.3f} mm, "
+            f"robot_R={self.noise_config.robot_rotation_std_deg:.4f} deg, "
+            f"flatness={1e3 * self.noise_config.board_flatness_rms_m:.3f} mm, "
+            f"sync_jitter={1e3 * self.noise_config.sync_jitter_std_s:.3f} ms"
+        )
 
         # 先发一次场景 (无 joint 信息时只发平板)
         stamp = self.get_clock().now().to_msg()
@@ -221,12 +238,22 @@ class ScenePublisher(Node):
         try:
             q = [msg.position[msg.name.index(j)] for j in JOINT_NAMES]
             self.latest_joints = np.array(q)
+            self.joint_history.append(time.monotonic_ns(), self.latest_joints)
             # 首次收到 joint_states → 此时 TF 树应有 gocator_sensor，创建 FOV 角点 IM
             if not self._fov_im_setup:
                 if self._setup_fov_corner_markers():
                     self._fov_im_setup = True
         except Exception as e:
             self.get_logger().warn(f"joint_states 回调异常: {e}")
+
+    def _noise_status_cb(self, request, response):
+        """Return the immutable noise settings loaded at process startup."""
+        del request
+        response.success = True
+        response.message = json.dumps(
+            self.noise_config.as_dict(), ensure_ascii=False, sort_keys=True
+        )
+        return response
 
     def _setup_plate_interactive_marker(self):
         """创建 FOV 角点的 IM server（仅初始化 server，供 FOV 角点使用）"""
@@ -396,57 +423,88 @@ class ScenePublisher(Node):
         corners_S = self.scene['fov_corners_S']
         if self.latest_joints is not None:
             try:
-                # Use one encoder snapshot for the simulated measurement and
-                # publish that same flange pose with the endpoints.  This
-                # models trigger-synchronized joint/Gocator acquisition.
-                flange_transform = forward_kinematics_urdf(self.latest_joints)
-                sensor_transform = flange_transform @ make_transform(
+                # The current encoder drives Gazebo.  A hidden perturbation
+                # creates the physical flange used to render the profile,
+                # while a delayed history sample becomes the pose reported to
+                # the calibration algorithm.
+                current_flange = forward_kinematics_urdf(self.latest_joints)
+                physical_flange = self.noise_model.perturb_flange(
+                    current_flange
+                )
+                delay_s = self.noise_model.sample_sync_delay_s()
+                delayed_joints = self.joint_history.delayed(
+                    time.monotonic_ns(), delay_s
+                )
+                if delayed_joints is None:
+                    delayed_joints = self.latest_joints
+                reported_flange = forward_kinematics_urdf(delayed_joints)
+
+                sensor_transform = physical_flange @ make_transform(
                     self.scene['R_he'], self.scene['t_he']
                 )
                 R = sensor_transform[:3, :3]
                 t_vec = sensor_transform[:3, 3]
                 corners_world = [t_vec + R @ c for c in corners_S]
 
-                # 计算 FOV 与平板交线 → 扫描点
-                # ── 注入噪声模型 ──
-                laser_std = self.get_parameter('laser_noise_std').value
-                warp_mm = self.get_parameter('plate_warp_mm').value / 1000.0
-                robot_std = self.get_parameter('robot_repeat_std').value
-                rng = self._noise_rng
-
-                # 机器人重复性：扰动末端位姿
-                if robot_std > 0:
-                    t_noisy = t_vec + rng.normal(0, robot_std, 3)
-                    axis = rng.normal(0, robot_std, 3)
-                    R_noisy = R @ so3_exp(axis * 0.001)  # ~0.06° per 0.1mm
-                else:
-                    R_noisy, t_noisy = R, t_vec
-
-                # Stress mode only: frame-wise board-normal disturbance.  This
-                # is intentionally disabled for the nominal precision test
-                # because it violates the fixed rigid-plane model.
-                if warp_mm > 0:
-                    warp_angle = warp_mm / max(w, h)  # 弧度
-                    w_axis = rng.normal(0, 1, 3)
-                    w_axis -= np.dot(w_axis, n_B) * n_B  # 投影到板面内
-                    w_axis /= np.linalg.norm(w_axis) + 1e-12
-                    n_warped = so3_exp(w_axis * warp_angle) @ n_B
-                else:
-                    n_warped = n_B
-
                 res = compute_fov_plate_scanline(
-                    rotation_sensor_base=R_noisy,
-                    translation_sensor_base=t_noisy,
+                    rotation_sensor_base=R,
+                    translation_sensor_base=t_vec,
                     corner=C,
-                    normal=n_warped,
+                    normal=n_B,
                     u=u_B,
                     v=v_B,
                     width=w,
                     height=h,
                     fov_corners_S=self.scene['fov_corners_S'])
 
-                # 世界系角点（用户校准的真实激光窗口）
-                corners_world = [t_vec + R @ c for c in self.scene['fov_corners_S']]
+                # A fixed spatial height field approximates plate flatness.
+                # Move each ideal intersection point along the board-normal
+                # component that remains inside the physical laser plane.
+                if res['has_intersection']:
+                    laser_normal = R[:, 1]
+                    res['scan_pts_B'] = (
+                        self.noise_model.deform_points_in_laser_plane(
+                            res['scan_pts_B'],
+                            laser_normal=laser_normal,
+                            board_normal=n_B,
+                            corner=C,
+                            board_u=u_B,
+                            board_v=v_B,
+                            width=w,
+                            height=h,
+                        )
+                    )
+                    res['scan_pts_S'] = (
+                        R.T @ (res['scan_pts_B'] - t_vec).T
+                    ).T
+                    endpoint_labels = [
+                        label for label, _ in res['endpoints_B']
+                    ]
+                    if endpoint_labels:
+                        endpoint_points = np.asarray(
+                            [point for _, point in res['endpoints_B']]
+                        )
+                        endpoint_points = (
+                            self.noise_model.deform_points_in_laser_plane(
+                                endpoint_points,
+                                laser_normal=laser_normal,
+                                board_normal=n_B,
+                                corner=C,
+                                board_u=u_B,
+                                board_v=v_B,
+                                width=w,
+                                height=h,
+                            )
+                        )
+                        res['endpoints_B'] = list(
+                            zip(endpoint_labels, endpoint_points)
+                        )
+                        endpoint_points_sensor = (
+                            R.T @ (endpoint_points - t_vec).T
+                        ).T
+                        res['endpoints_S'] = list(
+                            zip(endpoint_labels, endpoint_points_sensor)
+                        )
 
                 # 发布场景 markers（平板 + FOV平面 + 扫描线 + 断点）
                 if res['has_intersection']:
@@ -471,15 +529,10 @@ class ScenePublisher(Node):
                 ]
                 if res['has_intersection'] and len(res['scan_pts_S']) >= 3:
                     pts_S = res['scan_pts_S']
-                    # 加激光噪声 (可配置，默认 0.055mm)
-                    laser_std = self.get_parameter('laser_noise_std').value
-                    noise = np.random.normal(0, laser_std, pts_S.shape)
-                    pts_noisy = pts_S + noise
-                    # 只保留 X, Z (Y 在传感器系中恒为 0)
-                    pts_2d = np.zeros((len(pts_noisy), 3), dtype=np.float32)
-                    pts_2d[:, 0] = pts_noisy[:, 0]  # X
-                    pts_2d[:, 1] = 0.0               # Y = 0 (激光平面)
-                    pts_2d[:, 2] = pts_noisy[:, 2]   # Z
+                    frame_dropped = self.noise_model.sample_frame_dropout()
+                    pts_2d = self.noise_model.corrupt_profile(
+                        pts_S, frame_dropped=frame_dropped
+                    ).astype(np.float32)
                     # 只保留扫描线范围调试（每秒1次，方便确认有无断点）
                     self._debug_frame += 1
                     if len(pts_S) >= 3 and self._debug_frame % 30 == 0:
@@ -491,6 +544,7 @@ class ScenePublisher(Node):
                                 f"scan: pts={len(pts_S)} x=[{x_min:.3f},{x_max:.3f}] z=[{z_min:.3f},{z_max:.3f}] no ep")
                 else:
                     # 无交线 → 发布空点云，让 RViz 清掉旧帧
+                    frame_dropped = False
                     pts_2d = np.zeros((0, 3), dtype=np.float32)
                 cloud = pc2.create_cloud(
                     Header(stamp=stamp, frame_id='gocator_sensor'),
@@ -508,21 +562,26 @@ class ScenePublisher(Node):
                 ]
                 ep.layout.data_offset = 0
                 # First 9 values retain the legacy endpoint layout.  The
-                # remaining values are R_BF row-major and t_BF from the exact
-                # encoder snapshot used to render this profile.
+                # remaining values are R_BF row-major and t_BF from the
+                # delayed encoder snapshot associated with this profile.
                 ep_data = [0.0] * 23
                 eps_S = res.get('endpoints_S', [])
-                ep_data[0] = float(len(eps_S))
                 e1_valid, e2_valid = 0.0, 0.0
                 for et, pt in eps_S:
+                    noisy_point, valid = self.noise_model.corrupt_endpoint(
+                        pt, frame_dropped=frame_dropped
+                    )
+                    if not valid:
+                        continue
                     if et == 'e1':
-                        ep_data[1:4] = pt; e1_valid = 1.0
+                        ep_data[1:4] = noisy_point; e1_valid = 1.0
                     elif et == 'e2':
-                        ep_data[5:8] = pt; e2_valid = 1.0
+                        ep_data[5:8] = noisy_point; e2_valid = 1.0
+                ep_data[0] = e1_valid + e2_valid
                 ep_data[4] = e1_valid
                 ep_data[8] = e2_valid
-                ep_data[9:18] = flange_transform[:3, :3].reshape(-1).tolist()
-                ep_data[18:21] = flange_transform[:3, 3].tolist()
+                ep_data[9:18] = reported_flange[:3, :3].reshape(-1).tolist()
+                ep_data[18:21] = reported_flange[:3, 3].tolist()
                 # Match this endpoint/encoder snapshot to the PointCloud2
                 # frame without relying on DDS callback arrival order.
                 ep_data[21] = float(stamp.sec)

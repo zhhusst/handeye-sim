@@ -2,42 +2,153 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 from pathlib import Path
 
 import numpy as np
 
+from .geometry import so3_exp, so3_log
 from .models import FlangePose, Measurement
 
 
-def load_seed_dataset(path: str | Path) -> tuple[list[FlangePose], list[Measurement]]:
+@dataclass(frozen=True)
+class SeedObservationGroup:
+    label: str
+    poses: tuple[FlangePose, ...]
+    measurements: tuple[Measurement, ...]
+
+    def __post_init__(self) -> None:
+        if not self.poses or len(self.poses) != len(self.measurements):
+            raise ValueError("a physical seed needs equal non-empty frame lists")
+
+
+@dataclass(frozen=True)
+class LoadedSeedDataset:
+    groups: tuple[SeedObservationGroup, ...]
+    schema_version: int
+
+    @property
+    def physical_seed_count(self) -> int:
+        return len(self.groups)
+
+    @property
+    def observation_count(self) -> int:
+        return sum(len(group.poses) for group in self.groups)
+
+    @property
+    def poses(self) -> list[FlangePose]:
+        return [pose for group in self.groups for pose in group.poses]
+
+    @property
+    def measurements(self) -> list[Measurement]:
+        return [
+            measurement
+            for group in self.groups
+            for measurement in group.measurements
+        ]
+
+
+def aggregate_seed_group(
+    group: SeedObservationGroup,
+    *,
+    maximum_profile_points: int = 200,
+) -> tuple[FlangePose, Measurement]:
+    """Form one robust stationary observation from a physical seed batch."""
+    if maximum_profile_points < 2:
+        raise ValueError("maximum_profile_points must be at least two")
+    reference_rotation = group.poses[0].rotation
+    rotation_offsets = np.asarray(
+        [
+            so3_log(reference_rotation.T @ pose.rotation)
+            for pose in group.poses
+        ]
+    )
+    mean_rotation = reference_rotation @ so3_exp(
+        np.mean(rotation_offsets, axis=0)
+    )
+    mean_translation = np.mean(
+        [pose.translation for pose in group.poses], axis=0
+    )
+    profiles = np.vstack(
+        [measurement.profile_points for measurement in group.measurements]
+    )
+    if len(profiles) > maximum_profile_points:
+        indices = np.linspace(
+            0, len(profiles) - 1, maximum_profile_points, dtype=int
+        )
+        profiles = profiles[indices]
+    endpoint_u = np.mean(
+        [measurement.endpoint_u for measurement in group.measurements], axis=0
+    )
+    endpoint_v = np.mean(
+        [measurement.endpoint_v for measurement in group.measurements], axis=0
+    )
+    endpoint_u[1] = 0.0
+    endpoint_v[1] = 0.0
+    return (
+        FlangePose(mean_rotation, mean_translation),
+        Measurement(profiles, endpoint_u, endpoint_v),
+    )
+
+
+def _parse_observation(record: dict, description: str) -> tuple[FlangePose, Measurement]:
+    try:
+        return (
+            FlangePose(
+                np.asarray(record["R_BF"], dtype=float),
+                np.asarray(record["t_BF"], dtype=float),
+            ),
+            Measurement(
+                np.asarray(record["profile_points_S"], dtype=float),
+                np.asarray(record["endpoint_u_S"], dtype=float),
+                np.asarray(record["endpoint_v_S"], dtype=float),
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError(f"invalid {description}: {error}") from error
+
+
+def load_seed_dataset_grouped(path: str | Path) -> LoadedSeedDataset:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     version = int(payload.get("schema_version", 1))
-    if version not in {1, 2}:
+    if version not in {1, 2, 3}:
         raise ValueError(f"unsupported seed schema version {version}")
     records = payload.get("seeds")
     if not isinstance(records, list):
         raise ValueError("seed file must contain a seeds list")
-    poses: list[FlangePose] = []
-    measurements: list[Measurement] = []
+    groups: list[SeedObservationGroup] = []
     for index, record in enumerate(records):
-        try:
-            poses.append(
-                FlangePose(
-                    np.asarray(record["R_BF"], dtype=float),
-                    np.asarray(record["t_BF"], dtype=float),
+        if not isinstance(record, dict):
+            raise ValueError(f"invalid seed record {index}: expected an object")
+        label = str(record.get("label", f"seed_{index + 1}"))
+        frame_records = record.get("frames") if version >= 3 else None
+        if frame_records is None:
+            frame_records = [record]
+        if not isinstance(frame_records, list) or not frame_records:
+            raise ValueError(f"invalid seed record {index}: frames must be non-empty")
+        poses: list[FlangePose] = []
+        measurements: list[Measurement] = []
+        for frame_index, frame in enumerate(frame_records):
+            if not isinstance(frame, dict):
+                raise ValueError(
+                    f"invalid seed record {index} frame {frame_index}: "
+                    "expected an object"
                 )
+            pose, measurement = _parse_observation(
+                frame, f"seed record {index} frame {frame_index}"
             )
-            measurements.append(
-                Measurement(
-                    np.asarray(record["profile_points_S"], dtype=float),
-                    np.asarray(record["endpoint_u_S"], dtype=float),
-                    np.asarray(record["endpoint_v_S"], dtype=float),
-                )
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"invalid seed record {index}: {error}") from error
-    return poses, measurements
+            poses.append(pose)
+            measurements.append(measurement)
+        groups.append(
+            SeedObservationGroup(label, tuple(poses), tuple(measurements))
+        )
+    return LoadedSeedDataset(tuple(groups), version)
+
+
+def load_seed_dataset(path: str | Path) -> tuple[list[FlangePose], list[Measurement]]:
+    dataset = load_seed_dataset_grouped(path)
+    return dataset.poses, dataset.measurements
 
 
 def result_payload(result, *, extra: dict | None = None) -> dict:

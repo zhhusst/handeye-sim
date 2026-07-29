@@ -10,6 +10,7 @@ from .initial_pose import (
     normalized_joint_limit_margin,
     seed_feature_is_acceptable,
 )
+from .multiframe import EndpointBatchDiagnostics, robust_endpoint_inliers
 from .rotation_scheduler import (
     RotationTarget,
     adaptive_rotation_plan,
@@ -23,6 +24,7 @@ __all__ = [
     "EndpointTracker",
     "InitialPoseAssessment",
     "InitialPoseCriteria",
+    "EndpointBatchDiagnostics",
     "RotationTarget",
     "TranslationServo",
     "adaptive_rotation_plan",
@@ -31,6 +33,7 @@ __all__ = [
     "local_preflight_is_acceptable",
     "normalized_joint_limit_margin",
     "rotation_diversity",
+    "robust_endpoint_inliers",
     "seed_feature_is_acceptable",
     "star_rotation_plan",
 ]
