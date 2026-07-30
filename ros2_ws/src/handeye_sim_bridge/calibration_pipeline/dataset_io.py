@@ -92,6 +92,53 @@ def aggregate_seed_group(
     )
 
 
+def split_stationary_group(
+    group: SeedObservationGroup,
+    *,
+    validation_frame_count: int,
+) -> tuple[SeedObservationGroup, SeedObservationGroup | None]:
+    """Split one synchronized stationary batch into fit and held-out frames.
+
+    Validation frames are distributed through the acquisition instead of
+    taking one contiguous tail.  A legacy one-frame observation remains a fit
+    observation and has no held-out part.
+    """
+    frame_count = len(group.poses)
+    if validation_frame_count < 0:
+        raise ValueError("validation_frame_count must be non-negative")
+    validation_count = min(int(validation_frame_count), max(frame_count - 1, 0))
+    if validation_count == 0:
+        return group, None
+    validation_indices = set(
+        int(index)
+        for index in np.linspace(
+            0, frame_count - 1, validation_count + 2, dtype=int
+        )[1:-1]
+    )
+    # Integer rounding can duplicate indices for very small batches.
+    if len(validation_indices) < validation_count:
+        for index in range(frame_count - 1, -1, -1):
+            if index not in validation_indices:
+                validation_indices.add(index)
+            if len(validation_indices) >= validation_count:
+                break
+    fit_indices = [
+        index for index in range(frame_count) if index not in validation_indices
+    ]
+    held_out_indices = sorted(validation_indices)
+    fit = SeedObservationGroup(
+        group.label,
+        tuple(group.poses[index] for index in fit_indices),
+        tuple(group.measurements[index] for index in fit_indices),
+    )
+    held_out = SeedObservationGroup(
+        f"{group.label}_validation",
+        tuple(group.poses[index] for index in held_out_indices),
+        tuple(group.measurements[index] for index in held_out_indices),
+    )
+    return fit, held_out
+
+
 def _parse_observation(record: dict, description: str) -> tuple[FlangePose, Measurement]:
     try:
         return (

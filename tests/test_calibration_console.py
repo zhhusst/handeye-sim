@@ -43,3 +43,15 @@ def test_noise_regime_exceedances_identify_the_modified_dominant_terms():
         ("机器人旋转", 10.0),
         ("平板平面度", 0.0005 / 0.000030),
     ]
+
+
+def test_disabled_direct_endpoint_noise_is_not_reported_as_active_stress():
+    noise = {
+        "direct_endpoint_injection_active": False,
+        "endpoint_gaussian_std_m": 0.0008,
+        "robot_translation_std_m": 0.000030,
+        "robot_rotation_std_deg": 0.003,
+        "board_flatness_rms_m": 0.000030,
+    }
+
+    assert CONSOLE.noise_regime_exceedances(noise) == []

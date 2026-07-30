@@ -29,6 +29,7 @@ setup(
     entry_points={
         'console_scripts': [
             'scene_publisher_node = handeye_sim_bridge.scene_publisher_node:main',
+            'profile_endpoint_detector = handeye_sim_bridge.profile_endpoint_detector_node:main',
             'srdf_publisher_node = handeye_sim_bridge.srdf_publisher_node:main',
             'profile_viz = handeye_sim_bridge.profile_viz_node:main',
             'seed_collection = handeye_sim_bridge.seed_collection_node:main',

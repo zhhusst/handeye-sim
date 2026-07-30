@@ -12,6 +12,7 @@ from .nbv.candidate_generator import generate_candidates
 from .nbv.scoring import score_candidates
 from .nbv.stopping import StopPolicy
 from .solvers import TwelveDofV2Solver
+from .validation import ValidationMetrics, held_out_geometric_metrics
 
 
 class PipelineStage(Enum):
@@ -47,6 +48,9 @@ class ActiveCalibrationPipeline:
         initial_maximum_update_rotation_deg: float | None = None,
         initial_maximum_update_translation_m: float | None = None,
         initial_maximum_board_rotation_deg: float | None = None,
+        validation_minimum_relative_improvement: float = 0.01,
+        validation_patience: int = 3,
+        validation_best_relative_tolerance: float = 0.10,
     ) -> None:
         self.coarse_handeye_rotation_init = np.asarray(
             nominal_handeye_rotation, dtype=float
@@ -112,6 +116,32 @@ class ActiveCalibrationPipeline:
         self.result: CalibrationResult | None = None
         self.failed_candidates: set[str] = set()
         self.gain_history: list[float] = []
+        self.validation_poses: list[FlangePose] = []
+        self.validation_measurements: list[Measurement] = []
+        self.result_history: list[tuple[int, CalibrationResult]] = []
+        self.validation_metrics_history: list[ValidationMetrics | None] = []
+        self.best_result: CalibrationResult | None = None
+        self.best_result_nbv_index = 0
+        self.current_validation_metrics: ValidationMetrics | None = None
+        self.best_validation_metrics: ValidationMetrics | None = None
+        self.validation_minimum_relative_improvement = float(
+            validation_minimum_relative_improvement
+        )
+        self.validation_patience = int(validation_patience)
+        self.validation_best_relative_tolerance = float(
+            validation_best_relative_tolerance
+        )
+        self.validation_no_improvement_count = 0
+        if not 0.0 <= self.validation_minimum_relative_improvement < 1.0:
+            raise ValueError(
+                "validation_minimum_relative_improvement must be in [0, 1)"
+            )
+        if self.validation_patience < 1:
+            raise ValueError("validation_patience must be positive")
+        if not 0.0 <= self.validation_best_relative_tolerance < 1.0:
+            raise ValueError(
+                "validation_best_relative_tolerance must be in [0, 1)"
+            )
 
     def append_seed(self, pose: FlangePose, measurement: Measurement) -> None:
         self.append_seed_batch([pose], [measurement])
@@ -153,6 +183,97 @@ class ActiveCalibrationPipeline:
             self.stage = PipelineStage.COLLECT_SEEDS
             return self.result
         self.stage = PipelineStage.ACTIVE_NBV
+        self._register_result(self.result)
+        return self.result
+
+    def append_validation_observation(
+        self, pose: FlangePose, measurement: Measurement
+    ) -> None:
+        """Add one held-out physical-pose representative.
+
+        Validation observations never enter the solve or the information
+        matrix.  Seed validation can therefore be populated before
+        :meth:`initialize`.
+        """
+        self.validation_poses.append(pose)
+        self.validation_measurements.append(measurement)
+
+    def _register_result(self, result: CalibrationResult) -> None:
+        self.result_history.append((self.nbv_count, result))
+        metrics = [
+            held_out_geometric_metrics(
+                item,
+                self.validation_poses,
+                self.validation_measurements,
+                weights=getattr(self.solver, "weights", None),
+            )
+            for _index, item in self.result_history
+        ]
+        self.validation_metrics_history = metrics
+        current = metrics[-1]
+        self.current_validation_metrics = current
+        finite = [
+            (index, metric)
+            for index, metric in enumerate(metrics)
+            if metric is not None and np.isfinite(metric.score_m)
+        ]
+        if not finite:
+            self.best_result = result
+            self.best_result_nbv_index = self.nbv_count
+            self.best_validation_metrics = None
+            return
+        minimum_score = min(metric.score_m for _index, metric in finite)
+        statistically_equivalent = [
+            (index, metric)
+            for index, metric in finite
+            if metric.score_m
+            <= minimum_score * (1.0 + self.validation_best_relative_tolerance)
+        ]
+        # Held-out scores based on only a few noisy physical poses fluctuate.
+        # Prefer the most informed/newest snapshot inside a configurable
+        # equivalence band; roll back only for a material regression.
+        best_history_index, best_metric = max(
+            statistically_equivalent, key=lambda item: item[0]
+        )
+        self.best_result_nbv_index, self.best_result = self.result_history[
+            best_history_index
+        ]
+        self.best_validation_metrics = best_metric
+        if len(metrics) <= 1 or current is None:
+            self.validation_no_improvement_count = 0
+            return
+        previous_scores = [
+            metric.score_m
+            for metric in metrics[:-1]
+            if metric is not None and np.isfinite(metric.score_m)
+        ]
+        if not previous_scores:
+            self.validation_no_improvement_count = 0
+            return
+        previous_best = min(previous_scores)
+        required = previous_best * (
+            1.0 - self.validation_minimum_relative_improvement
+        )
+        if current.score_m < required:
+            self.validation_no_improvement_count = 0
+        else:
+            self.validation_no_improvement_count += 1
+
+    @property
+    def validation_plateaued(self) -> bool:
+        return (
+            self.current_validation_metrics is not None
+            and self.validation_no_improvement_count >= self.validation_patience
+        )
+
+    def restore_historical_best(self) -> CalibrationResult:
+        """Select the newest snapshot statistically tied for held-out best."""
+        if self.best_result is None:
+            if self.result is None:
+                raise RuntimeError("no calibration result is available")
+            self.best_result = self.result
+            self.best_result_nbv_index = self.nbv_count
+        self.result = self.best_result
         return self.result
 
     @staticmethod
@@ -231,6 +352,8 @@ class ActiveCalibrationPipeline:
         measurements: list[Measurement],
         *,
         candidate_id: str | None = None,
+        validation_pose: FlangePose | None = None,
+        validation_measurement: Measurement | None = None,
     ) -> CalibrationResult:
         """Commit one physical NBV containing trigger-synchronized frames.
 
@@ -243,6 +366,10 @@ class ActiveCalibrationPipeline:
             raise RuntimeError(f"cannot append an NBV observation during {self.stage.name}")
         if not poses or len(poses) != len(measurements):
             raise ValueError("NBV batch must contain equal non-empty pose/measurement lists")
+        if (validation_pose is None) != (validation_measurement is None):
+            raise ValueError(
+                "validation_pose and validation_measurement must be provided together"
+            )
         for measurement in measurements:
             if not self.roi.contains(
                 measurement.endpoint_u, safe=False
@@ -310,6 +437,11 @@ class ActiveCalibrationPipeline:
         self.measurements = trial_measurements
         self.nbv_count += 1
         self.result = trial
+        if validation_pose is not None and validation_measurement is not None:
+            self.append_validation_observation(
+                validation_pose, validation_measurement
+            )
+        self._register_result(trial)
         if candidate_id is not None:
             self.exclude_candidate(candidate_id)
         return trial
@@ -338,6 +470,7 @@ class ActiveCalibrationPipeline:
                 if self.result.estimate.covariance_x9 is None
                 else self.result.estimate.covariance_x9[:6, :6]
             ),
+            validation_plateaued=self.validation_plateaued,
         )
         if stop:
             self.stage = PipelineStage.COMPLETE

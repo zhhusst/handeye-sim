@@ -141,6 +141,7 @@ CALIBRATION_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/calibration.
 SCENE_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/scene_publisher_node
 SRDF_PUB_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/srdf_publisher_node
 PROFILE_VIZ_BIN=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/profile_viz
+ENDPOINT_DETECTOR_BIN=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/profile_endpoint_detector
 
 /workspace/scripts/stop_simulation.sh 2>/dev/null || true
 sleep 1
@@ -316,6 +317,8 @@ tmux send-keys -t handeye_sim:0.1 "'$SRDF_PUB_EXE' --ros-args -p use_sim_time:=t
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "'$SCENE_EXE' --ros-args --params-file '$CALIBRATION_CONFIG' -p use_sim_time:=true" Enter
 sleep 1
+tmux send-keys -t handeye_sim:0.1 "'$ENDPOINT_DETECTOR_BIN' --ros-args --params-file '$CALIBRATION_CONFIG' -p use_sim_time:=true &" Enter
+sleep 1
 tmux send-keys -t handeye_sim:0.1 "'$PROFILE_VIZ_BIN' --ros-args -p use_sim_time:=true &" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "echo 'Components started. MoveGroup starting in other pane.'" Enter
@@ -392,10 +395,12 @@ echo "[5/7] MoveIt2 move_group..."
 ros2 run moveit_ros_move_group move_group --ros-args --params-file /tmp/ros_params/mg_params.yaml &
 sleep 5
 
-echo "[6/7] SRDF + Scene + Profile Viz..."
+echo "[6/7] SRDF + Scene + Endpoint Detector + Profile Viz..."
 "$SRDF_PUB_EXE" --ros-args -p use_sim_time:=true &
 sleep 1
 "$SCENE_EXE" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
+sleep 1
+"$ENDPOINT_DETECTOR_BIN" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
 sleep 1
 "$PROFILE_VIZ_BIN" --ros-args -p use_sim_time:=true &
 sleep 1

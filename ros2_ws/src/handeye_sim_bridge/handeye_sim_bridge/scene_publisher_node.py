@@ -9,7 +9,7 @@ import os
 import time
 
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Point, Pose, Quaternion
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
 from interactive_markers.interactive_marker_server import InteractiveMarkerServer
 from moveit_msgs.msg import CollisionObject
 import numpy as np
@@ -19,7 +19,6 @@ from sensor_msgs.msg import JointState
 from sensor_msgs.msg import PointCloud2, PointField
 import sensor_msgs_py.point_cloud2 as pc2
 from shape_msgs.msg import SolidPrimitive
-from std_msgs.msg import Float64MultiArray, MultiArrayDimension
 from std_msgs.msg import Header
 from std_srvs.srv import Trigger
 from tf2_ros.buffer import Buffer
@@ -112,16 +111,24 @@ class ScenePublisher(Node):
         # 模拟 GoCator 数据发布器（点云，传感器系 XZ 坐标）
         self.gocator_pub = self.create_publisher(
             PointCloud2, '/gocator/profile', 10)
-        # 断点信息发布器（传感器系，正确标记 e1/e2）
-        self.endpoint_pub = self.create_publisher(
-            Float64MultiArray, '/gocator/endpoints', 10)
+        # Ground truth is isolated under /simulation and is never consumed by
+        # the calibration pipeline.  The independent detector sees only the
+        # raw metric profile above.
+        self.truth_endpoint_pub = self.create_publisher(
+            PointCloud2, '/simulation/ground_truth/endpoints', 10
+        )
+        # The encoder pose synchronized to this profile is a separate source.
+        # A real robot adapter can publish the same PoseStamped topic without
+        # coupling endpoint extraction to robot kinematics.
+        self.flange_pose_pub = self.create_publisher(
+            PoseStamped, '/calibration/flange_pose', 10
+        )
         self.collision_pub = self.create_publisher(
             CollisionObject, '/collision_object', 10
         )
-        # All simulation disturbances are injected before publishing the
-        # profile/endpoints.  The calibration nodes receive no truth flag and
-        # therefore exercise the same rejection and estimation path as a real
-        # sensor.
+        # All physical/profile disturbances are injected before publishing the
+        # raw profile. Direct truth-endpoint noise is retained only as a legacy
+        # configuration field and is deliberately not applied.
         noise_defaults = SimulationNoiseConfig()
         noise_values = {}
         for name, default in noise_defaults.as_dict().items():
@@ -222,11 +229,13 @@ class ScenePublisher(Node):
         self.get_logger().info(
             "仿真噪声已启用: "
             f"profile={1e3 * self.noise_config.profile_gaussian_std_m:.3f} mm, "
-            f"endpoint={1e3 * self.noise_config.endpoint_gaussian_std_m:.3f} mm, "
             f"robot_t={1e3 * self.noise_config.robot_translation_std_m:.3f} mm, "
             f"robot_R={self.noise_config.robot_rotation_std_deg:.4f} deg, "
             f"flatness={1e3 * self.noise_config.board_flatness_rms_m:.3f} mm, "
             f"sync_jitter={1e3 * self.noise_config.sync_jitter_std_s:.3f} ms"
+        )
+        self.get_logger().info(
+            "直接断点发布/注噪已禁用；/calibration/endpoints 必须由原始轮廓检测器生成"
         )
 
         # 先发一次场景 (无 joint 信息时只发平板)
@@ -250,8 +259,10 @@ class ScenePublisher(Node):
         """Return the immutable noise settings loaded at process startup."""
         del request
         response.success = True
+        status = self.noise_config.as_dict()
+        status["direct_endpoint_injection_active"] = False
         response.message = json.dumps(
-            self.noise_config.as_dict(), ensure_ascii=False, sort_keys=True
+            status, ensure_ascii=False, sort_keys=True
         )
         return response
 
@@ -439,6 +450,30 @@ class ScenePublisher(Node):
                     delayed_joints = self.latest_joints
                 reported_flange = forward_kinematics_urdf(delayed_joints)
 
+                flange_pose = PoseStamped()
+                flange_pose.header = Header(
+                    stamp=stamp, frame_id='base_link'
+                )
+                flange_pose.pose.position.x = float(
+                    reported_flange[0, 3]
+                )
+                flange_pose.pose.position.y = float(
+                    reported_flange[1, 3]
+                )
+                flange_pose.pose.position.z = float(
+                    reported_flange[2, 3]
+                )
+                flange_quaternion = matrix_to_quat(
+                    reported_flange[:3, :3]
+                )
+                flange_pose.pose.orientation.x = float(flange_quaternion[0])
+                flange_pose.pose.orientation.y = float(flange_quaternion[1])
+                flange_pose.pose.orientation.z = float(flange_quaternion[2])
+                flange_pose.pose.orientation.w = float(flange_quaternion[3])
+                # Publish first so exact-stamp consumers normally have the
+                # synchronized encoder pose before the detected endpoints.
+                self.flange_pose_pub.publish(flange_pose)
+
                 sensor_transform = physical_flange @ make_transform(
                     self.scene['R_he'], self.scene['t_he']
                 )
@@ -510,7 +545,7 @@ class ScenePublisher(Node):
                 if res['has_intersection']:
                     self.publisher.publish_frame_markers(
                         stamp, R, t_vec,
-                        res['scan_pts_B'], res['endpoints_B'],
+                        res['scan_pts_B'], [],
                         P0=res['line_origin_B'], line_dir=res['line_dir'],
                         frame_id='world',
                         corners_B=corners_world)  # 用校准过的角点
@@ -551,43 +586,26 @@ class ScenePublisher(Node):
                     fields, pts_2d)
                 self.gocator_pub.publish(cloud)
 
-                # 发布断点信息（传感器系，正确标记 e1/e2）
-                ep = Float64MultiArray()
-                ep.layout.dim = [
-                    MultiArrayDimension(
-                        label='endpoints_flange_pose_and_stamp',
-                        size=23,
-                        stride=23,
+                # Publish exact endpoints only on the simulation truth topic.
+                # The point order is e1 then e2 and is never visible to the
+                # endpoint detector or calibration nodes.
+                truth_by_label = {
+                    label: np.asarray(point, dtype=float)
+                    for label, point in res.get('endpoints_S', [])
+                }
+                truth_rows = []
+                if "e1" in truth_by_label and "e2" in truth_by_label:
+                    truth_rows = [
+                        truth_by_label["e1"].astype(np.float32).tolist(),
+                        truth_by_label["e2"].astype(np.float32).tolist(),
+                    ]
+                self.truth_endpoint_pub.publish(
+                    pc2.create_cloud(
+                        Header(stamp=stamp, frame_id='gocator_sensor'),
+                        fields,
+                        truth_rows,
                     )
-                ]
-                ep.layout.data_offset = 0
-                # First 9 values retain the legacy endpoint layout.  The
-                # remaining values are R_BF row-major and t_BF from the
-                # delayed encoder snapshot associated with this profile.
-                ep_data = [0.0] * 23
-                eps_S = res.get('endpoints_S', [])
-                e1_valid, e2_valid = 0.0, 0.0
-                for et, pt in eps_S:
-                    noisy_point, valid = self.noise_model.corrupt_endpoint(
-                        pt, frame_dropped=frame_dropped
-                    )
-                    if not valid:
-                        continue
-                    if et == 'e1':
-                        ep_data[1:4] = noisy_point; e1_valid = 1.0
-                    elif et == 'e2':
-                        ep_data[5:8] = noisy_point; e2_valid = 1.0
-                ep_data[0] = e1_valid + e2_valid
-                ep_data[4] = e1_valid
-                ep_data[8] = e2_valid
-                ep_data[9:18] = reported_flange[:3, :3].reshape(-1).tolist()
-                ep_data[18:21] = reported_flange[:3, 3].tolist()
-                # Match this endpoint/encoder snapshot to the PointCloud2
-                # frame without relying on DDS callback arrival order.
-                ep_data[21] = float(stamp.sec)
-                ep_data[22] = float(stamp.nanosec)
-                ep.data = ep_data
-                self.endpoint_pub.publish(ep)
+                )
 
             except Exception as e:
                 self.get_logger().warn(

@@ -8,6 +8,7 @@ from pathlib import Path
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
+from geometry_msgs.msg import PoseStamped
 from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes, RobotState
 from moveit_msgs.srv import GetMotionPlan, GetStateValidity
 import numpy as np
@@ -17,15 +18,16 @@ from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import JointState, PointCloud2
 import sensor_msgs_py.point_cloud2 as point_cloud2
-from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 from tf2_ros import Buffer, TransformListener
 
 from calibration_pipeline.dataset_io import (
+    SeedObservationGroup,
     aggregate_seed_group,
     load_seed_dataset_grouped,
     save_result,
+    split_stationary_group,
 )
 from calibration_pipeline.geometry import (
     make_transform,
@@ -45,6 +47,7 @@ from calibration_pipeline.initial_validation import (
 )
 from calibration_pipeline.nbv.stopping import StopPolicy
 from calibration_pipeline.pipeline import ActiveCalibrationPipeline
+from calibration_pipeline.seed_collection import robust_endpoint_inliers
 from calibration_pipeline.simulation.scene_truth import (
     HAND_EYE_ROTATION,
     HAND_EYE_TRANSLATION,
@@ -93,7 +96,9 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("auto_start", True)
         self.declare_parameter("seed_file", "/workspace/data/seed_measurements_v5.json")
         self.declare_parameter("output_file", "/workspace/data/calibration_result_v5.json")
-        self.declare_parameter("maximum_nbv_poses", 5)
+        # Zero delegates termination to the adaptive policy.  A separate
+        # maximum_total_poses parameter remains the emergency guard.
+        self.declare_parameter("maximum_nbv_poses", 0)
         self.declare_parameter("maximum_scored_candidates", 32)
         self.declare_parameter("maximum_planning_candidates", 32)
         self.declare_parameter("nbv.edge_samples", 4)
@@ -112,10 +117,19 @@ class ActiveCalibrationSimNode(Node):
             "nbv.minimum_committed_joint_separation_rad", 0.10
         )
         self.declare_parameter("nbv.measurement_batch_size", 5)
+        self.declare_parameter("nbv.validation_frame_count", 1)
+        self.declare_parameter("nbv.minimum_fit_frame_count", 3)
+        self.declare_parameter("nbv.endpoint_mad_multiplier", 3.5)
         self.declare_parameter("nbv.minimum_poses", 3)
         self.declare_parameter("nbv.maximum_total_poses", 20)
         self.declare_parameter("nbv.information_gain_threshold", 1e-3)
+        self.declare_parameter("nbv.relative_information_gain_threshold", 0.03)
         self.declare_parameter("nbv.consecutive_low_gain_limit", 3)
+        self.declare_parameter(
+            "nbv.validation_minimum_relative_improvement", 0.01
+        )
+        self.declare_parameter("nbv.validation_patience", 3)
+        self.declare_parameter("nbv.validation_best_relative_tolerance", 0.10)
         self.declare_parameter("nbv.minimum_effective_eigenvalue", 1e-6)
         self.declare_parameter("nbv.maximum_rotation_std_deg", 0.025)
         self.declare_parameter("nbv.maximum_translation_std_m", 0.00005)
@@ -129,6 +143,7 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("nbv.initial_maximum_board_rotation_deg", -1.0)
         self.declare_parameter("settling_time_s", 0.75)
         self.declare_parameter("measurement_timeout_s", 5.0)
+        self.declare_parameter("measurement.pose_source", "topic")
         self.declare_parameter("nbv.minimum_measurement_frame_rate_hz", 2.0)
         self.declare_parameter("board.length_u_m", 0.4)
         self.declare_parameter("board.length_v_m", 0.5)
@@ -144,6 +159,7 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("solver.plane_rotation_scale_deg", 10.0)
         self.declare_parameter("solver.maximum_condition_number", 1e12)
         self.declare_parameter("initial_validation.bootstrap_trials", 4)
+        self.declare_parameter("initial_validation.held_out_frames_per_pose", 4)
         self.declare_parameter("initial_validation.random_seed", 20260728)
         self.declare_parameter(
             "initial_validation.maximum_rotation_p95_deg", 1.0
@@ -165,6 +181,8 @@ class ActiveCalibrationSimNode(Node):
         self.seed_file = Path(str(self.get_parameter("seed_file").value))
         self.output_file = Path(str(self.get_parameter("output_file").value))
         self.maximum_nbv_poses = int(self.get_parameter("maximum_nbv_poses").value)
+        if self.maximum_nbv_poses < 0:
+            raise ValueError("maximum_nbv_poses must be zero or positive")
         self.maximum_scored = int(
             self.get_parameter("maximum_scored_candidates").value
         )
@@ -217,8 +235,25 @@ class ActiveCalibrationSimNode(Node):
         self.measurement_batch_size = int(
             self.get_parameter("nbv.measurement_batch_size").value
         )
-        if self.measurement_batch_size < 1:
-            raise ValueError("nbv.measurement_batch_size must be positive")
+        self.validation_frame_count = int(
+            self.get_parameter("nbv.validation_frame_count").value
+        )
+        self.minimum_fit_frame_count = int(
+            self.get_parameter("nbv.minimum_fit_frame_count").value
+        )
+        self.endpoint_mad_multiplier = float(
+            self.get_parameter("nbv.endpoint_mad_multiplier").value
+        )
+        if (
+            self.measurement_batch_size < 2
+            or self.validation_frame_count < 1
+            or self.validation_frame_count >= self.measurement_batch_size
+            or self.minimum_fit_frame_count < 1
+            or self.minimum_fit_frame_count
+            > self.measurement_batch_size - self.validation_frame_count
+            or self.endpoint_mad_multiplier <= 0.0
+        ):
+            raise ValueError("invalid NBV synchronized batch configuration")
         self.stop_policy = StopPolicy(
             minimum_nbv_poses=int(
                 self.get_parameter("nbv.minimum_poses").value
@@ -228,6 +263,11 @@ class ActiveCalibrationSimNode(Node):
             ),
             information_gain_threshold=float(
                 self.get_parameter("nbv.information_gain_threshold").value
+            ),
+            relative_information_gain_threshold=float(
+                self.get_parameter(
+                    "nbv.relative_information_gain_threshold"
+                ).value
             ),
             consecutive_low_gain_limit=int(
                 self.get_parameter("nbv.consecutive_low_gain_limit").value
@@ -242,6 +282,19 @@ class ActiveCalibrationSimNode(Node):
                 self.get_parameter("nbv.maximum_translation_std_m").value
             ),
         )
+        self.validation_minimum_relative_improvement = float(
+            self.get_parameter(
+                "nbv.validation_minimum_relative_improvement"
+            ).value
+        )
+        self.validation_patience = int(
+            self.get_parameter("nbv.validation_patience").value
+        )
+        self.validation_best_relative_tolerance = float(
+            self.get_parameter(
+                "nbv.validation_best_relative_tolerance"
+            ).value
+        )
         self.settling_time = float(self.get_parameter("settling_time_s").value)
         self.measurement_timeout_ns = int(
             effective_measurement_timeout_s(
@@ -255,6 +308,11 @@ class ActiveCalibrationSimNode(Node):
             )
             * 1e9
         )
+        self.pose_source = str(
+            self.get_parameter("measurement.pose_source").value
+        ).strip().lower()
+        if self.pose_source not in {"topic", "tf"}:
+            raise ValueError("measurement.pose_source must be topic or tf")
         self.roi = SensorROI(
             hard_domain=TrapezoidDomain(
                 *map(float, self.get_parameter("sensor.hard_trapezoid").value)
@@ -293,7 +351,16 @@ class ActiveCalibrationSimNode(Node):
         self.create_subscription(JointState, "/joint_states", self._joint_callback, 10)
         self.create_subscription(PointCloud2, "/gocator/profile", self._profile_callback, 10)
         self.create_subscription(
-            Float64MultiArray, "/gocator/endpoints", self._endpoint_callback, 10
+            PointCloud2,
+            "/calibration/endpoints",
+            self._endpoint_callback,
+            10,
+        )
+        self.create_subscription(
+            PoseStamped,
+            "/calibration/flange_pose",
+            self._flange_pose_callback,
+            10,
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -343,7 +410,10 @@ class ActiveCalibrationSimNode(Node):
             tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
         ] = []
         self.pending_profiles: dict[tuple[int, int], np.ndarray] = {}
-        self.pending_endpoint_frames: dict[tuple[int, int], list[float]] = {}
+        self.pending_endpoint_frames: dict[
+            tuple[int, int], tuple[np.ndarray, np.ndarray]
+        ] = {}
+        self.pending_flange_poses: dict[tuple[int, int], np.ndarray] = {}
         self.last_batched_profile_ns = 0
         self.last_batched_endpoints_ns = 0
         self.get_logger().info(
@@ -360,7 +430,8 @@ class ActiveCalibrationSimNode(Node):
         response.success = self.state != "FAILED"
         count = 0 if self.pipeline is None else self.pipeline.nbv_count
         response.message = (
-            f"state={self.state}; nbv={count}/{self.maximum_nbv_poses}; "
+            f"state={self.state}; nbv={count}/"
+            f"{self.maximum_nbv_poses if self.maximum_nbv_poses > 0 else 'adaptive'}; "
             f"planning_attempt={self.planning_index}/{self.maximum_planning}; "
             f"measurement_batch={len(self.measurement_batch)}/"
             f"{self.measurement_batch_size}; "
@@ -399,52 +470,126 @@ class ActiveCalibrationSimNode(Node):
         self.latest_profile_stamp = message.header.stamp
         key = (int(message.header.stamp.sec), int(message.header.stamp.nanosec))
         self.pending_profiles[key] = profile
-        endpoint_data = self.pending_endpoint_frames.pop(key, None)
-        if endpoint_data is not None:
-            self.pending_profiles.pop(key, None)
-            self._accept_matched_frame(profile, endpoint_data, message.header.stamp)
+        self._try_accept_matched_frame(key, message.header.stamp)
         self._trim_pending_frames()
 
-    def _endpoint_callback(self, message: Float64MultiArray) -> None:
-        data = list(message.data)
-        if len(data) < 9 or not bool(data[4]) or not bool(data[8]):
+    def _endpoint_callback(self, message: PointCloud2) -> None:
+        values = point_cloud2.read_points(
+            message, field_names=("x", "y", "z"), skip_nans=True
+        )
+        if len(values) != 2:
             self.latest_endpoints = None
             return
-        if len(data) >= 23:
-            key = (int(data[21]), int(data[22]))
-            profile = self.pending_profiles.pop(key, None)
-            if profile is None:
-                self.pending_endpoint_frames[key] = data
-                self._trim_pending_frames()
-                return
-            self._accept_matched_frame(profile, data, None)
-            return
-        # Backward compatibility for legacy simulation publishers.
-        self._accept_matched_frame(self.latest_profile, data, None)
-
-    def _accept_matched_frame(self, profile, data, stamp) -> None:
-        if profile is None:
-            return
-        self.latest_profile = np.asarray(profile, dtype=float)
-        self.latest_endpoints = (
-            np.asarray(data[1:4], dtype=float),
-            np.asarray(data[5:8], dtype=float),
-        )
-        if len(data) >= 21:
-            self.latest_measurement_transform = make_transform(
-                np.asarray(data[9:18], dtype=float).reshape(3, 3),
-                np.asarray(data[18:21], dtype=float),
+        if getattr(values.dtype, "names", None):
+            endpoints = np.column_stack(
+                tuple(
+                    np.asarray(values[name], dtype=float)
+                    for name in ("x", "y", "z")
+                )
             )
+        else:
+            endpoints = np.asarray(values, dtype=float).reshape(2, 3)
+        key = (
+            int(message.header.stamp.sec),
+            int(message.header.stamp.nanosec),
+        )
+        self.pending_endpoint_frames[key] = (
+            endpoints[0].copy(),
+            endpoints[1].copy(),
+        )
+        self._try_accept_matched_frame(key, message.header.stamp)
+        self._trim_pending_frames()
+
+    def _flange_pose_callback(self, message: PoseStamped) -> None:
+        position = message.pose.position
+        orientation = message.pose.orientation
+        transform = make_transform(
+            quaternion_to_matrix(
+                np.array(
+                    [
+                        orientation.x,
+                        orientation.y,
+                        orientation.z,
+                        orientation.w,
+                    ]
+                )
+            ),
+            np.array([position.x, position.y, position.z]),
+        )
+        key = (
+            int(message.header.stamp.sec),
+            int(message.header.stamp.nanosec),
+        )
+        self.pending_flange_poses[key] = transform
+        self._try_accept_matched_frame(key, message.header.stamp)
+        self._trim_pending_frames()
+
+    def _try_accept_matched_frame(self, key, stamp) -> None:
+        profile = self.pending_profiles.get(key)
+        endpoints = self.pending_endpoint_frames.get(key)
+        if profile is None or endpoints is None:
+            return
+        if self.pose_source == "topic":
+            transform = self.pending_flange_poses.get(key)
+            if transform is None:
+                return
+        else:
+            transform = self._lookup_flange_transform(stamp)
+            if transform is None:
+                return
+        self.pending_profiles.pop(key, None)
+        self.pending_endpoint_frames.pop(key, None)
+        self.pending_flange_poses.pop(key, None)
+        self._accept_matched_frame(profile, endpoints, transform, stamp)
+
+    def _accept_matched_frame(
+        self, profile, endpoints, transform, stamp
+    ) -> None:
+        self.latest_profile = np.asarray(profile, dtype=float)
+        self.latest_endpoints = tuple(
+            np.asarray(endpoint, dtype=float) for endpoint in endpoints
+        )
+        self.latest_measurement_transform = np.asarray(
+            transform, dtype=float
+        ).copy()
         now = self.get_clock().now().nanoseconds
         self.latest_profile_ns = now
         self.latest_endpoints_ns = now
-        if stamp is not None:
-            self.latest_profile_stamp = stamp
+        self.latest_profile_stamp = stamp
 
     def _trim_pending_frames(self) -> None:
-        for pending in (self.pending_profiles, self.pending_endpoint_frames):
+        for pending in (
+            self.pending_profiles,
+            self.pending_endpoint_frames,
+            self.pending_flange_poses,
+        ):
             while len(pending) > 20:
                 pending.pop(next(iter(pending)))
+
+    def _lookup_flange_transform(self, stamp) -> np.ndarray | None:
+        try:
+            stamped = self.tf_buffer.lookup_transform(
+                "base_link",
+                "fanuc_flange",
+                Time.from_msg(stamp),
+            )
+        except Exception:
+            return None
+        translation = stamped.transform.translation
+        quaternion = stamped.transform.rotation
+        return make_transform(
+            quaternion_to_matrix(
+                np.array(
+                    [
+                        quaternion.x,
+                        quaternion.y,
+                        quaternion.z,
+                        quaternion.w,
+                    ]
+                )
+            ),
+            np.array([translation.x, translation.y, translation.z]),
+        )
 
     def _tick(self) -> None:
         if not self.started:
@@ -622,10 +767,35 @@ class ActiveCalibrationSimNode(Node):
                     if initial_board_limit <= 0.0
                     else initial_board_limit
                 ),
+                validation_minimum_relative_improvement=(
+                    self.validation_minimum_relative_improvement
+                ),
+                validation_patience=self.validation_patience,
+                validation_best_relative_tolerance=(
+                    self.validation_best_relative_tolerance
+                ),
             )
+            held_out_frames = int(
+                self.get_parameter(
+                    "initial_validation.held_out_frames_per_pose"
+                ).value
+            )
+            fit_groups: list[SeedObservationGroup] = []
             for group in dataset.groups:
-                pose, measurement = aggregate_seed_group(group)
+                fit_group, validation_group = split_stationary_group(
+                    group,
+                    validation_frame_count=held_out_frames,
+                )
+                fit_groups.append(fit_group)
+                pose, measurement = aggregate_seed_group(fit_group)
                 self.pipeline.append_seed(pose, measurement)
+                if validation_group is not None:
+                    validation_pose, validation_measurement = (
+                        aggregate_seed_group(validation_group)
+                    )
+                    self.pipeline.append_validation_observation(
+                        validation_pose, validation_measurement
+                    )
             result = self.pipeline.initialize()
             if not result.converged:
                 self._fail(
@@ -635,7 +805,7 @@ class ActiveCalibrationSimNode(Node):
                 )
                 return
             self.initial_stability_report = bootstrap_initial_stability(
-                dataset.groups,
+                fit_groups,
                 self.solver,
                 result,
                 board_dimensions=board_dimensions,
@@ -720,7 +890,9 @@ class ActiveCalibrationSimNode(Node):
         self.ranked = self.pipeline.rank_candidates(
             maximum_candidates=self.maximum_scored,
             minimum_valid_probability=self.minimum_valid_probability,
-            virtual_batch_size=self.measurement_batch_size,
+            # Repeated frames at one stopped robot pose reduce measurement
+            # variance but are not independent geometric excitation.
+            virtual_batch_size=1,
             candidate_filter=self._candidate_kinematic_filter,
             candidate_options=self.candidate_options,
         )
@@ -986,11 +1158,31 @@ class ActiveCalibrationSimNode(Node):
         profiles = [item[0] for item in self.measurement_batch]
         endpoint_u_frames = [item[1] for item in self.measurement_batch]
         endpoint_v_frames = [item[2] for item in self.measurement_batch]
-        endpoint_u = np.mean(endpoint_u_frames, axis=0)
-        endpoint_v = np.mean(endpoint_v_frames, axis=0)
+        inlier_mask, batch_diagnostics = robust_endpoint_inliers(
+            np.asarray(endpoint_u_frames),
+            np.asarray(endpoint_v_frames),
+            mad_multiplier=self.endpoint_mad_multiplier,
+        )
+        inlier_items = [
+            item
+            for item, accepted in zip(self.measurement_batch, inlier_mask)
+            if accepted
+        ]
+        required_frames = (
+            self.minimum_fit_frame_count + self.validation_frame_count
+        )
+        if len(inlier_items) < required_frames:
+            self._rollback_after_failure(
+                "synchronized NBV batch has too few endpoint-consistent "
+                f"frames ({len(inlier_items)}/{len(self.measurement_batch)} "
+                f"inliers, need {required_frames})"
+            )
+            return
+        endpoint_u = np.mean([item[1] for item in inlier_items], axis=0)
+        endpoint_v = np.mean([item[2] for item in inlier_items], axis=0)
         frame_hard_margins = [
             min(self.roi.hard_margin(item[1]), self.roi.hard_margin(item[2]))
-            for item in self.measurement_batch
+            for item in inlier_items
         ]
         if min(frame_hard_margins) < 0.0:
             self._rollback_after_failure(
@@ -1025,25 +1217,58 @@ class ActiveCalibrationSimNode(Node):
             )
         poses = [
             FlangePose(item[3][:3, :3], item[3][:3, 3])
-            for item in self.measurement_batch
+            for item in inlier_items
         ]
         measurements = [
             Measurement(profile, endpoint_u_frame, endpoint_v_frame)
             for profile, endpoint_u_frame, endpoint_v_frame, _transform
-            in self.measurement_batch
+            in inlier_items
         ]
+        stationary_group = SeedObservationGroup(
+            f"nbv_{self.pipeline.nbv_count + 1}",
+            tuple(poses),
+            tuple(measurements),
+        )
+        fit_group, validation_group = split_stationary_group(
+            stationary_group,
+            validation_frame_count=self.validation_frame_count,
+        )
+        if len(fit_group.poses) < self.minimum_fit_frame_count:
+            self._rollback_after_failure(
+                "synchronized NBV fit split has too few frames "
+                f"({len(fit_group.poses)}/{self.minimum_fit_frame_count})"
+            )
+            return
+        fit_pose, fit_measurement = aggregate_seed_group(fit_group)
+        validation_pose = None
+        validation_measurement = None
+        if validation_group is not None:
+            validation_pose, validation_measurement = aggregate_seed_group(
+                validation_group
+            )
         try:
             result = self.pipeline.append_nbv_batch(
-                poses,
-                measurements,
+                [fit_pose],
+                [fit_measurement],
                 candidate_id=self.executing_score.candidate.candidate_id,
+                validation_pose=validation_pose,
+                validation_measurement=validation_measurement,
             )
         except RuntimeError as error:
             self._rollback_after_failure(str(error))
             return
+        validation_score_mm = (
+            float("nan")
+            if self.pipeline.current_validation_metrics is None
+            else 1000.0
+            * self.pipeline.current_validation_metrics.score_m
+        )
         self.get_logger().info(
             f"NBV {self.pipeline.nbv_count} committed: "
             f"gain={self.executing_score.information_gain:.6g}, "
+            f"batch_inliers={batch_diagnostics.inlier_count}/"
+            f"{batch_diagnostics.raw_count}, "
+            f"validation_score={validation_score_mm:.4f} mm, "
             f"rotation_error={rotation_distance_deg(result.estimate.handeye_rotation, HAND_EYE_ROTATION):.4f} deg, "
             f"translation_error={1000.0 * np.linalg.norm(result.estimate.handeye_translation - HAND_EYE_TRANSLATION):.4f} mm"
         )
@@ -1051,9 +1276,12 @@ class ActiveCalibrationSimNode(Node):
         self.committed_nbv_joints.append(self.latest_joints.copy())
         self._record_iteration("nbv", result, self.executing_score)
         self._write_result("RUNNING")
-        if self.pipeline.nbv_count >= self.maximum_nbv_poses:
-            self.stop_reason = "configured simulation NBV limit reached"
-            self.get_logger().info("configured simulation NBV limit reached")
+        if (
+            self.maximum_nbv_poses > 0
+            and self.pipeline.nbv_count >= self.maximum_nbv_poses
+        ):
+            self.stop_reason = "optional user NBV budget reached"
+            self.get_logger().info("optional user NBV budget reached")
             self._finish()
         else:
             self._rank_and_plan()
@@ -1063,35 +1291,18 @@ class ActiveCalibrationSimNode(Node):
             return self.latest_measurement_transform.copy()
         if self.latest_profile_stamp is None:
             return None
-        try:
-            stamped = self.tf_buffer.lookup_transform(
-                "base_link",
-                "fanuc_flange",
-                Time.from_msg(self.latest_profile_stamp),
-            )
-        except Exception:
-            return None
-        translation = stamped.transform.translation
-        quaternion = stamped.transform.rotation
-        return make_transform(
-            quaternion_to_matrix(
-                np.array(
-                    [
-                        quaternion.x,
-                        quaternion.y,
-                        quaternion.z,
-                        quaternion.w,
-                    ]
-                )
-            ),
-            np.array([translation.x, translation.y, translation.z]),
-        )
+        return self._lookup_flange_transform(self.latest_profile_stamp)
 
     def _finish(self) -> None:
         assert self.pipeline is not None and self.pipeline.result is not None
+        self.pipeline.restore_historical_best()
         self._write_result("DONE")
         self.state = "DONE"
-        self.get_logger().info(f"simulation calibration complete -> {self.output_file}")
+        self.get_logger().info(
+            "simulation calibration complete; selected held-out historical "
+            f"best at NBV {self.pipeline.best_result_nbv_index} -> "
+            f"{self.output_file}"
+        )
 
     def _record_iteration(self, phase: str, result, score=None) -> None:
         rotation_error = rotation_distance_deg(
@@ -1167,6 +1378,18 @@ class ActiveCalibrationSimNode(Node):
             "handeye_rotation": result.estimate.handeye_rotation.tolist(),
             "handeye_translation_m": result.estimate.handeye_translation.tolist(),
             "board_corner_m": result.estimate.board.corner.tolist(),
+            "held_out_validation_score_mm": (
+                None
+                if self.pipeline is None
+                or self.pipeline.current_validation_metrics is None
+                else 1000.0
+                * self.pipeline.current_validation_metrics.score_m
+            ),
+            "historical_best_nbv_index": (
+                0
+                if self.pipeline is None
+                else self.pipeline.best_result_nbv_index
+            ),
         }
         self.iteration_history.append(record)
         self.last_result_summary = (
@@ -1207,6 +1430,27 @@ class ActiveCalibrationSimNode(Node):
                     )
                 ),
                 "stop_reason": self.stop_reason,
+                "selected_historical_best_nbv_index": (
+                    self.pipeline.best_result_nbv_index
+                ),
+                "held_out_validation": {
+                    "pose_count": len(self.pipeline.validation_poses),
+                    "current_score_mm": (
+                        None
+                        if self.pipeline.current_validation_metrics is None
+                        else 1000.0
+                        * self.pipeline.current_validation_metrics.score_m
+                    ),
+                    "best_score_mm": (
+                        None
+                        if self.pipeline.best_validation_metrics is None
+                        else 1000.0
+                        * self.pipeline.best_validation_metrics.score_m
+                    ),
+                    "no_improvement_count": (
+                        self.pipeline.validation_no_improvement_count
+                    ),
+                },
                 "iterations": self.iteration_history,
                 "execution_failures": self.execution_failure_history,
             },

@@ -205,3 +205,22 @@ def test_stop_policy_accepts_saturated_gain_without_covariance_target():
         )
     assert stop
     assert reason == "information gain saturated"
+
+
+def test_stop_policy_accepts_truth_independent_validation_plateau():
+    policy = StopPolicy(
+        minimum_nbv_poses=3,
+        maximum_total_poses=20,
+        minimum_effective_eigenvalue=1e-8,
+    )
+    stop, reason = policy.evaluate(
+        total_poses=9,
+        nbv_poses=3,
+        effective_rank=6,
+        best_information_gain=1.0,
+        minimum_effective_eigenvalue=1.0,
+        handeye_covariance=None,
+        validation_plateaued=True,
+    )
+    assert stop
+    assert reason == "held-out validation score plateaued"

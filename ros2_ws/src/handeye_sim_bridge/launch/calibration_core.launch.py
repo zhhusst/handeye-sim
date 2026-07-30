@@ -34,6 +34,13 @@ def generate_launch_description():
             ),
             Node(
                 package="handeye_sim_bridge",
+                executable="profile_endpoint_detector",
+                name="profile_endpoint_detector",
+                parameters=[config, {"use_sim_time": use_sim_time}],
+                output="screen",
+            ),
+            Node(
+                package="handeye_sim_bridge",
                 executable="profile_viz",
                 name="profile_visualization",
                 parameters=[config, {"use_sim_time": use_sim_time}],

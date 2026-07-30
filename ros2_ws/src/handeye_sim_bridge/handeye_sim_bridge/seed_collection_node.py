@@ -15,9 +15,9 @@ import rclpy
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.time import Time
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState, PointCloud2
 import sensor_msgs_py.point_cloud2 as point_cloud2
-from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 from tf2_ros import Buffer, TransformListener
@@ -36,6 +36,7 @@ from calibration_pipeline.seed_collection import (
     assess_initial_pose,
     evaluate_bilateral_feature,
     local_preflight_is_acceptable,
+    preflight_guided_rotation_plan,
     robust_endpoint_inliers,
     rotation_diversity,
     seed_feature_is_acceptable,
@@ -114,6 +115,7 @@ class SeedCollectionNode(Node):
         self.declare_parameter("manual_max_joint_speed_rad_s", 0.02)
         self.declare_parameter("maximum_measurement_skew_s", 0.1)
         self.declare_parameter("maximum_measurement_age_s", 0.5)
+        self.declare_parameter("measurement.pose_source", "topic")
         self.declare_parameter("output_file", "data/seed_measurements.json")
         self.declare_parameter("sensor.min_range_m", 0.27)
         self.declare_parameter("sensor.max_range_m", 0.82)
@@ -311,6 +313,11 @@ class SeedCollectionNode(Node):
         self.maximum_measurement_age_ns = int(
             float(self.get_parameter("maximum_measurement_age_s").value) * 1e9
         )
+        self.pose_source = str(
+            self.get_parameter("measurement.pose_source").value
+        ).strip().lower()
+        if self.pose_source not in {"topic", "tf"}:
+            raise ValueError("measurement.pose_source must be topic or tf")
         self.output_file = Path(str(self.get_parameter("output_file").value))
         self.collection_mode = str(
             self.get_parameter("collection_mode").value
@@ -323,7 +330,16 @@ class SeedCollectionNode(Node):
         self.create_subscription(JointState, "/joint_states", self._joint_callback, 10)
         self.create_subscription(PointCloud2, "/gocator/profile", self._profile_callback, 10)
         self.create_subscription(
-            Float64MultiArray, "/gocator/endpoints", self._endpoint_callback, 10
+            PointCloud2,
+            "/calibration/endpoints",
+            self._endpoint_callback,
+            10,
+        )
+        self.create_subscription(
+            PoseStamped,
+            "/calibration/flange_pose",
+            self._flange_pose_callback,
+            10,
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -343,7 +359,10 @@ class SeedCollectionNode(Node):
         self.latest_endpoints: tuple[np.ndarray, np.ndarray] | None = None
         self.latest_measurement_transform: np.ndarray | None = None
         self.pending_profiles: dict[tuple[int, int], np.ndarray] = {}
-        self.pending_endpoint_frames: dict[tuple[int, int], list[float]] = {}
+        self.pending_endpoint_frames: dict[
+            tuple[int, int], tuple[np.ndarray, np.ndarray]
+        ] = {}
+        self.pending_flange_poses: dict[tuple[int, int], np.ndarray] = {}
         self.latest_profile_ns = 0
         self.latest_profile_stamp = None
         self.latest_endpoints_ns = 0
@@ -445,56 +464,131 @@ class SeedCollectionNode(Node):
         self.latest_profile_stamp = message.header.stamp
         key = (int(message.header.stamp.sec), int(message.header.stamp.nanosec))
         self.pending_profiles[key] = profile
-        endpoint_data = self.pending_endpoint_frames.pop(key, None)
-        if endpoint_data is not None:
-            self.pending_profiles.pop(key, None)
-            self._accept_matched_frame(profile, endpoint_data, message.header.stamp)
+        self._try_accept_matched_frame(key, message.header.stamp)
         self._trim_pending_frames()
 
-    def _endpoint_callback(self, message: Float64MultiArray) -> None:
-        data = list(message.data)
-        if len(data) < 9 or not bool(data[4]) or not bool(data[8]):
+    def _endpoint_callback(self, message: PointCloud2) -> None:
+        values = point_cloud2.read_points(
+            message, field_names=("x", "y", "z"), skip_nans=True
+        )
+        if len(values) != 2:
             self.latest_endpoints = None
             return
-        if len(data) >= 23:
-            key = (int(data[21]), int(data[22]))
-            profile = self.pending_profiles.pop(key, None)
-            if profile is None:
-                self.pending_endpoint_frames[key] = data
-                self._trim_pending_frames()
-                return
-            self._accept_matched_frame(profile, data, None)
-            return
-        self._accept_matched_frame(self.latest_profile, data, None)
-
-    def _accept_matched_frame(self, profile, data, stamp) -> None:
-        if profile is None:
-            return
-        self.latest_profile = np.asarray(profile, dtype=float)
-        self.latest_endpoints = (
-            np.array(data[1:4], dtype=float),
-            np.array(data[5:8], dtype=float),
-        )
-        if len(data) >= 21:
-            self.latest_measurement_transform = make_transform(
-                np.asarray(data[9:18], dtype=float).reshape(3, 3),
-                np.asarray(data[18:21], dtype=float),
+        if getattr(values.dtype, "names", None):
+            endpoints = np.column_stack(
+                tuple(
+                    np.asarray(values[name], dtype=float)
+                    for name in ("x", "y", "z")
+                )
             )
+        else:
+            endpoints = np.asarray(values, dtype=float).reshape(2, 3)
+        key = (
+            int(message.header.stamp.sec),
+            int(message.header.stamp.nanosec),
+        )
+        self.pending_endpoint_frames[key] = (
+            endpoints[0].copy(),
+            endpoints[1].copy(),
+        )
+        self._try_accept_matched_frame(key, message.header.stamp)
+        self._trim_pending_frames()
+
+    def _flange_pose_callback(self, message: PoseStamped) -> None:
+        position = message.pose.position
+        orientation = message.pose.orientation
+        transform = make_transform(
+            quaternion_to_matrix(
+                np.array(
+                    [
+                        orientation.x,
+                        orientation.y,
+                        orientation.z,
+                        orientation.w,
+                    ]
+                )
+            ),
+            np.array([position.x, position.y, position.z]),
+        )
+        key = (
+            int(message.header.stamp.sec),
+            int(message.header.stamp.nanosec),
+        )
+        self.pending_flange_poses[key] = transform
+        self._try_accept_matched_frame(key, message.header.stamp)
+        self._trim_pending_frames()
+
+    def _try_accept_matched_frame(self, key, stamp) -> None:
+        profile = self.pending_profiles.get(key)
+        endpoints = self.pending_endpoint_frames.get(key)
+        if profile is None or endpoints is None:
+            return
+        if self.pose_source == "topic":
+            transform = self.pending_flange_poses.get(key)
+            if transform is None:
+                return
+        else:
+            transform = self._lookup_flange_transform(stamp)
+            if transform is None:
+                return
+        self.pending_profiles.pop(key, None)
+        self.pending_endpoint_frames.pop(key, None)
+        self.pending_flange_poses.pop(key, None)
+        self._accept_matched_frame(profile, endpoints, transform, stamp)
+
+    def _accept_matched_frame(
+        self, profile, endpoints, transform, stamp
+    ) -> None:
+        self.latest_profile = np.asarray(profile, dtype=float)
+        self.latest_endpoints = tuple(
+            np.asarray(endpoint, dtype=float) for endpoint in endpoints
+        )
+        self.latest_measurement_transform = np.asarray(
+            transform, dtype=float
+        ).copy()
         now = self.get_clock().now().nanoseconds
         wall_now = time.monotonic_ns()
         self.latest_profile_ns = now
         self.latest_endpoints_ns = now
         self.latest_profile_wall_ns = wall_now
         self.latest_endpoints_wall_ns = wall_now
-        if stamp is not None:
-            self.latest_profile_stamp = stamp
+        self.latest_profile_stamp = stamp
         if self.state == "CAPTURING_SEED":
             self._collect_seed_frame(wall_now)
 
     def _trim_pending_frames(self) -> None:
-        for pending in (self.pending_profiles, self.pending_endpoint_frames):
+        for pending in (
+            self.pending_profiles,
+            self.pending_endpoint_frames,
+            self.pending_flange_poses,
+        ):
             while len(pending) > 20:
                 pending.pop(next(iter(pending)))
+
+    def _lookup_flange_transform(self, stamp) -> np.ndarray | None:
+        try:
+            stamped = self.tf_buffer.lookup_transform(
+                "base_link",
+                "fanuc_flange",
+                Time.from_msg(stamp),
+            )
+        except Exception:
+            return None
+        translation = stamped.transform.translation
+        quaternion = stamped.transform.rotation
+        return make_transform(
+            quaternion_to_matrix(
+                np.array(
+                    [
+                        quaternion.x,
+                        quaternion.y,
+                        quaternion.z,
+                        quaternion.w,
+                    ]
+                )
+            ),
+            np.array([translation.x, translation.y, translation.z]),
+        )
 
     def _start_callback(self, _request, response):
         if self.state in {"DONE", "FAILED"}:
@@ -633,11 +727,20 @@ class SeedCollectionNode(Node):
             target_name = f"manual_{len(self.records) + 1}"
         else:
             target_name = "complete"
-        displayed_rotation_target = (
-            self.preflight_rotation
-            if self.collection_phase == "PREFLIGHT"
-            else self.rotation_target
-        )
+        if (
+            self.collection_phase == "PREFLIGHT"
+            and self.preflight_index < len(self.preflight_plan)
+        ):
+            displayed_rotation_target = (
+                self.preflight_rotation
+                * self.preflight_plan[self.preflight_index].angle_scale
+            )
+        elif self.target_index < len(self.plan):
+            displayed_rotation_target = (
+                self.rotation_target * self.plan[self.target_index].angle_scale
+            )
+        else:
+            displayed_rotation_target = self.rotation_target
         response.message = (
             f"state={self.state}; mode={self.collection_mode}; "
             f"phase={self.collection_phase}; "
@@ -696,29 +799,7 @@ class SeedCollectionNode(Node):
             return self.latest_measurement_transform.copy()
         if self.latest_profile_stamp is None:
             return None
-        try:
-            stamped = self.tf_buffer.lookup_transform(
-                "base_link",
-                "fanuc_flange",
-                Time.from_msg(self.latest_profile_stamp),
-            )
-        except Exception:
-            return None
-        translation = stamped.transform.translation
-        quaternion = stamped.transform.rotation
-        return make_transform(
-            quaternion_to_matrix(
-                np.array(
-                    [
-                        quaternion.x,
-                        quaternion.y,
-                        quaternion.z,
-                        quaternion.w,
-                    ]
-                )
-            ),
-            np.array([translation.x, translation.y, translation.z]),
-        )
+        return self._lookup_flange_transform(self.latest_profile_stamp)
 
     def _local_ik_coverage(self) -> int:
         transform = self._current_transform()
@@ -962,9 +1043,13 @@ class SeedCollectionNode(Node):
                 if not self._begin_seed_capture("reference", "REFERENCE"):
                     self._fail("reference multi-frame capture could not start")
                     return
+                self.plan = preflight_guided_rotation_plan(
+                    self.preflight_results
+                )
                 self.get_logger().info(
                     f"dynamic preflight accepted "
                     f"({len(feasible)}/{len(self.preflight_plan)} directions); "
+                    "reordered seed plan from measured-safe directions; "
                     "collecting the reference stationary frame batch"
                 )
                 return
@@ -1001,11 +1086,7 @@ class SeedCollectionNode(Node):
             else self.plan[self.target_index]
         )
         axis, sign = target.stages[self.stage_index]
-        target_angle = (
-            self.preflight_rotation
-            if self.collection_phase == "PREFLIGHT"
-            else self.rotation_target
-        )
+        target_angle = self._current_target_angle()
         remaining = target_angle - self.accumulated_angle
         magnitude = min(self.rotation_step, remaining)
         delta = sign * magnitude
@@ -1025,11 +1106,7 @@ class SeedCollectionNode(Node):
         self.accumulated_angle += self.pending_rotation
         self.last_valid_joints = self.latest_joints.copy()
         self._remember_last_valid(feature)
-        target_angle = (
-            self.preflight_rotation
-            if self.collection_phase == "PREFLIGHT"
-            else self.rotation_target
-        )
+        target_angle = self._current_target_angle()
         if (
             self.accumulated_angle + 1e-10 < target_angle
             and abs(feature.x_mid)
@@ -1194,12 +1271,15 @@ class SeedCollectionNode(Node):
             return self.preflight_maximum_abs_x_mid
         return self.x_tolerance
 
+    def _current_target_angle(self) -> float:
+        if self.collection_phase == "PREFLIGHT":
+            target = self.preflight_plan[self.preflight_index]
+            return self.preflight_rotation * target.angle_scale
+        target = self.plan[self.target_index]
+        return self.rotation_target * target.angle_scale
+
     def _continue_after_centered(self, feature) -> None:
-        target_angle = (
-            self.preflight_rotation
-            if self.collection_phase == "PREFLIGHT"
-            else self.rotation_target
-        )
+        target_angle = self._current_target_angle()
         if self.accumulated_angle + 1e-10 < target_angle:
             self._issue_micro_rotation()
             return
@@ -1226,11 +1306,6 @@ class SeedCollectionNode(Node):
                 f"margin={1000.0 * feature.domain_margin:.2f} mm"
             )
             self.preflight_index += 1
-            if local_preflight_is_acceptable(
-                self.preflight_results,
-                minimum_feasible_directions=self.preflight_minimum_directions,
-            ):
-                self.preflight_index = len(self.preflight_plan)
             self._return_reference()
             return
         target = self.plan[self.target_index]
@@ -1310,9 +1385,38 @@ class SeedCollectionNode(Node):
     def _after_rollback(self) -> None:
         feature = self._feature()
         if feature is None or not feature.safe:
+            if (
+                self.collection_phase != "PREFLIGHT"
+                and self.reference_joints is not None
+                and self._command_joints(
+                    self.reference_joints, "ROLLBACK_REFERENCE_RECOVERY"
+                )
+            ):
+                self.get_logger().warning(
+                    "local rollback did not restore bilateral visibility; "
+                    "trying the verified reference pose and skipping this "
+                    "target"
+                )
+                return
             self._fail("rollback did not restore bilateral visibility")
             return
         self._issue_micro_rotation()
+
+    def _after_rollback_reference_recovery(self) -> None:
+        feature = self._feature()
+        if feature is None or not feature.safe:
+            self._fail(
+                "neither local rollback nor reference recovery restored "
+                "bilateral visibility"
+            )
+            return
+        self.get_logger().warning(
+            f"{self.plan[self.target_index].name} abandoned after reference "
+            "recovery; continuing with the next preflight-guided branch"
+        )
+        self.failure_count = 0
+        self.target_index += 1
+        self._return_reference()
 
     def _after_partial_capture_ready(self) -> None:
         feature = self._feature()

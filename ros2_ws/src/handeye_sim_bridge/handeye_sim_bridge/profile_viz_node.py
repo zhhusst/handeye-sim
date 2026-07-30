@@ -9,6 +9,7 @@ profile_viz_node.py — Gocator 2D 轮廓可视化 (独立节点)
 """
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2, Image
 from visualization_msgs.msg import Marker, MarkerArray
@@ -22,6 +23,12 @@ class ProfileVizNode(Node):
 
         self.create_subscription(PointCloud2, '/gocator/profile',
                                   self._cb, 1)
+        self.create_subscription(
+            PointCloud2,
+            '/calibration/endpoints',
+            self._endpoint_cb,
+            10,
+        )
 
         self._marker_pub = self.create_publisher(
             MarkerArray, '/gocator/profile_viz', 10)
@@ -29,6 +36,7 @@ class ProfileVizNode(Node):
             Image, '/gocator/profile_2d', 10)
 
         self._latest = None
+        self._endpoints = None
         self.declare_parameter('visualization_rate_hz', 3.0)
         rate = max(
             0.5, float(self.get_parameter('visualization_rate_hz').value)
@@ -56,6 +64,29 @@ class ProfileVizNode(Node):
         if self._latest is not None and len(self._latest) > 0:
             self._last_viz_time = now
             self._publish_all()
+
+    def _endpoint_cb(self, msg):
+        from sensor_msgs_py.point_cloud2 import read_points
+        try:
+            values = read_points(
+                msg, field_names=('x', 'y', 'z'), skip_nans=True
+            )
+            if len(values) != 2:
+                self._endpoints = None
+                return
+            if getattr(values.dtype, 'names', None):
+                self._endpoints = np.column_stack(
+                    tuple(
+                        np.asarray(values[name], dtype=float)
+                        for name in ('x', 'y', 'z')
+                    )
+                )
+            else:
+                self._endpoints = np.asarray(
+                    values, dtype=float
+                ).reshape(2, 3)
+        except Exception:
+            self._endpoints = None
 
     def _publish_all(self):
         pts = self._latest
@@ -92,6 +123,33 @@ class ProfileVizNode(Node):
         m2.color.r = 0.2; m2.color.g = 0.4; m2.color.b = 1.0; m2.color.a = 1.0
         m2.points = [Point(x=0.0, y=0.0, z=-0.05), Point(x=0.0, y=0.0, z=0.6)]
         arr.markers.append(m2)
+
+        endpoint_colors = ((0.1, 0.9, 0.2), (0.2, 0.4, 1.0))
+        for index in range(2):
+            marker = Marker()
+            marker.header.frame_id = FRAME
+            marker.header.stamp = stamp
+            marker.ns = 'detected_endpoints'
+            marker.id = 10 + index
+            if self._endpoints is None:
+                marker.action = Marker.DELETE
+            else:
+                marker.type = Marker.SPHERE
+                marker.action = Marker.ADD
+                marker.scale.x = 0.008
+                marker.scale.y = 0.008
+                marker.scale.z = 0.008
+                marker.pose.position = Point(
+                    x=float(self._endpoints[index, 0]),
+                    y=0.0,
+                    z=float(self._endpoints[index, 2]),
+                )
+                red, green, blue = endpoint_colors[index]
+                marker.color.r = red
+                marker.color.g = green
+                marker.color.b = blue
+                marker.color.a = 1.0
+            arr.markers.append(marker)
 
         self._marker_pub.publish(arr)
 
@@ -152,6 +210,18 @@ class ProfileVizNode(Node):
                 if e2 >= dy: err += dy; c1 += sx
                 if e2 <= dx: err += dx; r1 += sy
 
+        if self._endpoints is not None:
+            colors = ([20, 210, 50], [40, 80, 230])
+            for endpoint, color in zip(self._endpoints, colors):
+                col, row = to_px((endpoint[0], endpoint[2]))
+                for dr in range(-5, 6):
+                    for dc in range(-5, 6):
+                        if dr * dr + dc * dc > 25:
+                            continue
+                        rr, cc = row + dr, col + dc
+                        if 0 <= rr < H and 0 <= cc < W:
+                            img[rr, cc] = color
+
         img_msg = Image()
         img_msg.header.stamp = stamp
         img_msg.header.frame_id = ''
@@ -169,7 +239,7 @@ def main():
     node = ProfileVizNode()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

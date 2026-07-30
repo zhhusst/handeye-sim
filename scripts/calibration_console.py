@@ -57,6 +57,10 @@ TARGET_NAMES = {
     "rx_negative": "绕局部 X 轴负向",
     "ry_positive": "绕局部 Y 轴正向",
     "ry_negative": "绕局部 Y 轴负向",
+    "rx_positive_half": "绕局部 X 轴正向 2.5°",
+    "rx_negative_half": "绕局部 X 轴负向 2.5°",
+    "ry_positive_half": "绕局部 Y 轴正向 2.5°",
+    "ry_negative_half": "绕局部 Y 轴负向 2.5°",
     "rx_ry_positive": "绕局部 X/Y 轴组合",
     "rx_ry_opposite": "绕局部 X 正向/Y 负向补采",
     "rx_negative_ry_positive": "绕局部 X 负向/Y 正向补采",
@@ -112,6 +116,11 @@ def noise_regime_exceedances(noise: dict) -> list[tuple[str, float]]:
     }
     exceedances: list[tuple[str, float]] = []
     for name, baseline in VALIDATED_NOISE_BASELINE.items():
+        if (
+            name == "endpoint_gaussian_std_m"
+            and noise.get("direct_endpoint_injection_active") is False
+        ):
+            continue
         try:
             ratio = float(noise[name]) / baseline
         except (KeyError, TypeError, ValueError):
@@ -287,12 +296,19 @@ class CalibrationConsole:
             "/controller_manager",
             "/move_group",
             "/scene_publisher",
+            "/profile_endpoint_detector",
             "/profile_viz_node",
         }
-        required_topics = {"/joint_states", "/gocator/profile", "/gocator/endpoints"}
+        required_topics = {
+            "/joint_states",
+            "/gocator/profile",
+            "/calibration/endpoints",
+            "/calibration/flange_pose",
+        }
         required_services = {
             "/controller_manager/list_controllers",
             "/scene_publisher/noise_status",
+            "/profile_endpoint_detector/status",
         }
         missing_nodes = sorted(required_nodes - nodes)
         missing_topics = sorted(required_topics - topics)
@@ -323,7 +339,9 @@ class CalibrationConsole:
             print("检测到遗留的标定节点：" + ", ".join(sorted(conflicting)))
             print("请先在之前的标定终端按 Ctrl+C，再重新运行本控制台。")
             return False
-        print("环境正常：MoveIt、关节状态和双边轮廓话题均已发现。")
+        print(
+            "环境正常：MoveIt、原始轮廓、独立断点检测和同步位姿话题均已发现。"
+        )
         success, message = call_trigger("/scene_publisher/noise_status")
         if success:
             try:
@@ -331,7 +349,6 @@ class CalibrationConsole:
                 print(
                     "仿真噪声："
                     f"轮廓 {1e3 * noise['profile_gaussian_std_m']:.3f} mm；"
-                    f"断点 {1e3 * noise['endpoint_gaussian_std_m']:.3f} mm；"
                     f"机器人 {1e3 * noise['robot_translation_std_m']:.3f} mm/"
                     f"{noise['robot_rotation_std_deg']:.4f}°；"
                     f"平面度 {1e3 * noise['board_flatness_rms_m']:.3f} mm RMS；"
@@ -340,11 +357,13 @@ class CalibrationConsole:
                 print(
                     "           "
                     f"点离群 {100 * noise['point_outlier_probability']:.2f}%；"
-                    f"断点离群 {100 * noise['endpoint_outlier_probability']:.2f}%；"
                     f"点漏检 {100 * noise['point_dropout_probability']:.2f}%；"
-                    f"帧漏检 {100 * noise['frame_dropout_probability']:.2f}%；"
-                    f"断点漏检 {100 * noise['endpoint_dropout_probability']:.2f}%"
+                    f"整帧漏检 {100 * noise['frame_dropout_probability']:.2f}%"
                 )
+                if not noise.get("direct_endpoint_injection_active", True):
+                    print(
+                        "           直接断点真值注噪已禁用；断点误差由原始轮廓检测自然产生。"
+                    )
                 exceedances = noise_regime_exceedances(noise)
                 if exceedances:
                     details = "；".join(
@@ -362,6 +381,26 @@ class CalibrationConsole:
                 print("仿真噪声状态：" + message)
         else:
             print("警告：无法读取仿真噪声状态：" + message)
+        detector_success, detector_message = call_trigger(
+            "/profile_endpoint_detector/status"
+        )
+        try:
+            detector = json.loads(detector_message)
+            if detector_success:
+                print(
+                    "断点检测：有效；"
+                    f"支撑点 {detector.get('support_points', '?')}；"
+                    f"拟合RMS {float(detector.get('residual_rms_mm', 0.0)):.3f} mm；"
+                    f"估计σ {float(detector.get('endpoint_sigma_mm', 0.0)):.3f} mm；"
+                    f"置信度 {float(detector.get('confidence', 0.0)):.3f}"
+                )
+            else:
+                print(
+                    "断点检测暂未有效："
+                    + str(detector.get("reason", detector_message))
+                )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            print("断点检测状态：" + detector_message)
         return True
 
     @staticmethod
@@ -425,10 +464,10 @@ class CalibrationConsole:
             print(f"已保留种子文件：{seed_file}")
             return
         maximum_nbv = ask_integer(
-            "最多执行多少个主动 NBV 位姿（3分钟目标建议5，上限6）",
-            default=5,
-            minimum=1,
-            maximum=6,
+            "主动 NBV 可选预算（0=自适应停止；内部仍保留20个NBV紧急保护）",
+            default=0,
+            minimum=0,
+            maximum=20,
         )
         self._run_active(seed_file, result_file, run_directory, maximum_nbv)
 
@@ -742,10 +781,10 @@ class CalibrationConsole:
             return
         self._print_seed_summary(seed_file)
         maximum_nbv = ask_integer(
-            "最多执行多少个主动 NBV 位姿（3分钟目标建议5，上限6）",
-            default=5,
-            minimum=1,
-            maximum=6,
+            "主动 NBV 可选预算（0=自适应停止；内部仍保留20个NBV紧急保护）",
+            default=0,
+            minimum=0,
+            maximum=20,
         )
         run_directory = self.make_run_directory()
         result_file = run_directory / "calibration_result.json"
@@ -913,6 +952,16 @@ class CalibrationConsole:
                     f"旋转≤{record.get('maximum_rotation_std_deg', 0.0):.4f}°；"
                     f"平移≤{record.get('maximum_translation_std_mm', 0.0):.4f} mm"
                 )
+            validation_score = record.get(
+                "held_out_validation_score_mm"
+            )
+            if validation_score is not None:
+                print(
+                    "  │ 留出帧几何验证（不使用真值）："
+                    f"{float(validation_score):.4f} mm；"
+                    "当前历史候选 "
+                    f"NBV {record.get('historical_best_nbv_index', '?')}"
+                )
             stability = record.get("initial_stability")
             if phase == "initial" and isinstance(stability, dict):
                 if stability.get("available"):
@@ -989,6 +1038,17 @@ class CalibrationConsole:
             f"主动 NBV {simulation.get('nbv_count', '?')} 个；"
             f"停止原因：{simulation.get('stop_reason') or '正常完成'}"
         )
+        held_out = simulation.get("held_out_validation", {})
+        selected_index = simulation.get(
+            "selected_historical_best_nbv_index"
+        )
+        if selected_index is not None:
+            print(
+                "  历史结果保留：最终选用 NBV "
+                f"{selected_index} 的快照；"
+                "留出帧分数 "
+                f"{float(held_out.get('best_score_mm', float('nan'))):.4f} mm"
+            )
 
     def show_latest_result(self) -> None:
         candidates = sorted(

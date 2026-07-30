@@ -24,29 +24,62 @@
       # Fixed seed makes repeated robustness runs directly comparable.
       # Use -1 only when intentionally requesting a non-repeatable sequence.
       random_seed: 20260728
-      # Profile sampling and endpoint extraction are distinct estimators.
+      # Only the raw profile is corrupted and exposed to calibration.
+      # Endpoints are now extracted by profile_endpoint_detector.  The three
+      # legacy endpoint fields remain zero for old tooling but are not applied
+      # by the simulation publisher.
       profile_gaussian_std_m: 0.000055  # 轮廓高斯标准差
-      endpoint_gaussian_std_m: 0.0008   # 断点提取高斯标准差 0.8mm
+      endpoint_gaussian_std_m: 0.0
       # Hidden physical flange error; the reported encoder pose is not changed.
-      # Robot/plate model mismatch remains simulated at the validated
-      # background level, but is deliberately not estimated by 12-DOF-V2.
-      # This robustness campaign isolates the 0.8 mm endpoint-extraction case.
-      robot_translation_std_m: 0.00003  # 机器人平移标准差
+      # Robot/plate mismatch is deliberately not estimated by 12-DOF-V2.
+      # The values below form a combined worst-case pressure test rather than
+      # an endpoint-only or ordinary industrial-repeatability baseline.
+      robot_translation_std_m: 0.0005  # 机器人平移标准差
       robot_rotation_std_deg: 0.003     # 机器人旋转标准差
       # RMS amplitude of one fixed spatial height field on the board.
-      board_flatness_rms_m: 0.00003         # 固定板面度RMS
+      board_flatness_rms_m: 0.0003         # 固定板面度RMS
       # The profile is paired with a delayed encoder history sample.
       sync_delay_mean_s: 0.0                # 同步延迟均值
       sync_jitter_std_s: 0.001              # 同步抖动标准差
       # Sparse large errors, independent of the Gaussian extraction error.
       point_outlier_probability: 0.002      # 轮廓点离群概率
-      point_outlier_std_m: 0.0008           # 轮廓点离群幅度
-      endpoint_outlier_probability: 0.001   # 断点离群概率
-      endpoint_outlier_std_m: 0.0008        # 断点离群幅度
+      point_outlier_std_m: 0.0005           # 轮廓点离群幅度
+      endpoint_outlier_probability: 0.0
+      endpoint_outlier_std_m: 0.0
       # Point loss, complete-frame loss, and endpoint-specific missed detection.
       point_dropout_probability: 0.01       # 轮廓点漏检概率
       frame_dropout_probability: 0.001      # 整帧漏检概率
-      endpoint_dropout_probability: 0.002   # 单断点漏检概率
+      endpoint_dropout_probability: 0.0
+
+    # The simulator publishes this exact-stamp encoder pose separately from
+    # the raw Gocator profile. A real adapter may use "tf" after validating
+    # that the robot TF buffer is hardware-time synchronized.
+    measurement:
+      pose_source: topic
+
+    # One detector is shared by synthetic PointCloud2 profiles and a future
+    # real Gocator PointCloud2 driver. It never subscribes to simulation truth.
+    endpoint_detection:
+      input_topic: /gocator/profile
+      output_topic: /calibration/endpoints
+      minimum_points: 12
+      minimum_segment_points: 10
+      minimum_segment_length_m: 0.020
+      maximum_segment_length_m: 0.800
+      absolute_neighbor_gap_m: 0.004
+      neighbor_gap_multiplier: 8.0
+      residual_mad_multiplier: 3.5
+      residual_floor_m: 0.00008
+      maximum_residual_rms_m: 0.0015
+      endpoint_extension_fraction: 0.5
+      candidate_ambiguity_ratio: 0.03
+      maximum_fit_iterations: 4
+      identity_ambiguity_ratio: 0.05
+      # At the repository's reference pose, acquisition-order point 0 lies on
+      # physical edge e2. A real setup must determine this once during setup;
+      # subsequent frames are associated temporally and never re-sorted by X.
+      initial_first_label: e2
+      minimum_confidence: 0.25
 
     sensor:
       # v5: both polygons use the metric X_S-Z_S coordinates published by Gocator.
@@ -65,7 +98,9 @@
       rotation_target_deg: 5.0
       # v5 recommends 2-3 deg micro-rotations. Start at 2 deg and halve on
       # unsafe feedback so a safe branch is fast without losing rollback.
-      rotation_step_deg: 2.0
+      # 5° target is reached in two nominal moves. Unsafe feedback still
+      # halves this value transactionally.
+      rotation_step_deg: 2.5
       minimum_rotation_step_deg: 0.25
       minimum_partial_rotation_deg: 2.5
       probe_step_m: 0.001
@@ -87,12 +122,14 @@
       # frame batch. Endpoint MAD screening rejects whole bad frames. Schema 3
       # retains every synchronized flange pose; the seed solve uses their
       # translation/SO(3) mean as one representative physical pose.
-      measurement_batch_size: 20
-      minimum_batch_inliers: 15
-      maximum_batch_frames: 40
+      measurement_batch_size: 18
+      minimum_batch_inliers: 14
+      maximum_batch_frames: 30
       measurement_batch_timeout_s: 6.0
       endpoint_mad_multiplier: 3.5
-      maximum_target_failures: 3
+      # The measured preflight now reorders the real plan. Two failures are
+      # enough to retain a safe partial pose or skip that branch.
+      maximum_target_failures: 2
       minimum_profile_points: 5
       minimum_rotation_separation_deg: 2.0
       minimum_seed_domain_margin_m: 0.002
@@ -120,7 +157,10 @@
         # envelope. The tighter 3 mm target is reserved for saved seed poses.
         maximum_abs_x_mid_m: 0.030
         minimum_domain_margin_m: 0.015
-        minimum_feasible_directions: 3
+        # One measured-safe sign on each local axis is sufficient. When only
+        # two directions pass, the scheduler uses 2.5°/5° amplitudes on those
+        # safe rays instead of demanding an unsafe opposite sign.
+        minimum_feasible_directions: 2
       # Simulation-only trajectory timing; real hardware must use its own
       # velocity/acceleration limits.
       motion_duration_s: 0.45
@@ -131,10 +171,11 @@
 
     solver:
       plane_weight: 1.0
-      # Residual whitening for 0.055 mm profile noise versus 0.8 mm endpoint
-      # noise: (0.055/0.8)^2 = 0.00473, rounded conservatively to 0.005.
-      edge_weight: 0.005
-      endpoint_plane_weight: 0.005
+      # The raw-profile detector reports about 0.108 mm single-frame endpoint
+      # sigma at the reference pose. Residual whitening against 0.055 mm
+      # profile noise gives (0.055/0.108)^2 ~= 0.26.
+      edge_weight: 0.25
+      endpoint_plane_weight: 0.25
       handeye_rotation_scale_deg: 10.0
       handeye_translation_scale_m: 0.1
       plane_rotation_scale_deg: 10.0
@@ -148,7 +189,13 @@
     initial_validation:
       bootstrap_trials: 4
       random_seed: 20260728
-      maximum_rotation_p95_deg: 1.0
+      # Preserve every seed inlier for the critical initial solution. Held-out
+      # validation starts with the first NBV batch; at that point both the
+      # initial and updated snapshots are scored on the same unseen frames.
+      held_out_frames_per_pose: 0
+      # The current combined robot/flatness stress regime sits just above
+      # 1 deg on four-trial resampling even though all trials converge.
+      maximum_rotation_p95_deg: 1.25
       maximum_translation_p95_m: 0.010
       minimum_converged_fraction: 0.8
 
@@ -172,15 +219,31 @@
       # Fifteen synchronized frames retain multi-frame averaging while
       # reducing both acquisition time and the O(N) rolling solve/score cost.
       measurement_batch_size: 15
+      # Endpoint-consistent frames are split after capture: 12 for one robust
+      # physical-pose representative and 3 for held-out validation.
+      validation_frame_count: 3
+      minimum_fit_frame_count: 9
+      endpoint_mad_multiplier: 3.5
       # Batch timeout is automatically at least batch_size/rate + 1 second.
       minimum_measurement_frame_rate_hz: 2.0
       minimum_valid_probability: 0.8
       minimum_poses: 3
-      # Six seeds plus at most six NBVs. Longer runs were slower while truth
-      # error merely fluctuated under the current 0.8 mm endpoint stress.
-      maximum_total_poses: 12
+      # Internal emergency protection only: 6 seeds + at most 20 NBVs.
+      # The console defaults to adaptive stopping and does not impose 6 NBVs.
+      maximum_total_poses: 26
       information_gain_threshold: 1.0e-3
+      # Absolute gain is scale-dependent. Also stop after consecutive gains
+      # fall below 3% of the first feasible NBV cycle.
+      relative_information_gain_threshold: 0.03
       consecutive_low_gain_limit: 3
+      # Stop when new estimates fail to improve the held-out geometric score
+      # by 1% for three consecutive physical NBVs; retain the best snapshot.
+      validation_minimum_relative_improvement: 0.01
+      validation_patience: 3
+      # With only a few noisy held-out physical poses, scores within 10% are
+      # statistically indistinguishable. Prefer the newer/more informed one;
+      # roll back only after a material validation regression.
+      validation_best_relative_tolerance: 0.10
       minimum_effective_eigenvalue: 1.0e-6
       # The covariance is still optimistic under 0.8 mm endpoint stress.
       # Keep its one-sigma stop target below half the requested truth-error

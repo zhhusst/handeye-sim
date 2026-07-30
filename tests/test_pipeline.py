@@ -3,7 +3,7 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
-from calibration_pipeline.geometry import so3_exp
+from calibration_pipeline.geometry import so3_exp, so3_log
 from calibration_pipeline.models import (
     FlangePose,
     Measurement,
@@ -225,3 +225,54 @@ def test_synchronized_nbv_batch_counts_as_one_physical_pose():
     assert pipeline.nbv_count == 1
     assert len(pipeline.poses) == 8
     assert "candidate_batch" in pipeline.failed_candidates
+
+
+def test_historical_best_uses_held_out_geometry_and_can_restore_initial():
+    scene = default_scene()
+    poses, measurements = generate_seed_dataset(scene, count=6)
+    pipeline = ActiveCalibrationPipeline(
+        scene.handeye_rotation,
+        scene.handeye_translation,
+        (scene.board.length_u, scene.board.length_v),
+        roi=scene.roi,
+        minimum_seed_poses=6,
+        maximum_update_rotation_deg=10.0,
+        maximum_update_translation_m=0.1,
+    )
+    for pose, measurement in zip(poses, measurements):
+        pipeline.append_seed(pose, measurement)
+        pipeline.append_validation_observation(pose, measurement)
+    initialized = pipeline.initialize()
+    initial_score = pipeline.current_validation_metrics.score_m
+
+    bad_rotation = initialized.estimate.handeye_rotation @ so3_exp(
+        np.deg2rad(np.array([2.0, 0.0, 0.0]))
+    )
+    bad_translation = (
+        initialized.estimate.handeye_translation
+        + np.array([0.002, -0.001, 0.001])
+    )
+    bad_x9 = initialized.estimate.x9.copy()
+    bad_x9[:3] = so3_log(bad_rotation)
+    bad_x9[3:6] = bad_translation
+    bad_estimate = replace(
+        initialized.estimate,
+        handeye_rotation=bad_rotation,
+        handeye_translation=bad_translation,
+        x9=bad_x9,
+    )
+
+    class FixedSolver:
+        def solve(self, *_args, **_kwargs):
+            return replace(initialized, estimate=bad_estimate)
+
+    pipeline.solver = FixedSolver()
+    pipeline.append_nbv(poses[0], measurements[0])
+
+    assert pipeline.current_validation_metrics.score_m > initial_score
+    assert pipeline.best_result_nbv_index == 0
+    restored = pipeline.restore_historical_best()
+    assert np.allclose(
+        restored.estimate.handeye_rotation,
+        initialized.estimate.handeye_rotation,
+    )

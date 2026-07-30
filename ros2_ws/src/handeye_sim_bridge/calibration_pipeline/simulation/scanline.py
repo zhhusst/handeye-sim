@@ -19,8 +19,9 @@ def compute_fov_plate_scanline(
     half_fov_deg=15.0,
     min_range=0.27,
     max_range=0.82,
-    n_sample=500,
+    n_sample=6401,
     half_span=0.8,
+    maximum_profile_points=980,
     fov_corners_S=None,
 ):
     """Compute the visible scan segment using the original GitHub algorithm."""
@@ -85,25 +86,53 @@ def compute_fov_plate_scanline(
                 return False
             return abs(x_coordinate) <= z_coordinate * tangent + 1e-6
 
+    if n_sample < 3:
+        raise ValueError("n_sample must be at least three")
+    if maximum_profile_points < 3:
+        raise ValueError("maximum_profile_points must be at least three")
+    # A dense, fixed parameter grid approximates the sampling columns of a
+    # profile scanner.  The previous 500-sample grid quantized board
+    # boundaries at about 3.2 mm over this span, which unrealistically
+    # dominated endpoint extraction.
     sample_parameters = np.linspace(-half_span, half_span, n_sample)
-    valid_indices = []
-    for index, parameter in enumerate(sample_parameters):
-        point_base = line_origin + parameter * line_direction
-        delta = point_base - corner
-        board_u = np.dot(delta, u)
-        board_v = np.dot(delta, v)
-        if (
-            board_u < -1e-6
-            or board_v < -1e-6
-            or board_u > width + 1e-6
-            or board_v > height + 1e-6
-        ):
-            continue
-        point_sensor = (
-            rotation_base_sensor @ point_base + translation_base_sensor
+    all_points_base = (
+        line_origin[None, :]
+        + sample_parameters[:, None] * line_direction[None, :]
+    )
+    delta = all_points_base - corner[None, :]
+    board_u_coordinate = delta @ u
+    board_v_coordinate = delta @ v
+    board_mask = (
+        (board_u_coordinate >= -1e-6)
+        & (board_v_coordinate >= -1e-6)
+        & (board_u_coordinate <= width + 1e-6)
+        & (board_v_coordinate <= height + 1e-6)
+    )
+    all_points_sensor = (
+        rotation_base_sensor @ all_points_base.T
+    ).T + translation_base_sensor
+    x_coordinate = all_points_sensor[:, 0]
+    z_coordinate = all_points_sensor[:, 2]
+    if fov_corners_S is not None and len(fov_corners_S) >= 4:
+        fraction = (z_coordinate - tip_z) / fov_range_z
+        left = tip_x + (left_base_x - tip_x) * fraction
+        right = tip_x + (right_base_x - tip_x) * fraction
+        fov_mask = (
+            (z_coordinate >= tip_z)
+            & (z_coordinate <= base_z)
+            & (x_coordinate >= left - 1e-6)
+            & (x_coordinate <= right + 1e-6)
         )
-        if in_fov(point_sensor[0], point_sensor[2]):
-            valid_indices.append(index)
+    else:
+        fov_mask = (
+            (z_coordinate >= min_range)
+            & (z_coordinate <= max_range)
+            & (
+                np.abs(x_coordinate)
+                <= z_coordinate * tangent + 1e-6
+            )
+        )
+    valid_indices = np.flatnonzero(board_mask & fov_mask).tolist()
 
     if len(valid_indices) < 3:
         return _empty_result(
@@ -121,22 +150,14 @@ def compute_fov_plate_scanline(
         segments, key=lambda segment: segment[1] - segment[0]
     )
 
-    scan_count = min(200, segment_end - segment_start + 1)
+    scan_count = min(
+        maximum_profile_points, segment_end - segment_start + 1
+    )
     sample_indices = np.linspace(
         segment_start, segment_end, scan_count, dtype=int
     )
-    points_base = np.array(
-        [
-            line_origin + sample_parameters[index] * line_direction
-            for index in sample_indices
-        ]
-    )
-    points_sensor = np.array(
-        [
-            rotation_base_sensor @ point + translation_base_sensor
-            for point in points_base
-        ]
-    )
+    points_base = all_points_base[sample_indices]
+    points_sensor = all_points_sensor[sample_indices]
 
     endpoints_base = []
     endpoints_sensor = []

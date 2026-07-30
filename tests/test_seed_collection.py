@@ -6,6 +6,7 @@ from calibration_pipeline.seed_collection import (
     EndpointTracker,
     adaptive_rotation_plan,
     assess_initial_pose,
+    preflight_guided_rotation_plan,
     TranslationServo,
     evaluate_bilateral_feature,
     local_preflight_is_acceptable,
@@ -157,6 +158,24 @@ def test_adaptive_plan_adds_signed_and_reordered_fallback_branches():
     stages = {target.stages for target in adaptive}
     assert ((0, 1), (1, -1)) in stages
     assert ((1, -1), (0, 1)) in stages
+
+
+def test_preflight_guided_plan_prioritizes_measured_safe_directions():
+    results = [
+        {"axis": 0, "sign": -1, "accepted": True},
+        {"axis": 0, "sign": 1, "accepted": False},
+        {"axis": 1, "sign": 1, "accepted": True},
+    ]
+    plan = preflight_guided_rotation_plan(results)
+    assert plan[0].stages == ((0, -1),)
+    assert plan[1].stages == ((1, 1),)
+    assert plan[0].angle_scale == 1.0
+    assert plan[1].angle_scale == 1.0
+    assert plan[2].stages == ((0, -1),)
+    assert plan[2].angle_scale == 0.5
+    assert plan[4].stages == ((0, -1), (1, 1))
+    assert plan[4].angle_scale == 1.0
+    assert ((0, 1),) in {target.stages for target in plan}
 
 
 def test_partial_seed_requires_centering_and_margin():
