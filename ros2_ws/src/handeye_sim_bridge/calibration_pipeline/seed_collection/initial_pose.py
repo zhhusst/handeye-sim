@@ -128,7 +128,7 @@ def seed_feature_is_acceptable(
 def local_preflight_is_acceptable(
     direction_results: list[dict],
     *,
-    minimum_feasible_directions: int = 3,
+    minimum_feasible_directions: int = 2,
 ) -> bool:
     """Require measured safe reserve in enough signed X/Y neighborhoods."""
     accepted = [item for item in direction_results if item["accepted"]]
@@ -136,3 +136,41 @@ def local_preflight_is_acceptable(
     return bool(
         len(accepted) >= minimum_feasible_directions and axes == {0, 1}
     )
+
+
+def dynamic_preflight_decision(
+    mode: str,
+    assessment: InitialPoseAssessment,
+    *,
+    auto_skip_maximum_abs_x_mid_m: float,
+    auto_skip_minimum_domain_margin_m: float,
+) -> tuple[bool, str]:
+    """Decide whether the optional measured preflight should run.
+
+    ``auto`` skips the four standalone trial motions only when the static
+    observation has ample image-domain reserve and all four local IK probes
+    are feasible.  This decision never disables the bilateral checks and
+    rollback used during the real seed motions.
+    """
+    normalized_mode = str(mode).strip().lower()
+    if normalized_mode not in {"auto", "always", "off"}:
+        raise ValueError("preflight mode must be auto, always or off")
+    if auto_skip_maximum_abs_x_mid_m < 0.0:
+        raise ValueError("auto preflight x-mid threshold must be non-negative")
+    if auto_skip_minimum_domain_margin_m < 0.0:
+        raise ValueError("auto preflight margin threshold must be non-negative")
+    if normalized_mode == "always":
+        return True, "configured_always"
+    if normalized_mode == "off":
+        return False, "configured_off"
+
+    reasons: list[str] = []
+    if abs(assessment.x_mid_m) > auto_skip_maximum_abs_x_mid_m:
+        reasons.append("x_mid_not_centered")
+    if assessment.domain_margin_m < auto_skip_minimum_domain_margin_m:
+        reasons.append("domain_margin_not_wide")
+    if assessment.local_ik_directions < 4:
+        reasons.append("local_ik_not_four_of_four")
+    if reasons:
+        return True, ",".join(reasons)
+    return False, "static_reserve_sufficient"

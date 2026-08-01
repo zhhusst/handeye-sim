@@ -122,17 +122,8 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("nbv.endpoint_mad_multiplier", 3.5)
         self.declare_parameter("nbv.minimum_poses", 3)
         self.declare_parameter("nbv.maximum_total_poses", 20)
-        self.declare_parameter("nbv.information_gain_threshold", 1e-3)
-        self.declare_parameter("nbv.relative_information_gain_threshold", 0.03)
+        self.declare_parameter("nbv.relative_information_gain_threshold", 0.05)
         self.declare_parameter("nbv.consecutive_low_gain_limit", 3)
-        self.declare_parameter(
-            "nbv.validation_minimum_relative_improvement", 0.01
-        )
-        self.declare_parameter("nbv.validation_patience", 3)
-        self.declare_parameter("nbv.validation_best_relative_tolerance", 0.10)
-        self.declare_parameter("nbv.minimum_effective_eigenvalue", 1e-6)
-        self.declare_parameter("nbv.maximum_rotation_std_deg", 0.025)
-        self.declare_parameter("nbv.maximum_translation_std_m", 0.00005)
         self.declare_parameter("nbv.maximum_update_rotation_deg", 5.0)
         self.declare_parameter("nbv.maximum_update_translation_m", 0.05)
         self.declare_parameter("nbv.maximum_board_rotation_deg", 10.0)
@@ -261,9 +252,6 @@ class ActiveCalibrationSimNode(Node):
             maximum_total_poses=int(
                 self.get_parameter("nbv.maximum_total_poses").value
             ),
-            information_gain_threshold=float(
-                self.get_parameter("nbv.information_gain_threshold").value
-            ),
             relative_information_gain_threshold=float(
                 self.get_parameter(
                     "nbv.relative_information_gain_threshold"
@@ -272,28 +260,6 @@ class ActiveCalibrationSimNode(Node):
             consecutive_low_gain_limit=int(
                 self.get_parameter("nbv.consecutive_low_gain_limit").value
             ),
-            minimum_effective_eigenvalue=float(
-                self.get_parameter("nbv.minimum_effective_eigenvalue").value
-            ),
-            maximum_rotation_std_deg=float(
-                self.get_parameter("nbv.maximum_rotation_std_deg").value
-            ),
-            maximum_translation_std_m=float(
-                self.get_parameter("nbv.maximum_translation_std_m").value
-            ),
-        )
-        self.validation_minimum_relative_improvement = float(
-            self.get_parameter(
-                "nbv.validation_minimum_relative_improvement"
-            ).value
-        )
-        self.validation_patience = int(
-            self.get_parameter("nbv.validation_patience").value
-        )
-        self.validation_best_relative_tolerance = float(
-            self.get_parameter(
-                "nbv.validation_best_relative_tolerance"
-            ).value
         )
         self.settling_time = float(self.get_parameter("settling_time_s").value)
         self.measurement_timeout_ns = int(
@@ -767,13 +733,6 @@ class ActiveCalibrationSimNode(Node):
                     if initial_board_limit <= 0.0
                     else initial_board_limit
                 ),
-                validation_minimum_relative_improvement=(
-                    self.validation_minimum_relative_improvement
-                ),
-                validation_patience=self.validation_patience,
-                validation_best_relative_tolerance=(
-                    self.validation_best_relative_tolerance
-                ),
             )
             held_out_frames = int(
                 self.get_parameter(
@@ -920,13 +879,14 @@ class ActiveCalibrationSimNode(Node):
             f"candidate cascade: scored={len(self.ranked)}, "
             f"prefilter_rejections={self.rejection_counts}"
         )
-        if self.pipeline.nbv_count:
-            stop, reason = self.pipeline.check_stop(self.ranked)
-            if stop:
-                self.stop_reason = reason
-                self.get_logger().info(f"adaptive stop: {reason}")
-                self._finish()
-                return
+        # Observe the first feasible pre-NBV gain as the relative reference.
+        # The minimum-NBV guard prevents this initial call from stopping.
+        stop, reason = self.pipeline.check_stop(self.ranked)
+        if stop:
+            self.stop_reason = reason
+            self.get_logger().info(f"adaptive stop: {reason}")
+            self._finish()
+            return
         if not self.ranked:
             self._no_more_feasible_candidates(
                 "no local robust information-bearing candidate after "
@@ -1295,13 +1255,11 @@ class ActiveCalibrationSimNode(Node):
 
     def _finish(self) -> None:
         assert self.pipeline is not None and self.pipeline.result is not None
-        self.pipeline.restore_historical_best()
         self._write_result("DONE")
         self.state = "DONE"
         self.get_logger().info(
-            "simulation calibration complete; selected held-out historical "
-            f"best at NBV {self.pipeline.best_result_nbv_index} -> "
-            f"{self.output_file}"
+            "simulation calibration complete; retained latest committed "
+            f"estimate at NBV {self.pipeline.nbv_count} -> {self.output_file}"
         )
 
     def _record_iteration(self, phase: str, result, score=None) -> None:
@@ -1385,11 +1343,7 @@ class ActiveCalibrationSimNode(Node):
                 else 1000.0
                 * self.pipeline.current_validation_metrics.score_m
             ),
-            "historical_best_nbv_index": (
-                0
-                if self.pipeline is None
-                else self.pipeline.best_result_nbv_index
-            ),
+            "result_selection": "latest_committed",
         }
         self.iteration_history.append(record)
         self.last_result_summary = (
@@ -1430,25 +1384,15 @@ class ActiveCalibrationSimNode(Node):
                     )
                 ),
                 "stop_reason": self.stop_reason,
-                "selected_historical_best_nbv_index": (
-                    self.pipeline.best_result_nbv_index
-                ),
+                "result_selection": "latest_committed",
                 "held_out_validation": {
+                    "diagnostic_only": True,
                     "pose_count": len(self.pipeline.validation_poses),
                     "current_score_mm": (
                         None
                         if self.pipeline.current_validation_metrics is None
                         else 1000.0
                         * self.pipeline.current_validation_metrics.score_m
-                    ),
-                    "best_score_mm": (
-                        None
-                        if self.pipeline.best_validation_metrics is None
-                        else 1000.0
-                        * self.pipeline.best_validation_metrics.score_m
-                    ),
-                    "no_improvement_count": (
-                        self.pipeline.validation_no_improvement_count
                     ),
                 },
                 "iterations": self.iteration_history,

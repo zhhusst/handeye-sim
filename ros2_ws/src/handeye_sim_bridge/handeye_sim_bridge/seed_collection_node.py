@@ -34,6 +34,7 @@ from calibration_pipeline.seed_collection import (
     TranslationServo,
     adaptive_rotation_plan,
     assess_initial_pose,
+    dynamic_preflight_decision,
     evaluate_bilateral_feature,
     local_preflight_is_acceptable,
     preflight_guided_rotation_plan,
@@ -105,10 +106,17 @@ class SeedCollectionNode(Node):
         self.declare_parameter("seed.initial.minimum_local_ik_directions", 3)
         self.declare_parameter("seed.initial.local_ik_test_step_deg", 2.0)
         self.declare_parameter("seed.initial.maximum_local_joint_step_deg", 20.0)
+        self.declare_parameter("seed.preflight.mode", "auto")
         self.declare_parameter("seed.preflight.rotation_deg", 2.0)
         self.declare_parameter("seed.preflight.maximum_abs_x_mid_m", 0.030)
         self.declare_parameter("seed.preflight.minimum_domain_margin_m", 0.015)
-        self.declare_parameter("seed.preflight.minimum_feasible_directions", 3)
+        self.declare_parameter("seed.preflight.minimum_feasible_directions", 2)
+        self.declare_parameter(
+            "seed.preflight.auto_skip_maximum_abs_x_mid_m", 0.015
+        )
+        self.declare_parameter(
+            "seed.preflight.auto_skip_minimum_domain_margin_m", 0.030
+        )
         self.declare_parameter("seed.motion_duration_s", 0.65)
         self.declare_parameter("seed.motion_timeout_s", 4.0)
         self.declare_parameter("settling_time_s", 0.3)
@@ -285,6 +293,11 @@ class SeedCollectionNode(Node):
                 ).value
             )
         )
+        self.preflight_mode = str(
+            self.get_parameter("seed.preflight.mode").value
+        ).strip().lower()
+        if self.preflight_mode not in {"auto", "always", "off"}:
+            raise ValueError("seed.preflight.mode must be auto, always or off")
         self.preflight_rotation = np.deg2rad(
             float(self.get_parameter("seed.preflight.rotation_deg").value)
         )
@@ -301,6 +314,16 @@ class SeedCollectionNode(Node):
         self.preflight_minimum_directions = int(
             self.get_parameter(
                 "seed.preflight.minimum_feasible_directions"
+            ).value
+        )
+        self.preflight_auto_skip_maximum_abs_x_mid = float(
+            self.get_parameter(
+                "seed.preflight.auto_skip_maximum_abs_x_mid_m"
+            ).value
+        )
+        self.preflight_auto_skip_minimum_margin = float(
+            self.get_parameter(
+                "seed.preflight.auto_skip_minimum_domain_margin_m"
             ).value
         )
         self.settling_time = float(self.get_parameter("settling_time_s").value)
@@ -399,6 +422,14 @@ class SeedCollectionNode(Node):
         self.collection_phase = "INITIAL"
         self.preflight_index = 0
         self.preflight_results: list[dict] = []
+        self.preflight_was_required: bool | None = (
+            False if self.collection_mode == "manual" else None
+        )
+        self.preflight_decision_reason = (
+            "manual_collection"
+            if self.collection_mode == "manual"
+            else "pending_static_assessment"
+        )
         self.initial_assessment_cache = None
         self.initial_assessment_cache_wall_ns = 0
         self.initial_assessment_period_ns = int(0.5e9)
@@ -427,7 +458,8 @@ class SeedCollectionNode(Node):
         self.servo_iterations = 0
         self.get_logger().info(
             "waiting for one manually positioned, stable bilateral profile; "
-            f"mode={self.collection_mode}; call ~/start when ready"
+            f"mode={self.collection_mode}; preflight={self.preflight_mode}; "
+            "call ~/start when ready"
         )
 
     def _joint_callback(self, message: JointState) -> None:
@@ -661,6 +693,7 @@ class SeedCollectionNode(Node):
     def _status_callback(self, _request, response):
         response.success = self.state != "FAILED"
         feature = self._feature()
+        assessment = None
         if feature is None:
             observation = "MISSING"
             feature_details = (
@@ -701,6 +734,17 @@ class SeedCollectionNode(Node):
                 f"initial_ready={str(initial_ready).lower()}; "
                 f"initial_reasons={initial_reasons}"
             )
+        preflight_required = self.preflight_was_required
+        preflight_reason = self.preflight_decision_reason
+        if preflight_required is None and assessment is not None:
+            preflight_required, preflight_reason = (
+                self._dynamic_preflight_decision(assessment)
+            )
+        preflight_required_text = (
+            "unknown"
+            if preflight_required is None
+            else str(preflight_required).lower()
+        )
         stable = (
             self.latest_joints is not None
             and self.latest_joint_speed <= self.manual_max_joint_speed
@@ -744,6 +788,9 @@ class SeedCollectionNode(Node):
         response.message = (
             f"state={self.state}; mode={self.collection_mode}; "
             f"phase={self.collection_phase}; "
+            f"preflight_mode={self.preflight_mode}; "
+            f"preflight_required={preflight_required_text}; "
+            f"preflight_reason={preflight_reason}; "
             f"seeds={len(self.records)}/{self.target_count}; "
             f"target={target_name}; target_index={self.target_index}/{len(self.plan)}; "
             f"preflight={sum(item['accepted'] for item in self.preflight_results)}/"
@@ -844,6 +891,20 @@ class SeedCollectionNode(Node):
         )
         self.initial_assessment_cache_wall_ns = now_wall_ns
         return self.initial_assessment_cache
+
+    def _dynamic_preflight_decision(self, assessment) -> tuple[bool, str]:
+        if self.collection_mode == "manual":
+            return False, "manual_collection"
+        return dynamic_preflight_decision(
+            self.preflight_mode,
+            assessment,
+            auto_skip_maximum_abs_x_mid_m=(
+                self.preflight_auto_skip_maximum_abs_x_mid
+            ),
+            auto_skip_minimum_domain_margin_m=(
+                self.preflight_auto_skip_minimum_margin
+            ),
+        )
 
     def _command_transform(self, transform: np.ndarray, after_settle: str) -> bool:
         if self.latest_joints is None:
@@ -1000,14 +1061,33 @@ class SeedCollectionNode(Node):
         self.reference_feature = feature
         self.last_valid_joints = self.latest_joints.copy()
         self._remember_last_valid(feature)
-        self.collection_phase = "PREFLIGHT"
         self.preflight_index = 0
         self.preflight_results = []
+        (
+            self.preflight_was_required,
+            self.preflight_decision_reason,
+        ) = self._dynamic_preflight_decision(assessment)
+        if self.preflight_was_required:
+            self.collection_phase = "PREFLIGHT"
+            self.get_logger().info(
+                "static initial envelope accepted; starting measured local "
+                "+/-X/+/-Y preflight; "
+                f"mode={self.preflight_mode}; "
+                f"reason={self.preflight_decision_reason}"
+            )
+            self._return_reference()
+            return
+
+        self.collection_phase = "REFERENCE"
+        self.plan = adaptive_rotation_plan()
         self.get_logger().info(
-            "static initial envelope accepted; starting measured local "
-            "+/-X/+/-Y preflight"
+            "static initial envelope accepted; standalone dynamic preflight "
+            f"skipped; mode={self.preflight_mode}; "
+            f"reason={self.preflight_decision_reason}; real seed motions "
+            "retain bilateral validation and rollback"
         )
-        self._return_reference()
+        if not self._begin_seed_capture("reference", "REFERENCE"):
+            self._fail("reference multi-frame capture could not start")
 
     def _return_reference(self) -> None:
         if self.reference_joints is None:
@@ -1650,6 +1730,15 @@ class SeedCollectionNode(Node):
                 {
                     "schema_version": 3,
                     "collection_mode": self.collection_mode,
+                    "dynamic_preflight": {
+                        "mode": self.preflight_mode,
+                        "executed": bool(self.preflight_was_required),
+                        "decision_reason": self.preflight_decision_reason,
+                        "minimum_feasible_directions": (
+                            self.preflight_minimum_directions
+                        ),
+                        "results": self.preflight_results,
+                    },
                     "physical_seed_count": len(self.records),
                     "observation_count": sum(
                         len(record.get("frames", []))

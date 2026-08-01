@@ -419,14 +419,19 @@ class CalibrationConsole:
         seed_file = run_directory / "seeds.json"
         result_file = run_directory / "calibration_result.json"
         print(f"\n本次运行目录：{run_directory}")
-        seed_node = self._start_seed_node(mode, seed_file, run_directory)
+        preflight_mode = (
+            ask_preflight_mode() if mode == "automatic" else "off"
+        )
+        seed_node = self._start_seed_node(
+            mode, seed_file, run_directory, preflight_mode
+        )
         try:
             if not wait_for_service(
                 "/bilateral_seed_collection/status", seed_node
             ):
                 self._node_start_failure(seed_node)
                 return
-            status = self._confirm_initial_pose()
+            status = self._confirm_initial_pose(mode, preflight_mode)
             if status is None:
                 return
             if mode == "automatic":
@@ -472,7 +477,11 @@ class CalibrationConsole:
         self._run_active(seed_file, result_file, run_directory, maximum_nbv)
 
     def _start_seed_node(
-        self, mode: str, seed_file: Path, run_directory: Path
+        self,
+        mode: str,
+        seed_file: Path,
+        run_directory: Path,
+        preflight_mode: str,
     ) -> ManagedNode:
         command = [
             "ros2",
@@ -486,10 +495,13 @@ class CalibrationConsole:
             f"collection_mode:={mode}",
             "-p",
             f"output_file:={seed_file}",
+            "-p",
+            f"seed.preflight.mode:='{preflight_mode}'",
         ]
         print(
             "\n[种子节点] "
             + ("自动采集模式" if mode == "automatic" else "人工采集模式")
+            + f"；动态预检={preflight_mode}"
         )
         return self._start_node(
             "种子采集节点", command, run_directory / "seed_collection.log"
@@ -501,7 +513,9 @@ class CalibrationConsole:
         success, message = call_trigger(service, timeout=timeout)
         return success, parse_key_values(message), message
 
-    def _confirm_initial_pose(self) -> dict[str, str] | None:
+    def _confirm_initial_pose(
+        self, collection_mode: str, preflight_mode: str
+    ) -> dict[str, str] | None:
         print(
             "\n请在 RViz 中设置初始位姿，使线激光同时稳定看到角点的两条物理边，"
             "并满足下方初始工作包络。"
@@ -530,10 +544,23 @@ class CalibrationConsole:
                 and fields.get("stable") == "true"
                 and fields.get("initial_ready") == "true"
             ):
-                print(
-                    "初始位姿静态检查通过。系统接下来会实际执行局部"
-                    " ±X/±Y 各 2° 的动态预检。"
-                )
+                if collection_mode == "manual":
+                    print("初始位姿静态检查通过。人工种子模式不执行动态预检。")
+                elif fields.get("preflight_required") == "true":
+                    print(
+                        "初始位姿静态检查通过。当前模式将执行局部"
+                        " ±X/±Y 各 2° 的动态预检。"
+                    )
+                elif preflight_mode == "auto":
+                    print(
+                        "初始位姿静态余量充分，auto 模式将跳过独立动态预检；"
+                        "正式种子运动仍逐步检查双边并支持回退。"
+                    )
+                else:
+                    print(
+                        "初始位姿静态检查通过。已选择跳过独立动态预检；"
+                        "正式种子运动仍逐步检查双边并支持回退。"
+                    )
                 return fields
             print("当前位姿还不满足初始工作包络，请按提示调整后再确认。")
 
@@ -617,13 +644,20 @@ class CalibrationConsole:
             rotation = fields.get("rotation_deg", "?")
             target_failures = fields.get("target_failures", "0/3")
             preflight = fields.get("preflight", "0/4")
+            preflight_mode = fields.get("preflight_mode", "?")
+            if fields.get("preflight_required") == "false":
+                preflight_text = f"已跳过({preflight_mode})"
+            elif fields.get("phase") == "PREFLIGHT":
+                preflight_text = f"进行中({preflight_mode}) {preflight}"
+            else:
+                preflight_text = f"已执行({preflight_mode}) {preflight}"
             seed_batch = fields.get("seed_batch", "0/?")
             elapsed = time.monotonic() - started_at
             line = (
                 f"[自动种子] {progress_bar(count, 6)} {count_text} | "
                 f"{target_cn} | {state_cn} | 旋转 {rotation}° | "
                 f"定点帧 {seed_batch} | "
-                f"预检 {preflight} | 本目标失败 {target_failures} | "
+                f"预检 {preflight_text} | 本目标失败 {target_failures} | "
                 f"已用 {elapsed:.0f}s"
             )
             print("\r" + line.ljust(150), end="", flush=True)
@@ -957,10 +991,8 @@ class CalibrationConsole:
             )
             if validation_score is not None:
                 print(
-                    "  │ 留出帧几何验证（不使用真值）："
-                    f"{float(validation_score):.4f} mm；"
-                    "当前历史候选 "
-                    f"NBV {record.get('historical_best_nbv_index', '?')}"
+                    "  │ 留出帧几何诊断（不参与停止或回滚）："
+                    f"{float(validation_score):.4f} mm"
                 )
             stability = record.get("initial_stability")
             if phase == "initial" and isinstance(stability, dict):
@@ -1039,15 +1071,11 @@ class CalibrationConsole:
             f"停止原因：{simulation.get('stop_reason') or '正常完成'}"
         )
         held_out = simulation.get("held_out_validation", {})
-        selected_index = simulation.get(
-            "selected_historical_best_nbv_index"
-        )
-        if selected_index is not None:
+        if simulation.get("result_selection") == "latest_committed":
             print(
-                "  历史结果保留：最终选用 NBV "
-                f"{selected_index} 的快照；"
-                "留出帧分数 "
-                f"{float(held_out.get('best_score_mm', float('nan'))):.4f} mm"
+                "  结果选择：保留最后一次通过双边验证的滚动解；"
+                "留出帧仅诊断 "
+                f"{float(held_out.get('current_score_mm', float('nan'))):.4f} mm"
             )
 
     def show_latest_result(self) -> None:
@@ -1125,6 +1153,29 @@ def ask_yes_no(prompt: str, *, default: bool) -> bool:
         if value in {"n", "no", "否", "取消"}:
             return False
         print("请输入 y 或 n。")
+
+
+def ask_preflight_mode() -> str:
+    print("\n动态实测预检（可选工程增强）：")
+    print("  1. auto：静态余量不足时自动执行（推荐）")
+    print("  2. always：每次都执行，较保守但更耗时")
+    print("  3. off：跳过独立预检，正式种子仍实时检查和回退")
+    while True:
+        try:
+            value = input("选择 [1]：").strip().lower() or "1"
+        except EOFError:
+            return "auto"
+        aliases = {
+            "1": "auto",
+            "auto": "auto",
+            "2": "always",
+            "always": "always",
+            "3": "off",
+            "off": "off",
+        }
+        if value in aliases:
+            return aliases[value]
+        print("请输入 1、2 或 3。")
 
 
 def ask_integer(

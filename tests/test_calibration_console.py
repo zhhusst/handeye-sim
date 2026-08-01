@@ -55,3 +55,14 @@ def test_disabled_direct_endpoint_noise_is_not_reported_as_active_stress():
     }
 
     assert CONSOLE.noise_regime_exceedances(noise) == []
+
+
+def test_preflight_mode_prompt_supports_all_three_modes(monkeypatch):
+    for entered, expected in (
+        ("", "auto"),
+        ("auto", "auto"),
+        ("2", "always"),
+        ("off", "off"),
+    ):
+        monkeypatch.setattr("builtins.input", lambda _prompt, value=entered: value)
+        assert CONSOLE.ask_preflight_mode() == expected

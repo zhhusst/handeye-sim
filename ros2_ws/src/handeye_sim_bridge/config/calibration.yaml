@@ -73,7 +73,6 @@
       maximum_residual_rms_m: 0.0015
       endpoint_extension_fraction: 0.5
       candidate_ambiguity_ratio: 0.03
-      maximum_fit_iterations: 4
       identity_ambiguity_ratio: 0.05
       # At the repository's reference pose, acquisition-order point 0 lies on
       # physical edge e2. A real setup must determine this once during setup;
@@ -147,20 +146,30 @@
         minimum_absolute_endpoint_depth_delta_m: 0.015
         minimum_normalized_joint_margin: 0.05
         # Three of four signed directions necessarily cover both local axes;
-        # the following measured preflight remains the final admission test.
+        # optional measured preflight can add a stronger admission test.
         minimum_local_ik_directions: 3
         local_ik_test_step_deg: 2.0
         maximum_local_joint_step_deg: 20.0
       preflight:
+        # Optional engineering safeguard, not part of the hand-eye model:
+        # auto = run only when the static observation has limited reserve;
+        # always = always execute the four standalone 2 deg trial motions;
+        # off = skip standalone trials (real seed motions still validate and
+        #       roll back every bilateral observation).
+        mode: "auto"
         rotation_deg: 2.0
         # Preflight proves that a signed direction stays inside the usable
-        # envelope. The tighter 3 mm target is reserved for saved seed poses.
+        # envelope. The tighter 10 mm target is reserved for saved seed poses.
         maximum_abs_x_mid_m: 0.030
         minimum_domain_margin_m: 0.015
         # One measured-safe sign on each local axis is sufficient. When only
         # two directions pass, the scheduler uses 2.5°/5° amplitudes on those
         # safe rays instead of demanding an unsafe opposite sign.
         minimum_feasible_directions: 2
+        # In auto mode, standalone preflight is skipped only if both measured
+        # limits are satisfied and local +/-X/+/-Y IK coverage is 4/4.
+        auto_skip_maximum_abs_x_mid_m: 0.015
+        auto_skip_minimum_domain_margin_m: 0.030
       # Simulation-only trajectory timing; real hardware must use its own
       # velocity/acceleration limits.
       motion_duration_s: 0.45
@@ -231,25 +240,11 @@
       # Internal emergency protection only: 6 seeds + at most 20 NBVs.
       # The console defaults to adaptive stopping and does not impose 6 NBVs.
       maximum_total_poses: 26
-      information_gain_threshold: 1.0e-3
-      # Absolute gain is scale-dependent. Also stop after consecutive gains
-      # fall below 3% of the first feasible NBV cycle.
-      relative_information_gain_threshold: 0.03
+      # Stop after consecutive gains fall below 5% of the first feasible NBV
+      # cycle. Covariance and held-out scores are diagnostic-only because their
+      # historical coverage/correlation did not support control authority.
+      relative_information_gain_threshold: 0.05
       consecutive_low_gain_limit: 3
-      # Stop when new estimates fail to improve the held-out geometric score
-      # by 1% for three consecutive physical NBVs; retain the best snapshot.
-      validation_minimum_relative_improvement: 0.01
-      validation_patience: 3
-      # With only a few noisy held-out physical poses, scores within 10% are
-      # statistically indistinguishable. Prefer the newer/more informed one;
-      # roll back only after a material validation regression.
-      validation_best_relative_tolerance: 0.10
-      minimum_effective_eigenvalue: 1.0e-6
-      # The covariance is still optimistic under 0.8 mm endpoint stress.
-      # Keep its one-sigma stop target below half the requested truth-error
-      # target; the six-NBV protection limit bounds runtime independently.
-      maximum_rotation_std_deg: 0.025
-      maximum_translation_std_m: 0.00005
       # Transactional update guards. The first accepted NBV is a correction
       # of the noisy six-seed estimate, so its negative values below mean:
       # automatically use at least the declared Phase-0a hand-eye uncertainty.

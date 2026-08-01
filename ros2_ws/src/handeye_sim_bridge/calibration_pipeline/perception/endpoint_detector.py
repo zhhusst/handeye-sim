@@ -25,7 +25,7 @@ class EndpointDetectionConfig:
     maximum_residual_rms_m: float = 0.0015
     endpoint_extension_fraction: float = 0.5
     candidate_ambiguity_ratio: float = 0.03
-    maximum_fit_iterations: int = 4
+    maximum_fit_iterations: int = 1
 
     def __post_init__(self) -> None:
         if self.minimum_points < 2:

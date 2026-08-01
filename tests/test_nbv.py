@@ -157,70 +157,60 @@ def test_virtual_information_matches_configured_measurement_batch():
     assert five[0].information_gain > one[0].information_gain
 
 
-def test_stop_policy_accepts_physical_covariance_target_without_low_gain():
+def test_stop_policy_does_not_stop_while_relative_gain_remains_high():
     policy = StopPolicy(
         minimum_nbv_poses=1,
         consecutive_low_gain_limit=3,
-        information_gain_threshold=1e-6,
-        minimum_effective_eigenvalue=1e-8,
     )
-    stop, _ = policy.evaluate(
-        total_poses=7,
-        nbv_poses=1,
-        effective_rank=6,
-        best_information_gain=10.0,
-        minimum_effective_eigenvalue=1.0,
-        handeye_covariance=None,
-    )
-    assert not stop
     stop, reason = policy.evaluate(
         total_poses=7,
         nbv_poses=1,
         effective_rank=6,
         best_information_gain=10.0,
-        minimum_effective_eigenvalue=1.0,
-        handeye_covariance=np.diag(
-            [np.deg2rad(0.01) ** 2] * 3 + [1e-4**2] * 3
-        ),
     )
-    assert stop
-    assert reason == "hand-eye uncertainty target reached"
+    assert not stop
+    assert reason == "continue"
 
 
-def test_stop_policy_accepts_saturated_gain_without_covariance_target():
+def test_stop_policy_accepts_consecutive_relative_gain_saturation():
     policy = StopPolicy(
         minimum_nbv_poses=1,
         consecutive_low_gain_limit=2,
-        information_gain_threshold=1.0,
-        minimum_effective_eigenvalue=1e-8,
+    )
+    policy.evaluate(
+        total_poses=7,
+        nbv_poses=1,
+        effective_rank=6,
+        best_information_gain=10.0,
     )
     for _ in range(2):
         stop, reason = policy.evaluate(
             total_poses=7,
             nbv_poses=1,
             effective_rank=6,
-            best_information_gain=0.0,
-            minimum_effective_eigenvalue=1.0,
-            handeye_covariance=None,
+            best_information_gain=0.1,
         )
     assert stop
     assert reason == "information gain saturated"
 
 
-def test_stop_policy_accepts_truth_independent_validation_plateau():
+def test_stop_policy_keeps_minimum_pose_and_observability_guards():
     policy = StopPolicy(
         minimum_nbv_poses=3,
         maximum_total_poses=20,
-        minimum_effective_eigenvalue=1e-8,
+        consecutive_low_gain_limit=1,
+    )
+    policy.evaluate(
+        total_poses=7,
+        nbv_poses=1,
+        effective_rank=6,
+        best_information_gain=10.0,
     )
     stop, reason = policy.evaluate(
-        total_poses=9,
-        nbv_poses=3,
-        effective_rank=6,
-        best_information_gain=1.0,
-        minimum_effective_eigenvalue=1.0,
-        handeye_covariance=None,
-        validation_plateaued=True,
+        total_poses=8,
+        nbv_poses=2,
+        effective_rank=5,
+        best_information_gain=0.1,
     )
-    assert stop
-    assert reason == "held-out validation score plateaued"
+    assert not stop
+    assert reason == "continue"

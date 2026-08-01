@@ -6,6 +6,7 @@ from calibration_pipeline.seed_collection import (
     EndpointTracker,
     adaptive_rotation_plan,
     assess_initial_pose,
+    dynamic_preflight_decision,
     preflight_guided_rotation_plan,
     TranslationServo,
     evaluate_bilateral_feature,
@@ -203,7 +204,7 @@ def test_partial_seed_requires_centering_and_margin():
     )
 
 
-def test_dynamic_preflight_requires_three_directions_spanning_both_axes():
+def test_dynamic_preflight_requires_two_directions_spanning_both_axes():
     results = [
         {"axis": 0, "accepted": True},
         {"axis": 0, "accepted": True},
@@ -213,3 +214,65 @@ def test_dynamic_preflight_requires_three_directions_spanning_both_axes():
     assert local_preflight_is_acceptable(results)
     results[2]["accepted"] = False
     assert not local_preflight_is_acceptable(results)
+
+
+def test_optional_preflight_modes_and_auto_static_reserve_decision():
+    limits = np.deg2rad(
+        np.array(
+            [
+                [-185, 185],
+                [-100, 160],
+                [-90, 220],
+                [-200, 200],
+                [-180, 180],
+                [-450, 450],
+            ]
+        )
+    )
+    joints = np.zeros(6)
+    ample = assess_initial_pose(
+        _feature(
+            x_mid=0.005,
+            z_mid=0.40,
+            margin=0.040,
+            depth_delta=0.050,
+        ),
+        joints,
+        limits,
+        local_ik_directions=4,
+    )
+    limited = assess_initial_pose(
+        _feature(
+            x_mid=0.020,
+            z_mid=0.40,
+            margin=0.025,
+            depth_delta=0.050,
+        ),
+        joints,
+        limits,
+        local_ik_directions=3,
+    )
+    thresholds = {
+        "auto_skip_maximum_abs_x_mid_m": 0.015,
+        "auto_skip_minimum_domain_margin_m": 0.030,
+    }
+
+    assert dynamic_preflight_decision("always", ample, **thresholds) == (
+        True,
+        "configured_always",
+    )
+    assert dynamic_preflight_decision("off", limited, **thresholds) == (
+        False,
+        "configured_off",
+    )
+    assert dynamic_preflight_decision("auto", ample, **thresholds) == (
+        False,
+        "static_reserve_sufficient",
+    )
+    required, reason = dynamic_preflight_decision(
+        "auto", limited, **thresholds
+    )
+    assert required
+    assert reason == (
+        "x_mid_not_centered,domain_margin_not_wide,local_ik_not_four_of_four"
+    )

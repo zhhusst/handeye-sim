@@ -7,7 +7,7 @@ V5保留为历史推导，V6以当前代码实际行为为准。
 |---|---|---|
 | Phase 0a 粗手眼初值 | `calibration_pipeline.cli`、仿真配置 | 已实现扰动入口；实机值由上层提供 |
 | Phase 0b 星形旋转计划 | `seed_collection/rotation_scheduler.py` | 已实现 |
-| 初始位姿静态包络与四方向动态预检 | `seed_collection/initial_pose.py`、`seed_collection_node.py` | 已实现；63组离线仿真样本验证 |
+| 初始位姿静态包络与可选四方向动态预检 | `seed_collection/initial_pose.py`、`seed_collection_node.py` | 已实现`auto/always/off`三模式；旧63组离线样本仅提供筛选证据，独立模块有效性仍需A/B验证 |
 | 异号/换序候补种子分支 | `seed_collection/rotation_scheduler.py` | 已实现；达到6帧即停止 |
 | 双边特征与非对称梯形安全域 | `models.py`、`seed_collection/features.py` | 已实现 |
 | 端点连续身份 | `seed_collection/endpoint_tracker.py` | 已实现；仿真优先使用场景发布的物理标签 |

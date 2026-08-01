@@ -95,9 +95,6 @@ class ProfileEndpointDetectorNode(Node):
             "endpoint_detection.candidate_ambiguity_ratio", 0.03
         )
         self.declare_parameter(
-            "endpoint_detection.maximum_fit_iterations", 4
-        )
-        self.declare_parameter(
             "endpoint_detection.identity_ambiguity_ratio", 0.05
         )
         self.declare_parameter(
@@ -145,9 +142,6 @@ class ProfileEndpointDetectorNode(Node):
                 self.get_parameter(
                     prefix + "candidate_ambiguity_ratio"
                 ).value
-            ),
-            maximum_fit_iterations=int(
-                self.get_parameter(prefix + "maximum_fit_iterations").value
             ),
         )
         self.detector = ProfileEndpointDetector(config)

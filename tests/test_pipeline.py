@@ -227,7 +227,7 @@ def test_synchronized_nbv_batch_counts_as_one_physical_pose():
     assert "candidate_batch" in pipeline.failed_candidates
 
 
-def test_historical_best_uses_held_out_geometry_and_can_restore_initial():
+def test_held_out_geometry_is_diagnostic_and_latest_result_is_retained():
     scene = default_scene()
     poses, measurements = generate_seed_dataset(scene, count=6)
     pipeline = ActiveCalibrationPipeline(
@@ -270,9 +270,7 @@ def test_historical_best_uses_held_out_geometry_and_can_restore_initial():
     pipeline.append_nbv(poses[0], measurements[0])
 
     assert pipeline.current_validation_metrics.score_m > initial_score
-    assert pipeline.best_result_nbv_index == 0
-    restored = pipeline.restore_historical_best()
     assert np.allclose(
-        restored.estimate.handeye_rotation,
-        initialized.estimate.handeye_rotation,
+        pipeline.result.estimate.handeye_rotation,
+        bad_rotation,
     )
