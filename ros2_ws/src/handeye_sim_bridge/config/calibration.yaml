@@ -34,10 +34,10 @@
       # Robot/plate mismatch is deliberately not estimated by 12-DOF-V2.
       # The values below form a combined worst-case pressure test rather than
       # an endpoint-only or ordinary industrial-repeatability baseline.
-      robot_translation_std_m: 0.0005  # 机器人平移标准差
-      robot_rotation_std_deg: 0.003     # 机器人旋转标准差
+      robot_translation_std_m: 0.00005  # 机器人平移标准差
+      robot_rotation_std_deg: 0.0003     # 机器人旋转标准差
       # RMS amplitude of one fixed spatial height field on the board.
-      board_flatness_rms_m: 0.0003         # 固定板面度RMS
+      board_flatness_rms_m: 0.0005         # 固定板面度RMS
       # The profile is paired with a delayed encoder history sample.
       sync_delay_mean_s: 0.0                # 同步延迟均值
       sync_jitter_std_s: 0.001              # 同步抖动标准差
