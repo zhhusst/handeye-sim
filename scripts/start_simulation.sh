@@ -7,6 +7,7 @@ NO_RVIZ=false
 HEADLESS=false
 FORCE_WEB=false
 WEB_VISUALIZATION=false
+STRESS_NOISE=false
 GZ_VERBOSITY=${GZ_VERBOSITY:-2}
 WEB_VISUALIZATION_URL="http://localhost:6080/vnc.html?autoconnect=1&resize=scale"
 for arg in "$@"; do
@@ -15,12 +16,14 @@ for arg in "$@"; do
         --no-rviz) NO_RVIZ=true ;;
         --headless) HEADLESS=true; NO_RVIZ=true ;;
         --web) FORCE_WEB=true ;;
+        --stress-noise) STRESS_NOISE=true ;;
         -h|--help)
-            echo "用法: ./scripts/start_simulation.sh [--tmux] [--no-rviz] [--headless] [--web]"
+            echo "用法: ./scripts/start_simulation.sh [--tmux] [--no-rviz] [--headless] [--web] [--stress-noise]"
             echo "  --tmux    分屏模式（可看各组件实时日志）"
             echo "  --no-rviz  不启动 RViz"
             echo "  --headless 不启动 Gazebo GUI 和 RViz（适合验证/无 X11 环境）"
             echo "  --web      在 http://localhost:6080 提供 Gazebo + RViz 可视化"
+            echo "  --stress-noise 加载 0.5 mm RMS 固定非平面共享形貌压力测试"
             exit 0 ;;
         *)
             echo "未知参数: $arg" >&2
@@ -110,19 +113,35 @@ move_to_initial_observation_pose() {
     local goal
     goal='{trajectory: {joint_names: [J1_joint, J2_joint, J3_joint, J4_joint, J5_joint, J6_joint], points: [{positions: [-0.2357, -0.0364, -0.6328, -0.4062, -1.0504, 0.8788], time_from_start: {sec: 3, nanosec: 0}}]}}'
 
-    if ! timeout 20s ros2 action send_goal \
-        "$action_name" control_msgs/action/FollowJointTrajectory "$goal" \
-        > /tmp/handeye_initial_pose.log 2>&1; then
-        echo "Failed to restore the GitHub initial observation pose." >&2
-        sed -n '1,20p' /tmp/handeye_initial_pose.log >&2
+    local active=false
+    for _ in $(seq 1 60); do
+        if ros2 control list_controllers 2>/dev/null \
+            | grep -E -q '^joint_trajectory_controller[[:space:]].*[[:space:]]active$'; then
+            active=true
+            break
+        fi
+        sleep 0.2
+    done
+    if ! $active; then
+        echo "joint_trajectory_controller did not become active." >&2
+        ros2 control list_controllers >&2 || true
         return 1
     fi
-    if ! grep -E -q "status: SUCCEEDED|Goal finished with status: SUCCEEDED" \
-        /tmp/handeye_initial_pose.log; then
-        echo "Initial observation pose was not reached." >&2
-        sed -n '1,30p' /tmp/handeye_initial_pose.log >&2
-        return 1
-    fi
+
+    for attempt in 1 2 3; do
+        if timeout 20s ros2 action send_goal \
+            "$action_name" control_msgs/action/FollowJointTrajectory "$goal" \
+            > /tmp/handeye_initial_pose.log 2>&1 \
+            && grep -E -q \
+                "status: SUCCEEDED|Goal finished with status: SUCCEEDED" \
+                /tmp/handeye_initial_pose.log; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    echo "Initial observation pose was not reached after three attempts." >&2
+    sed -n '1,40p' /tmp/handeye_initial_pose.log >&2
+    return 1
 }
 
 cd /workspace
@@ -138,10 +157,16 @@ URDF_PATH=/workspace/urdf/calib_robot.urdf
 SRDF_PATH=/workspace/ros2_ws/src/handeye_sim_bridge/config/fanuc.srdf
 GZ_CTRL_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/gz_controllers.yaml
 CALIBRATION_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/calibration.yaml
+STRESS_NOISE_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_noise_stress.yaml
 SCENE_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/scene_publisher_node
 SRDF_PUB_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/srdf_publisher_node
 PROFILE_VIZ_BIN=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/profile_viz
 ENDPOINT_DETECTOR_BIN=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/profile_endpoint_detector
+
+SCENE_PARAMETER_ARGS="--params-file '$CALIBRATION_CONFIG'"
+if $STRESS_NOISE; then
+    SCENE_PARAMETER_ARGS="$SCENE_PARAMETER_ARGS --params-file '$STRESS_NOISE_CONFIG'"
+fi
 
 /workspace/scripts/stop_simulation.sh 2>/dev/null || true
 sleep 1
@@ -149,6 +174,11 @@ sleep 1
 echo "=========================================="
 echo "  Gazebo + MoveIt2  手眼标定仿真 "
 echo "=========================================="
+if $STRESS_NOISE; then
+    echo "  噪声工况：0.5 mm RMS 固定非平面共享形貌压力测试"
+else
+    echo "  噪声工况：论文主实验（合格标定件 10 µm RMS）"
+fi
 
 if ! ros2 pkg prefix ros_gz_bridge >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq ros-jazzy-ros-gz-bridge
@@ -295,11 +325,11 @@ fi
 # Pane 1: Launch components sequentially
 tmux send-keys -t handeye_sim:0.1 "echo 'Starting components...'" Enter
 sleep 1
-tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock" Enter
+tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_bridge parameter_bridge /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock &" Enter
 sleep 1
-tmux send-keys -t handeye_sim:0.1 "ros2 run robot_state_publisher robot_state_publisher --ros-args --params-file /tmp/ros_params/rsp_params.yaml" Enter
+tmux send-keys -t handeye_sim:0.1 "ros2 run robot_state_publisher robot_state_publisher --ros-args --params-file /tmp/ros_params/rsp_params.yaml &" Enter
 sleep 1
-tmux send-keys -t handeye_sim:0.1 "ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 world base_link" Enter
+tmux send-keys -t handeye_sim:0.1 "ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 1 world base_link &" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_sim create -file /tmp/robot_ready.sdf -name fanuc_robot -world empty -allow_renaming true" Enter
 sleep 2
@@ -313,9 +343,9 @@ tmux send-keys -t handeye_sim:0.1 "ros2 run controller_manager spawner joint_tra
 sleep 2
 echo "Restoring GitHub initial observation pose..."
 move_to_initial_observation_pose
-tmux send-keys -t handeye_sim:0.1 "'$SRDF_PUB_EXE' --ros-args -p use_sim_time:=true" Enter
+tmux send-keys -t handeye_sim:0.1 "'$SRDF_PUB_EXE' --ros-args -p use_sim_time:=true &" Enter
 sleep 1
-tmux send-keys -t handeye_sim:0.1 "'$SCENE_EXE' --ros-args --params-file '$CALIBRATION_CONFIG' -p use_sim_time:=true" Enter
+tmux send-keys -t handeye_sim:0.1 "'$SCENE_EXE' --ros-args $SCENE_PARAMETER_ARGS -p use_sim_time:=true &" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "'$ENDPOINT_DETECTOR_BIN' --ros-args --params-file '$CALIBRATION_CONFIG' -p use_sim_time:=true &" Enter
 sleep 1
@@ -398,7 +428,11 @@ sleep 5
 echo "[6/7] SRDF + Scene + Endpoint Detector + Profile Viz..."
 "$SRDF_PUB_EXE" --ros-args -p use_sim_time:=true &
 sleep 1
-"$SCENE_EXE" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
+if $STRESS_NOISE; then
+    "$SCENE_EXE" --ros-args --params-file "$CALIBRATION_CONFIG" --params-file "$STRESS_NOISE_CONFIG" -p use_sim_time:=true &
+else
+    "$SCENE_EXE" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
+fi
 sleep 1
 "$ENDPOINT_DETECTOR_BIN" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
 sleep 1

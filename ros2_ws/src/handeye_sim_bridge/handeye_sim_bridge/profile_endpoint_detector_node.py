@@ -92,6 +92,9 @@ class ProfileEndpointDetectorNode(Node):
             "endpoint_detection.endpoint_extension_fraction", 0.5
         )
         self.declare_parameter(
+            "endpoint_detection.endpoint_local_fit_points", 24
+        )
+        self.declare_parameter(
             "endpoint_detection.candidate_ambiguity_ratio", 0.03
         )
         self.declare_parameter(
@@ -136,6 +139,11 @@ class ProfileEndpointDetectorNode(Node):
             endpoint_extension_fraction=float(
                 self.get_parameter(
                     prefix + "endpoint_extension_fraction"
+                ).value
+            ),
+            endpoint_local_fit_points=int(
+                self.get_parameter(
+                    prefix + "endpoint_local_fit_points"
                 ).value
             ),
             candidate_ambiguity_ratio=float(

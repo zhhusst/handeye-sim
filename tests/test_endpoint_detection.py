@@ -59,6 +59,36 @@ def test_detector_rejects_sparse_outliers_and_random_dropouts():
     assert result.residual_rms_m < 0.0002
 
 
+def test_detector_uses_local_tangents_for_a_gently_curved_profile():
+    parameter = np.linspace(0.0, 0.20, 801)
+    x = -0.05 + parameter
+    z = (
+        0.40
+        + 0.35 * parameter
+        + 0.0005 * np.sin(np.pi * parameter / 0.20)
+        + 0.0002 * np.sin(2.0 * np.pi * parameter / 0.20)
+    )
+    profile = np.column_stack((x, np.zeros_like(x), z))
+    detector = ProfileEndpointDetector(
+        EndpointDetectionConfig(maximum_segment_length_m=0.8)
+    )
+
+    result = detector.detect(profile)
+
+    assert result is not None
+    pitch = np.linalg.norm(profile[1] - profile[0])
+    first_direction = (profile[1] - profile[0]) / np.linalg.norm(
+        profile[1] - profile[0]
+    )
+    second_direction = (profile[-1] - profile[-2]) / np.linalg.norm(
+        profile[-1] - profile[-2]
+    )
+    expected_first = profile[0] - 0.5 * pitch * first_direction
+    expected_second = profile[-1] + 0.5 * pitch * second_direction
+    assert np.linalg.norm(result.first - expected_first) < 3e-5
+    assert np.linalg.norm(result.second - expected_second) < 3e-5
+
+
 def test_detector_selects_supported_board_segment_across_depth_gaps():
     rng = np.random.default_rng(23)
     prefix = make_profile(

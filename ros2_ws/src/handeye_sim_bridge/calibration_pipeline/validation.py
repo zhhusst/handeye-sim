@@ -27,6 +27,8 @@ def held_out_geometric_metrics(
     measurements: list[Measurement],
     *,
     weights: dict[str, float] | None = None,
+    solver=None,
+    board_dimensions: tuple[float, float] | None = None,
 ) -> ValidationMetrics | None:
     """Evaluate fixed hand-eye, board frame and corner on held-out batches.
 
@@ -47,13 +49,25 @@ def held_out_geometric_metrics(
     all_residuals: list[np.ndarray] = []
     corner = result.estimate.board.corner
     for pose, measurement in zip(poses, measurements):
-        system, target = build_corner_system(
-            result.estimate.x9,
-            [pose],
-            [measurement],
-            **projection_weights,
-        )
-        residual = system @ corner - target
+        if solver is not None:
+            dimensions = board_dimensions or (
+                result.estimate.board.length_u,
+                result.estimate.board.length_v,
+            )
+            residual = solver.observation_residual(
+                result.estimate.optimization_state,
+                [pose],
+                [measurement],
+                board_dimensions=dimensions,
+            )
+        else:
+            system, target = build_corner_system(
+                result.estimate.x9,
+                [pose],
+                [measurement],
+                **projection_weights,
+            )
+            residual = system @ corner - target
         all_residuals.append(residual)
         pose_rms.append(float(np.sqrt(np.mean(np.square(residual)))))
     residuals = np.concatenate(all_residuals)

@@ -9,10 +9,10 @@ import numpy as np
 
 @dataclass
 class StopPolicy:
-    minimum_nbv_poses: int = 3
-    maximum_total_poses: int = 20
-    relative_information_gain_threshold: float = 0.05
-    consecutive_low_gain_limit: int = 3
+    minimum_nbv_poses: int = 7
+    maximum_total_poses: int = 26
+    relative_information_gain_threshold: float = 0.08
+    consecutive_low_gain_limit: int = 2
     _low_gain_count: int = field(default=0, init=False)
     _reference_information_gain: float | None = field(default=None, init=False)
 

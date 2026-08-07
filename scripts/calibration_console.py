@@ -16,6 +16,8 @@ import sys
 import threading
 import time
 
+import yaml
+
 
 WORKSPACE = Path("/workspace")
 PARAM_FILE = (
@@ -28,10 +30,15 @@ SIM_ROTATION_ERROR_TARGET_DEG = 0.05
 SIM_TRANSLATION_ERROR_TARGET_MM = 0.1
 VALIDATED_NOISE_BASELINE = {
     "endpoint_gaussian_std_m": 0.000080,
-    "robot_translation_std_m": 0.000030,
+    # Frozen 2026-08-07 error-budget baseline.  Direct endpoint injection is
+    # disabled; the 0.05 mm flange disturbance is averaged within each
+    # stationary synchronized batch.
+    "robot_translation_std_m": 0.000050,
     "robot_rotation_std_deg": 0.003,
-    "board_flatness_rms_m": 0.000030,
+    # Flat-model ablation qualification allowance.
+    "board_flatness_rms_m": 0.000010,
 }
+SHARED_SHAPE_VALIDATED_FLATNESS_RMS_M = 0.0005
 
 STATE_NAMES = {
     "WAIT_MANUAL_INIT": "等待人工设置初始位姿",
@@ -106,7 +113,19 @@ def parse_key_values(message: str) -> dict[str, str]:
     return fields
 
 
-def noise_regime_exceedances(noise: dict) -> list[tuple[str, float]]:
+def configured_surface_model(path: Path = PARAM_FILE) -> str:
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return str(
+            payload["/**"]["ros__parameters"]["solver"]["surface_model"]
+        ).strip().lower()
+    except (OSError, KeyError, TypeError, yaml.YAMLError):
+        return "flat"
+
+
+def noise_regime_exceedances(
+    noise: dict, *, surface_model: str = "flat"
+) -> list[tuple[str, float]]:
     """Return factors outside the end-to-end validated noise regime."""
     labels = {
         "endpoint_gaussian_std_m": "断点提取",
@@ -116,6 +135,8 @@ def noise_regime_exceedances(noise: dict) -> list[tuple[str, float]]:
     }
     exceedances: list[tuple[str, float]] = []
     for name, baseline in VALIDATED_NOISE_BASELINE.items():
+        if name == "board_flatness_rms_m" and surface_model == "shared":
+            baseline = SHARED_SHAPE_VALIDATED_FLATNESS_RMS_M
         if (
             name == "endpoint_gaussian_std_m"
             and noise.get("direct_endpoint_injection_active") is False
@@ -364,7 +385,19 @@ class CalibrationConsole:
                     print(
                         "           直接断点真值注噪已禁用；断点误差由原始轮廓检测自然产生。"
                     )
-                exceedances = noise_regime_exceedances(noise)
+                surface_model = configured_surface_model()
+                exceedances = noise_regime_exceedances(
+                    noise, surface_model=surface_model
+                )
+                if (
+                    surface_model == "shared"
+                    and float(noise.get("board_flatness_rms_m", 0.0))
+                    <= SHARED_SHAPE_VALIDATED_FLATNESS_RMS_M
+                ):
+                    print(
+                        "共享形貌后端：已启用；当前平面度位于0.5 mm RMS仿真"
+                        "回归范围内。"
+                    )
                 if exceedances:
                     details = "；".join(
                         f"{label}为已验证基线的{ratio:.1f}倍"
@@ -980,6 +1013,13 @@ class CalibrationConsole:
                 f"rank={record.get('rank')}，"
                 f"condition={record.get('condition_number', 0.0):.3e}"
             )
+            if record.get("surface_model") == "shared":
+                print(
+                    "  │ 共享形貌："
+                    f"RMS {float(record.get('surface_rms_mm', 0.0)):.4f} mm；"
+                    f"最大绝对高度 "
+                    f"{float(record.get('surface_maximum_mm', 0.0)):.4f} mm"
+                )
             if "maximum_rotation_std_deg" in record:
                 print(
                     "  │ 预测1σ精度（不使用真值）："
@@ -1053,6 +1093,15 @@ class CalibrationConsole:
             f"rank={diagnostics.get('rank')}，"
             f"condition={float(diagnostics.get('condition_number', 0.0)):.3e}"
         )
+        surface = payload.get("surface", {})
+        if surface.get("model") == "shared":
+            print(
+                "  共享形貌：Legendre"
+                f" {surface.get('degree')}阶；"
+                f"RMS {1000.0 * float(surface.get('rms_m', 0.0)):.4f} mm；"
+                "最大绝对高度 "
+                f"{1000.0 * float(surface.get('maximum_abs_m', 0.0)):.4f} mm"
+            )
         print(
             "  仿真真值误差："
             f"旋转 {float(simulation.get('rotation_error_deg', 0.0)):.4f}°，"

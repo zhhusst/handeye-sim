@@ -39,9 +39,9 @@ def test_noise_regime_exceedances_identify_the_modified_dominant_terms():
     }
     assert CONSOLE.noise_regime_exceedances(noise) == [
         ("断点提取", 10.0),
-        ("机器人平移", 0.0005 / 0.000030),
+        ("机器人平移", 10.0),
         ("机器人旋转", 10.0),
-        ("平板平面度", 0.0005 / 0.000030),
+        ("平板平面度", 50.0),
     ]
 
 
@@ -49,12 +49,24 @@ def test_disabled_direct_endpoint_noise_is_not_reported_as_active_stress():
     noise = {
         "direct_endpoint_injection_active": False,
         "endpoint_gaussian_std_m": 0.0008,
-        "robot_translation_std_m": 0.000030,
+        "robot_translation_std_m": 0.000050,
         "robot_rotation_std_deg": 0.003,
-        "board_flatness_rms_m": 0.000030,
+        "board_flatness_rms_m": 0.000010,
     }
 
     assert CONSOLE.noise_regime_exceedances(noise) == []
+
+
+def test_shared_shape_uses_its_validated_flatness_range():
+    noise = {
+        "endpoint_gaussian_std_m": 0.000080,
+        "robot_translation_std_m": 0.000050,
+        "robot_rotation_std_deg": 0.003,
+        "board_flatness_rms_m": 0.0005,
+    }
+    assert CONSOLE.noise_regime_exceedances(
+        noise, surface_model="shared"
+    ) == []
 
 
 def test_preflight_mode_prompt_supports_all_three_modes(monkeypatch):

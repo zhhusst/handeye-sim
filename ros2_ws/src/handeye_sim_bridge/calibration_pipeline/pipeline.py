@@ -180,6 +180,8 @@ class ActiveCalibrationPipeline:
             self.validation_poses,
             self.validation_measurements,
             weights=getattr(self.solver, "weights", None),
+            solver=(self.solver if hasattr(self.solver, "residual") else None),
+            board_dimensions=self.board_dimensions,
         )
         self.validation_metrics_history.append(self.current_validation_metrics)
 
@@ -233,6 +235,8 @@ class ActiveCalibrationPipeline:
             maximum_candidates=None,
             projection_weights=self.solver.weights,
             state_scale=self.solver.state_scale,
+            solver=self.solver,
+            board_dimensions=self.board_dimensions,
         )
 
     def reject_candidate(self, candidate_id: str) -> None:
@@ -296,6 +300,7 @@ class ActiveCalibrationPipeline:
             self.result.estimate.handeye_translation,
             board_dimensions=self.board_dimensions,
             initial_board_rotation=self.result.estimate.board.rotation,
+            initial_estimate=self.result.estimate,
         )
         if not trial.converged:
             raise RuntimeError("NBV observation rejected: trial solve is not observable")

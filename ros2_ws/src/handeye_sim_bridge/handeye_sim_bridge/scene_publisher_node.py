@@ -497,9 +497,18 @@ class ScenePublisher(Node):
                 # component that remains inside the physical laser plane.
                 if res['has_intersection']:
                     laser_normal = R[:, 1]
-                    res['scan_pts_B'] = (
-                        self.noise_model.deform_points_in_laser_plane(
+                    endpoint_labels = [
+                        label for label, _ in res['endpoints_B']
+                    ]
+                    endpoint_points = np.asarray(
+                        [point for _, point in res['endpoints_B']]
+                    )
+                    if len(endpoint_points) == 2:
+                        deformed_points, endpoint_points = (
+                            self.noise_model.deform_bounded_scanline(
                             res['scan_pts_B'],
+                            endpoint_points,
+                            boundary_labels=endpoint_labels,
                             laser_normal=laser_normal,
                             board_normal=n_B,
                             corner=C,
@@ -508,20 +517,12 @@ class ScenePublisher(Node):
                             width=w,
                             height=h,
                         )
-                    )
-                    res['scan_pts_S'] = (
-                        R.T @ (res['scan_pts_B'] - t_vec).T
-                    ).T
-                    endpoint_labels = [
-                        label for label, _ in res['endpoints_B']
-                    ]
-                    if endpoint_labels:
-                        endpoint_points = np.asarray(
-                            [point for _, point in res['endpoints_B']]
                         )
-                        endpoint_points = (
+                        res['scan_pts_B'] = deformed_points
+                    else:
+                        res['scan_pts_B'] = (
                             self.noise_model.deform_points_in_laser_plane(
-                                endpoint_points,
+                                res['scan_pts_B'],
                                 laser_normal=laser_normal,
                                 board_normal=n_B,
                                 corner=C,
@@ -531,6 +532,10 @@ class ScenePublisher(Node):
                                 height=h,
                             )
                         )
+                    res['scan_pts_S'] = (
+                        R.T @ (res['scan_pts_B'] - t_vec).T
+                    ).T
+                    if endpoint_labels:
                         res['endpoints_B'] = list(
                             zip(endpoint_labels, endpoint_points)
                         )

@@ -66,7 +66,24 @@ def inflate_handeye_covariance_from_stability(
         inflated[index, index] = max(
             inflated[index, index], translation_variance
         )
-    estimate = replace(result.estimate, covariance_x9=inflated)
+    covariance_state = result.estimate.covariance_state
+    inflated_state = None
+    if covariance_state is not None:
+        inflated_state = np.asarray(covariance_state, dtype=float).copy()
+        inflated_state[:9, :9] = inflated
+        for index in range(3):
+            inflated_state[index, index] = max(
+                inflated_state[index, index], rotation_variance
+            )
+        for index in range(3, 6):
+            inflated_state[index, index] = max(
+                inflated_state[index, index], translation_variance
+            )
+    estimate = replace(
+        result.estimate,
+        covariance_x9=inflated,
+        covariance_state=inflated_state,
+    )
     return replace(result, estimate=estimate)
 
 
@@ -133,6 +150,7 @@ def bootstrap_initial_stability(
                 reference.estimate.handeye_translation,
                 board_dimensions=board_dimensions,
                 initial_board_rotation=reference.estimate.board.rotation,
+                initial_estimate=reference.estimate,
             )
         except Exception:
             continue

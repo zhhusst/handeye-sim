@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from action_msgs.msg import GoalStatus
@@ -120,10 +121,10 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("nbv.validation_frame_count", 1)
         self.declare_parameter("nbv.minimum_fit_frame_count", 3)
         self.declare_parameter("nbv.endpoint_mad_multiplier", 3.5)
-        self.declare_parameter("nbv.minimum_poses", 3)
-        self.declare_parameter("nbv.maximum_total_poses", 20)
-        self.declare_parameter("nbv.relative_information_gain_threshold", 0.05)
-        self.declare_parameter("nbv.consecutive_low_gain_limit", 3)
+        self.declare_parameter("nbv.minimum_poses", 7)
+        self.declare_parameter("nbv.maximum_total_poses", 26)
+        self.declare_parameter("nbv.relative_information_gain_threshold", 0.08)
+        self.declare_parameter("nbv.consecutive_low_gain_limit", 2)
         self.declare_parameter("nbv.maximum_update_rotation_deg", 5.0)
         self.declare_parameter("nbv.maximum_update_translation_m", 0.05)
         self.declare_parameter("nbv.maximum_board_rotation_deg", 10.0)
@@ -149,6 +150,11 @@ class ActiveCalibrationSimNode(Node):
         self.declare_parameter("solver.handeye_translation_scale_m", 0.1)
         self.declare_parameter("solver.plane_rotation_scale_deg", 10.0)
         self.declare_parameter("solver.maximum_condition_number", 1e12)
+        self.declare_parameter("solver.surface_model", "shared")
+        self.declare_parameter("solver.surface_basis_kind", "legendre")
+        self.declare_parameter("solver.surface_degree", 4)
+        self.declare_parameter("solver.shape_scale_m", 0.0005)
+        self.declare_parameter("solver.shape_regularization", 0.01)
         self.declare_parameter("initial_validation.bootstrap_trials", 4)
         self.declare_parameter("initial_validation.held_out_frames_per_pose", 4)
         self.declare_parameter("initial_validation.random_seed", 20260728)
@@ -312,6 +318,21 @@ class ActiveCalibrationSimNode(Node):
             maximum_condition_number=float(
                 self.get_parameter("solver.maximum_condition_number").value
             ),
+            surface_model=str(
+                self.get_parameter("solver.surface_model").value
+            ).strip().lower(),
+            surface_basis_kind=str(
+                self.get_parameter("solver.surface_basis_kind").value
+            ).strip().lower(),
+            surface_degree=int(
+                self.get_parameter("solver.surface_degree").value
+            ),
+            shape_scale_m=float(
+                self.get_parameter("solver.shape_scale_m").value
+            ),
+            shape_regularization=float(
+                self.get_parameter("solver.shape_regularization").value
+            ),
         )
 
         self.create_subscription(JointState, "/joint_states", self._joint_callback, 10)
@@ -334,6 +355,11 @@ class ActiveCalibrationSimNode(Node):
         self.validity_client = self.create_client(
             GetStateValidity, "/check_state_validity"
         )
+        self.noise_status_client = self.create_client(
+            Trigger, "/scene_publisher/noise_status"
+        )
+        self.noise_status_future = None
+        self.simulation_noise_snapshot: dict | None = None
         self.trajectory_client = ActionClient(
             self,
             FollowJointTrajectory,
@@ -558,6 +584,7 @@ class ActiveCalibrationSimNode(Node):
         )
 
     def _tick(self) -> None:
+        self._poll_noise_status()
         if not self.started:
             return
         if self.state == "WAIT_SEEDS":
@@ -799,9 +826,10 @@ class ActiveCalibrationSimNode(Node):
             )
             self.pipeline.result = result
             self.get_logger().info(
-                "12-DOF-V2 initialized: "
+                f"12-DOF-V2 initialized ({result.diagnostics.surface_model}): "
                 f"rank={result.diagnostics.rank}, "
                 f"condition={result.diagnostics.condition_number:.3e}, "
+                f"surface_rms={1000.0 * result.diagnostics.surface_rms_m:.4f} mm, "
                 f"rotation_error={rotation_distance_deg(result.estimate.handeye_rotation, HAND_EYE_ROTATION):.4f} deg, "
                 f"translation_error={1000.0 * np.linalg.norm(result.estimate.handeye_translation - HAND_EYE_TRANSLATION):.4f} mm"
             )
@@ -1336,6 +1364,10 @@ class ActiveCalibrationSimNode(Node):
             "handeye_rotation": result.estimate.handeye_rotation.tolist(),
             "handeye_translation_m": result.estimate.handeye_translation.tolist(),
             "board_corner_m": result.estimate.board.corner.tolist(),
+            "surface_model": result.diagnostics.surface_model,
+            "surface_rms_mm": 1000.0 * result.diagnostics.surface_rms_m,
+            "surface_maximum_mm": 1000.0
+            * result.diagnostics.surface_maximum_m,
             "held_out_validation_score_mm": (
                 None
                 if self.pipeline is None
@@ -1365,6 +1397,28 @@ class ActiveCalibrationSimNode(Node):
             extra={
                 "mode": "gazebo_only",
                 "status": status,
+                "simulation_noise": self.simulation_noise_snapshot,
+                "runtime_configuration": {
+                    "solver": {
+                        **dict(self.solver.weights),
+                        "surface_model": self.solver.surface_model,
+                        "surface_basis_kind": self.solver.surface_basis_kind,
+                        "surface_degree": self.solver.surface_degree,
+                        "shape_scale_m": self.solver.shape_scale_m,
+                        "shape_regularization": self.solver.shape_regularization,
+                    },
+                    "seed_file": str(self.seed_file),
+                    "nbv_measurement_batch_size": self.measurement_batch_size,
+                    "nbv_validation_frame_count": self.validation_frame_count,
+                    "minimum_nbv_poses": self.stop_policy.minimum_nbv_poses,
+                    "maximum_total_nbv_poses": self.stop_policy.maximum_total_poses,
+                    "relative_information_gain_threshold": (
+                        self.stop_policy.relative_information_gain_threshold
+                    ),
+                    "consecutive_low_gain_limit": (
+                        self.stop_policy.consecutive_low_gain_limit
+                    ),
+                },
                 "seed_count": self.pipeline.seed_count,
                 "seed_observation_count": self.seed_observation_count,
                 "initial_stability": (
@@ -1399,6 +1453,36 @@ class ActiveCalibrationSimNode(Node):
                 "execution_failures": self.execution_failure_history,
             },
         )
+
+    def _poll_noise_status(self) -> None:
+        """Capture the actual immutable publisher noise settings for replay."""
+        if self.simulation_noise_snapshot is not None:
+            return
+        if self.noise_status_future is None:
+            if self.noise_status_client.service_is_ready():
+                self.noise_status_future = self.noise_status_client.call_async(
+                    Trigger.Request()
+                )
+            return
+        if not self.noise_status_future.done():
+            return
+        try:
+            response = self.noise_status_future.result()
+            if response is not None and response.success:
+                self.simulation_noise_snapshot = json.loads(response.message)
+            else:
+                self.get_logger().warning(
+                    "simulation noise status service returned no snapshot"
+                )
+        except (RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
+            self.get_logger().warning(
+                f"failed to capture simulation noise snapshot: {error}"
+            )
+        finally:
+            # Do not spam the service.  A missing snapshot remains explicit in
+            # the result instead of silently copying a possibly different YAML.
+            if self.simulation_noise_snapshot is None:
+                self.simulation_noise_snapshot = {"available": False}
 
     def _rollback_after_failure(self, reason: str) -> None:
         if self.rollback_joints is None:
@@ -1479,6 +1563,14 @@ def main(args=None) -> None:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except RuntimeError:
+        # The keyboard console owns this child process and sends SIGINT after
+        # it has observed DONE/FAILED.  Jazzy may invalidate the context while
+        # a subscription is converting its final queued message, which raises
+        # RuntimeError instead of KeyboardInterrupt.  Suppress only that
+        # shutdown race; propagate genuine runtime failures while ROS is live.
+        if rclpy.ok():
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():

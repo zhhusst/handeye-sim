@@ -32,12 +32,16 @@
       endpoint_gaussian_std_m: 0.0
       # Hidden physical flange error; the reported encoder pose is not changed.
       # Robot/plate mismatch is deliberately not estimated by 12-DOF-V2.
-      # The values below form a combined worst-case pressure test rather than
-      # an endpoint-only or ordinary industrial-repeatability baseline.
+      # Robot-pose errors remain part of the precision-validation baseline.
+      # Board non-planarity is intentionally excluded from the estimated
+      # state: the method assumes a qualified planar artefact and does not fit
+      # a surface-error field.  A 10 um RMS residual keeps the main experiment
+      # physical; calibration_noise_stress.yaml reproduces the former 0.5 mm
+      # RMS model-mismatch pressure test.
       robot_translation_std_m: 0.00005  # 机器人平移标准差
       robot_rotation_std_deg: 0.0003     # 机器人旋转标准差
       # RMS amplitude of one fixed spatial height field on the board.
-      board_flatness_rms_m: 0.0005         # 固定板面度RMS
+      board_flatness_rms_m: 0.00001      # 主实验：合格标定件 10 µm RMS
       # The profile is paired with a delayed encoder history sample.
       sync_delay_mean_s: 0.0                # 同步延迟均值
       sync_jitter_std_s: 0.001              # 同步抖动标准差
@@ -72,6 +76,10 @@
       residual_floor_m: 0.00008
       maximum_residual_rms_m: 0.0015
       endpoint_extension_fraction: 0.5
+      # Use the full segment for robust selection, but estimate each boundary
+      # from a local tangent so fixed plate form error does not create a global
+      # straight-line extrapolation bias.
+      endpoint_local_fit_points: 24
       candidate_ambiguity_ratio: 0.03
       identity_ambiguity_ratio: 0.05
       # At the repository's reference pose, acquisition-order point 0 lies on
@@ -179,6 +187,15 @@
     maximum_measurement_age_s: 0.5
 
     solver:
+      # "shared" jointly estimates one fixed target height field from all
+      # views. Use "flat" only for the ideal-plane ablation experiment.
+      surface_model: "shared"
+      surface_basis_kind: "legendre"
+      # Degree four contains 12 quadratic-to-quartic modes; constant and
+      # linear modes are excluded to avoid duplicating target pose DOF.
+      surface_degree: 4
+      shape_scale_m: 0.0005
+      shape_regularization: 0.01
       plane_weight: 1.0
       # The raw-profile detector reports about 0.108 mm single-frame endpoint
       # sigma at the reference pose. Residual whitening against 0.055 mm
@@ -202,8 +219,8 @@
       # validation starts with the first NBV batch; at that point both the
       # initial and updated snapshots are scored on the same unseen frames.
       held_out_frames_per_pose: 0
-      # The current combined robot/flatness stress regime sits just above
-      # 1 deg on four-trial resampling even though all trials converge.
+      # This gate checks stationary resampling, not absolute accuracy.  The
+      # latter is evaluated by the frozen precision error-budget experiment.
       maximum_rotation_p95_deg: 1.25
       maximum_translation_p95_m: 0.010
       minimum_converged_fraction: 0.8
@@ -224,11 +241,10 @@
       maximum_execution_retries_per_pose: 3
       # Do not spend another NBV on the same or an almost identical joint pose.
       minimum_committed_joint_separation_rad: 0.10
-      # This file currently selects the high-noise stress regime above.
-      # Fifteen synchronized frames retain multi-frame averaging while
+      # Eighteen synchronized frames retain multi-frame averaging while
       # reducing both acquisition time and the O(N) rolling solve/score cost.
-      measurement_batch_size: 15
-      # Endpoint-consistent frames are split after capture: 12 for one robust
+      measurement_batch_size: 18
+      # Endpoint-consistent frames are split after capture: 15 for one robust
       # physical-pose representative and 3 for held-out validation.
       validation_frame_count: 3
       minimum_fit_frame_count: 9
@@ -236,15 +252,21 @@
       # Batch timeout is automatically at least batch_size/rate + 1 second.
       minimum_measurement_frame_rate_hz: 2.0
       minimum_valid_probability: 0.8
-      minimum_poses: 3
+      # Six seeds establish the local frame. In three 0.5 mm fixed-shape ROS
+      # stress runs, all runs met 0.1 deg/0.1 mm no later than NBV 7, so seven
+      # information-selected views are retained as the minimum safety floor.
+      # This is a minimum, not an NBV upper limit.
+      minimum_poses: 7
       # Internal emergency protection only: 6 seeds + at most 20 NBVs.
       # The console defaults to adaptive stopping and does not impose 6 NBVs.
       maximum_total_poses: 26
-      # Stop after consecutive gains fall below 5% of the first feasible NBV
+      # Stop after consecutive gains fall below 8% of the first feasible NBV
       # cycle. Covariance and held-out scores are diagnostic-only because their
       # historical coverage/correlation did not support control authority.
-      relative_information_gain_threshold: 0.05
-      consecutive_low_gain_limit: 3
+      relative_information_gain_threshold: 0.08
+      # Two consecutive low-gain rankings reject a one-cycle fluctuation while
+      # avoiding low-value motions after the seven-NBV safety floor.
+      consecutive_low_gain_limit: 2
       # Transactional update guards. The first accepted NBV is a correction
       # of the noisy six-seed estimate, so its negative values below mean:
       # automatically use at least the declared Phase-0a hand-eye uncertainty.

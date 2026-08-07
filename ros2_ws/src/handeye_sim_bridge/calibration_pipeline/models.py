@@ -199,6 +199,12 @@ class CalibrationEstimate:
     board: BoardModel
     x9: np.ndarray
     covariance_x9: np.ndarray | None = None
+    state: np.ndarray | None = None
+    covariance_state: np.ndarray | None = None
+    surface_model: str = "flat"
+    surface_basis_kind: str | None = None
+    surface_degree: int | None = None
+    shape_coefficients: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -211,10 +217,52 @@ class CalibrationEstimate:
         if x9.shape != (9,):
             raise ValueError("x9 must have shape (9,)")
         object.__setattr__(self, "x9", x9)
+        if self.covariance_x9 is not None:
+            covariance_x9 = np.asarray(self.covariance_x9, dtype=float)
+            if covariance_x9.shape != (9, 9):
+                raise ValueError("covariance_x9 must have shape (9, 9)")
+            object.__setattr__(self, "covariance_x9", covariance_x9)
+        if self.surface_model not in {"flat", "shared"}:
+            raise ValueError("surface_model must be 'flat' or 'shared'")
+        if self.state is not None:
+            state = np.asarray(self.state, dtype=float)
+            if state.ndim != 1 or len(state) < 9:
+                raise ValueError("state must be a vector with at least 9 values")
+            if not np.allclose(state[:9], x9):
+                raise ValueError("the first nine state values must equal x9")
+            object.__setattr__(self, "state", state)
+        if self.covariance_state is not None:
+            covariance_state = np.asarray(self.covariance_state, dtype=float)
+            expected = 9 if self.state is None else len(self.state)
+            if covariance_state.shape != (expected, expected):
+                raise ValueError(
+                    f"covariance_state must have shape ({expected}, {expected})"
+                )
+            object.__setattr__(self, "covariance_state", covariance_state)
+        if self.shape_coefficients is not None:
+            coefficients = np.asarray(self.shape_coefficients, dtype=float)
+            if coefficients.ndim != 1:
+                raise ValueError("shape_coefficients must be a vector")
+            object.__setattr__(self, "shape_coefficients", coefficients)
+        if self.surface_model == "shared":
+            if (
+                self.state is None
+                or self.surface_basis_kind is None
+                or self.surface_degree is None
+                or self.shape_coefficients is None
+            ):
+                raise ValueError("shared surface estimate is missing its latent state")
+            if len(self.state) != 12 + len(self.shape_coefficients):
+                raise ValueError("shared surface state and coefficients disagree")
 
     @property
     def handeye_transform(self) -> np.ndarray:
         return make_transform(self.handeye_rotation, self.handeye_translation)
+
+    @property
+    def optimization_state(self) -> np.ndarray:
+        """State used by the active solver; ``x9`` remains API-compatible."""
+        return self.x9 if self.state is None else self.state
 
 
 @dataclass(frozen=True)
@@ -225,6 +273,10 @@ class SolverDiagnostics:
     residual_variance: float
     effective_handeye_information: np.ndarray
     weakest_direction: np.ndarray
+    surface_model: str = "flat"
+    surface_rms_m: float = 0.0
+    surface_maximum_m: float = 0.0
+    state_information: np.ndarray | None = None
 
 
 @dataclass(frozen=True)

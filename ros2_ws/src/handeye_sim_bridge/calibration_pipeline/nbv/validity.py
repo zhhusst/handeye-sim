@@ -23,14 +23,37 @@ class ValidityResult:
     sample_count: int
 
 
-def sigma_points(mean: np.ndarray, covariance: np.ndarray) -> list[np.ndarray]:
+def sigma_points(
+    mean: np.ndarray,
+    covariance: np.ndarray,
+    *,
+    maximum_directions: int | None = None,
+    state_scale: np.ndarray | None = None,
+) -> list[np.ndarray]:
     covariance = 0.5 * (covariance + covariance.T)
-    values, vectors = np.linalg.eigh(covariance)
-    square_root = vectors @ np.diag(np.sqrt(np.maximum(values, 0.0)))
+    scale_vector = (
+        np.ones(len(mean), dtype=float)
+        if state_scale is None
+        else np.asarray(state_scale, dtype=float)
+    )
+    if scale_vector.shape != mean.shape or np.any(scale_vector <= 0.0):
+        raise ValueError("state_scale must match sigma-point state")
+    dimensionless = covariance / (
+        scale_vector[:, None] * scale_vector[None, :]
+    )
+    values, vectors = np.linalg.eigh(dimensionless)
+    order = np.argsort(values)[::-1]
+    if maximum_directions is not None:
+        order = order[: max(1, min(int(maximum_directions), len(mean)))]
     scale = np.sqrt(len(mean))
     points = [np.asarray(mean, dtype=float)]
-    for column in range(len(mean)):
-        offset = scale * square_root[:, column]
+    for column in order:
+        offset = (
+            scale
+            * scale_vector
+            * vectors[:, column]
+            * np.sqrt(max(float(values[column]), 0.0))
+        )
         points.extend((mean + offset, mean - offset))
     return points
 
@@ -45,10 +68,19 @@ def evaluate_candidate_validity(
     prediction_options: dict | None = None,
     projection_weights: dict | None = None,
     covariance_inflation: float = 1.0,
+    solver=None,
+    board_dimensions: tuple[float, float] | None = None,
+    maximum_sigma_directions: int = 12,
 ) -> ValidityResult:
     if covariance_inflation <= 0.0:
         raise ValueError("covariance_inflation must be positive")
-    if estimate.covariance_x9 is None:
+    covariance = (
+        estimate.covariance_state
+        if estimate.surface_model == "shared"
+        else estimate.covariance_x9
+    )
+    mean = estimate.optimization_state
+    if covariance is None:
         prediction = predict_candidate(candidate, estimate, roi)
         return ValidityResult(
             valid_probability=float(prediction.valid),
@@ -74,25 +106,57 @@ def evaluate_candidate_validity(
         "quality": 0,
     }
     states = sigma_points(
-        estimate.x9, covariance_inflation * estimate.covariance_x9
+        mean,
+        covariance_inflation * covariance,
+        maximum_directions=(
+            maximum_sigma_directions
+            if estimate.surface_model == "shared"
+            else None
+        ),
+        state_scale=(None if solver is None else solver.state_scale),
     )
     for state in states:
-        corner, rank = solve_corner(state, poses, measurements, **projection_weights)
-        if rank < 3:
-            counts["degenerate"] += 1
-            continue
-        sampled = CalibrationEstimate(
-            handeye_rotation=so3_exp(state[:3]),
-            handeye_translation=state[3:6],
-            board=BoardModel(
-                corner=corner,
-                rotation=so3_exp(state[6:9]),
-                length_u=estimate.board.length_u,
-                length_v=estimate.board.length_v,
-            ),
-            x9=state,
-            covariance_x9=None,
-        )
+        if estimate.surface_model == "shared":
+            if len(state) < 12:
+                counts["degenerate"] += 1
+                continue
+            sampled = CalibrationEstimate(
+                handeye_rotation=so3_exp(state[:3]),
+                handeye_translation=state[3:6],
+                board=BoardModel(
+                    corner=state[9:12],
+                    rotation=so3_exp(state[6:9]),
+                    length_u=estimate.board.length_u,
+                    length_v=estimate.board.length_v,
+                ),
+                x9=state[:9],
+                covariance_x9=None,
+                state=state,
+                covariance_state=None,
+                surface_model="shared",
+                surface_basis_kind=estimate.surface_basis_kind,
+                surface_degree=estimate.surface_degree,
+                shape_coefficients=state[12:],
+            )
+        else:
+            corner, rank = solve_corner(
+                state, poses, measurements, **projection_weights
+            )
+            if rank < 3:
+                counts["degenerate"] += 1
+                continue
+            sampled = CalibrationEstimate(
+                handeye_rotation=so3_exp(state[:3]),
+                handeye_translation=state[3:6],
+                board=BoardModel(
+                    corner=corner,
+                    rotation=so3_exp(state[6:9]),
+                    length_u=estimate.board.length_u,
+                    length_v=estimate.board.length_v,
+                ),
+                x9=state,
+                covariance_x9=None,
+            )
         prediction = predict_candidate(candidate, sampled, roi, **prediction_options)
         if prediction.valid:
             counts["valid"] += 1

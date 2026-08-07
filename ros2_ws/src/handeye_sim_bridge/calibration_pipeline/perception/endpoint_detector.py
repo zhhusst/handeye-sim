@@ -24,6 +24,7 @@ class EndpointDetectionConfig:
     residual_floor_m: float = 0.00008
     maximum_residual_rms_m: float = 0.0015
     endpoint_extension_fraction: float = 0.5
+    endpoint_local_fit_points: int = 24
     candidate_ambiguity_ratio: float = 0.03
     maximum_fit_iterations: int = 1
 
@@ -57,6 +58,8 @@ class EndpointDetectionConfig:
             raise ValueError(
                 "endpoint_extension_fraction must be in [0, 1]"
             )
+        if self.endpoint_local_fit_points < 2:
+            raise ValueError("endpoint_local_fit_points must be at least two")
         if not 0.0 <= self.candidate_ambiguity_ratio < 1.0:
             raise ValueError("candidate_ambiguity_ratio must be in [0, 1)")
 
@@ -209,6 +212,7 @@ class ProfileEndpointDetector:
         projection = (support - center) @ direction
         order = np.argsort(projection)
         projection = projection[order]
+        ordered_support = support[order]
         if len(projection) < 2:
             return None
         steps = np.diff(projection)
@@ -216,11 +220,36 @@ class ProfileEndpointDetector:
         if len(positive_steps) == 0:
             return None
         sample_pitch = float(np.median(positive_steps))
-        lower = float(projection[0])
-        upper = float(projection[-1])
         extension = self.config.endpoint_extension_fraction * sample_pitch
-        first_xz = center + (lower - extension) * direction
-        second_xz = center + (upper + extension) * direction
+        local_count = min(
+            int(self.config.endpoint_local_fit_points), len(ordered_support)
+        )
+
+        def local_endpoint(local: np.ndarray, *, first: bool) -> tuple[np.ndarray, float]:
+            local_center, local_direction = self._fit_tls(local)
+            acquisition_delta = local[-1] - local[0]
+            if float(acquisition_delta @ local_direction) < 0.0:
+                local_direction = -local_direction
+            local_projection = (local - local_center) @ local_direction
+            boundary_projection = (
+                float(np.min(local_projection)) - extension
+                if first
+                else float(np.max(local_projection)) + extension
+            )
+            local_normal = np.array([-local_direction[1], local_direction[0]])
+            local_residual = (local - local_center) @ local_normal
+            local_rms = float(np.sqrt(np.mean(local_residual**2)))
+            return local_center + boundary_projection * local_direction, local_rms
+
+        # Segment selection remains global and robust.  Boundary extrapolation
+        # is local so a gently curved physical profile does not bias both
+        # endpoints through one global straight-line fit.
+        first_xz, first_local_rms = local_endpoint(
+            ordered_support[:local_count], first=True
+        )
+        second_xz, second_local_rms = local_endpoint(
+            ordered_support[-local_count:], first=False
+        )
         segment_length = float(np.linalg.norm(second_xz - first_xz))
         if not (
             self.config.minimum_segment_length_m
@@ -236,7 +265,11 @@ class ProfileEndpointDetector:
             return None
         endpoint_sigma = float(
             np.hypot(
-                max(residual_rms, self.config.residual_floor_m),
+                max(
+                    first_local_rms,
+                    second_local_rms,
+                    self.config.residual_floor_m,
+                ),
                 sample_pitch / np.sqrt(12.0),
             )
         )

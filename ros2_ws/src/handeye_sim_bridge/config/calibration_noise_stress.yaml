@@ -1,0 +1,7 @@
+/**:
+  ros__parameters:
+    # Deliberately difficult 0.5 mm RMS fixed-form condition.  It violates the
+    # flat-model precision budget and is the main shared-shape robustness
+    # regression; keep it separate from the default nominal simulation.
+    simulation_noise:
+      board_flatness_rms_m: 0.0005

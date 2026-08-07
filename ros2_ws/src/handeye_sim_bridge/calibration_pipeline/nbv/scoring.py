@@ -5,7 +5,12 @@ from __future__ import annotations
 import numpy as np
 
 from ..models import Candidate, CandidateScore, FlangePose, SensorROI
-from ..v2_backend.information import effective_handeye_information, information_gain
+from ..v2_backend.information import (
+    effective_handeye_information,
+    effective_handeye_information_from_hessian,
+    information_gain,
+    scaled_jacobian,
+)
 from ..v2_backend.residual import numerical_jacobian, variable_projection_residual
 from .profile_predictor import predict_candidate
 from .validity import candidate_valid_probability
@@ -23,18 +28,44 @@ def score_candidates(
     maximum_candidates: int | None = None,
     state_scale: np.ndarray | None = None,
     virtual_batch_size: int = 1,
+    solver=None,
+    board_dimensions: tuple[float, float] | None = None,
 ) -> list[CandidateScore]:
     if virtual_batch_size < 1:
         raise ValueError("virtual_batch_size must be positive")
     projection_weights = projection_weights or {}
-    x9 = result.estimate.x9
-    residual = lambda state: variable_projection_residual(
-        state, poses, measurements, **projection_weights
+    state = result.estimate.optimization_state
+    if solver is None:
+        residual = lambda value: variable_projection_residual(
+            value, poses, measurements, **projection_weights
+        )
+    else:
+        if board_dimensions is None:
+            board_dimensions = (
+                result.estimate.board.length_u,
+                result.estimate.board.length_v,
+            )
+        residual = lambda value: solver.residual(
+            value,
+            poses,
+            measurements,
+            board_dimensions=board_dimensions,
+        )
+        state_scale = solver.state_scale
+    additive_shared_information = bool(
+        solver is not None
+        and getattr(solver, "uses_shared_surface", False)
+        and getattr(getattr(result, "diagnostics", None), "state_information", None)
+        is not None
     )
-    current_jacobian = numerical_jacobian(residual, x9)
-    current_information = effective_handeye_information(
-        current_jacobian, state_scale=state_scale
-    )
+    if additive_shared_information:
+        current_state_information = result.diagnostics.state_information
+        current_information = result.diagnostics.effective_handeye_information
+    else:
+        current_jacobian = numerical_jacobian(residual, state)
+        current_information = effective_handeye_information(
+            current_jacobian, state_scale=state_scale
+        )
     scored: list[CandidateScore] = []
     iterable = candidates if maximum_candidates is None else candidates[:maximum_candidates]
     for candidate in iterable:
@@ -48,23 +79,60 @@ def score_candidates(
             measurements,
             roi,
             projection_weights=projection_weights,
+            solver=solver,
+            board_dimensions=board_dimensions,
         )
         if probability < minimum_valid_probability:
             continue
         flange = candidate.flange_transform_command
         virtual_pose = FlangePose(flange[:3, :3], flange[:3, 3])
-        augmented_poses = poses + [virtual_pose] * virtual_batch_size
-        fixed_virtual_measurement = candidate.virtual_measurement or prediction.measurement
-        augmented_measurements = measurements + [
-            fixed_virtual_measurement
-        ] * virtual_batch_size
-        augmented_residual = lambda state: variable_projection_residual(
-            state, augmented_poses, augmented_measurements, **projection_weights
-        )
-        augmented_jacobian = numerical_jacobian(augmented_residual, x9)
-        augmented_information = effective_handeye_information(
-            augmented_jacobian, state_scale=state_scale
-        )
+        # Always use the measurement predicted by the current estimate.  In
+        # shared mode the candidate's construction-time chord is only a flat
+        # tangent-plane command and is not the expected physical profile.
+        fixed_virtual_measurement = prediction.measurement
+        if additive_shared_information:
+            virtual_residual = lambda value: solver.observation_residual(
+                value,
+                [virtual_pose],
+                [fixed_virtual_measurement],
+                board_dimensions=board_dimensions,
+            )
+            virtual_jacobian = numerical_jacobian(virtual_residual, state)
+            virtual_scaled = scaled_jacobian(virtual_jacobian, state_scale)
+            augmented_state_information = (
+                current_state_information
+                + virtual_batch_size * (virtual_scaled.T @ virtual_scaled)
+            )
+            augmented_information = effective_handeye_information_from_hessian(
+                augmented_state_information
+            )
+        elif solver is None:
+            augmented_poses = poses + [virtual_pose] * virtual_batch_size
+            augmented_measurements = measurements + [
+                fixed_virtual_measurement
+            ] * virtual_batch_size
+            augmented_residual = lambda value: variable_projection_residual(
+                value,
+                augmented_poses,
+                augmented_measurements,
+                **projection_weights,
+            )
+        else:
+            augmented_poses = poses + [virtual_pose] * virtual_batch_size
+            augmented_measurements = measurements + [
+                fixed_virtual_measurement
+            ] * virtual_batch_size
+            augmented_residual = lambda value: solver.residual(
+                value,
+                augmented_poses,
+                augmented_measurements,
+                board_dimensions=board_dimensions,
+            )
+        if not additive_shared_information:
+            augmented_jacobian = numerical_jacobian(augmented_residual, state)
+            augmented_information = effective_handeye_information(
+                augmented_jacobian, state_scale=state_scale
+            )
         eigenvalues = np.linalg.eigvalsh(augmented_information)
         scored.append(
             CandidateScore(

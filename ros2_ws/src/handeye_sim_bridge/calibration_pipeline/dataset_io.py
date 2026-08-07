@@ -213,6 +213,18 @@ def result_payload(result, *, extra: dict | None = None) -> dict:
             "corner": estimate.board.corner.tolist(),
             "rotation": estimate.board.rotation.tolist(),
         },
+        "surface": {
+            "model": estimate.surface_model,
+            "basis_kind": estimate.surface_basis_kind,
+            "degree": estimate.surface_degree,
+            "coefficients_m": (
+                None
+                if estimate.shape_coefficients is None
+                else estimate.shape_coefficients.tolist()
+            ),
+            "rms_m": float(result.diagnostics.surface_rms_m),
+            "maximum_abs_m": float(result.diagnostics.surface_maximum_m),
+        },
         "diagnostics": {
             "rank": int(result.diagnostics.rank),
             "condition_number": float(result.diagnostics.condition_number),

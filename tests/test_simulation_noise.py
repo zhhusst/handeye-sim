@@ -135,6 +135,36 @@ def test_fixed_flatness_preserves_the_laser_plane():
     assert np.array_equal(deformed, repeated)
 
 
+def test_bounded_flatness_recomputes_endpoints_on_physical_edges():
+    model = SimulationNoiseModel(
+        ideal_noise_config(board_flatness_rms_m=5e-4)
+    )
+    # A diagonal flat scan bounded by v=0 (e1) and u=0.4 (e2).
+    endpoints = np.array([[0.05, 0.0, 0.0], [0.4, 0.35, 0.0]])
+    points = np.linspace(endpoints[0], endpoints[1], 301)
+    laser_normal = np.cross(
+        points[-1] - points[0], np.array([0.0, 0.0, 1.0])
+    )
+    laser_normal /= np.linalg.norm(laser_normal)
+    warped, warped_endpoints = model.deform_bounded_scanline(
+        points,
+        endpoints,
+        boundary_labels=["e1", "e2"],
+        laser_normal=laser_normal,
+        board_normal=np.array([0.0, 0.0, 1.0]),
+        corner=np.zeros(3),
+        board_u=np.array([1.0, 0.0, 0.0]),
+        board_v=np.array([0.0, 1.0, 0.0]),
+        width=0.4,
+        height=0.5,
+    )
+
+    assert len(warped) == len(points)
+    assert abs(warped_endpoints[0, 1]) < 1e-8
+    assert abs(warped_endpoints[1, 0] - 0.4) < 1e-8
+    assert np.max(np.abs((warped - points[0]) @ laser_normal)) < 1e-10
+
+
 def test_joint_snapshot_buffer_selects_delayed_encoder_state():
     history = JointSnapshotBuffer(maximum_size=4)
     history.append(1_000_000_000, np.array([1.0]))
@@ -143,4 +173,3 @@ def test_joint_snapshot_buffer_selects_delayed_encoder_state():
 
     assert history.delayed(1_025_000_000, 0.012)[0] == 2.0
     assert history.delayed(1_025_000_000, 0.100)[0] == 1.0
-

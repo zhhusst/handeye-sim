@@ -38,17 +38,42 @@ def scaled_jacobian(
 
 
 def effective_handeye_information(
-    jacobian_x9: np.ndarray,
+    jacobian_state: np.ndarray,
     damping: float = 1e-10,
     *,
     state_scale: np.ndarray | None = None,
 ) -> np.ndarray:
-    jacobian_scaled = scaled_jacobian(jacobian_x9, state_scale)
+    """Schur-marginalized information for the first six hand-eye states.
+
+    Every state after index six is nuisance.  For the flat V2 model this is
+    only board rotation; for shared-shape V2 it also includes board corner and
+    the target-form coefficients.
+    """
+    jacobian_scaled = scaled_jacobian(jacobian_state, state_scale)
+    if jacobian_scaled.shape[1] < 6:
+        raise ValueError("hand-eye information needs at least six state columns")
     hessian = jacobian_scaled.T @ jacobian_scaled
+    return effective_handeye_information_from_hessian(hessian, damping=damping)
+
+
+def effective_handeye_information_from_hessian(
+    hessian: np.ndarray,
+    damping: float = 1e-10,
+) -> np.ndarray:
+    """Marginalize nuisance states from a dimensionless normal matrix."""
+    hessian = np.asarray(hessian, dtype=float)
+    if hessian.ndim != 2 or hessian.shape[0] != hessian.shape[1]:
+        raise ValueError("hessian must be square")
+    if hessian.shape[0] < 6:
+        raise ValueError("hand-eye information needs at least six states")
     handeye = hessian[:6, :6]
-    cross = hessian[:6, 6:9]
-    board = hessian[6:9, 6:9]
-    effective = handeye - cross @ np.linalg.pinv(board + damping * np.eye(3)) @ cross.T
+    nuisance = hessian[6:, 6:]
+    if nuisance.size == 0:
+        return 0.5 * (handeye + handeye.T)
+    cross = hessian[:6, 6:]
+    effective = handeye - cross @ np.linalg.pinv(
+        nuisance + damping * np.eye(nuisance.shape[0])
+    ) @ cross.T
     return 0.5 * (effective + effective.T)
 
 
