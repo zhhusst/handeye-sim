@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypesns="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>fanuc_gocator_bridge</name>
+  <version>0.1.0</version>
+  <description>Safety-gated FANUC R-30iB and Gocator calibration backend.</description>
+  <maintainer email="z@z.com">Zhang HaHa</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>control_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>sensor_msgs_py</depend>
+  <depend>fanuc_m20id25_support</depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-pycomm3</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

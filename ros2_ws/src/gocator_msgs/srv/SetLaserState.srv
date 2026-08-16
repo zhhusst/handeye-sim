@@ -1,0 +1,5 @@
+# SetLaserState.srv
+bool enable   # true: 开启激光, false: 关闭激光
+---
+bool success  # 操作是否成功
+string message # 结果消息

@@ -107,6 +107,7 @@
   </link>
   <link name="fanuc_flange" />
   <link name="ee_link" />
+  <link name="tool0" />
   <link name="gocator_sensor">
     <visual>
       <origin xyz="0 0 -0.270" rpy="0 0 0" />
@@ -120,6 +121,16 @@
       <mass value="1.5"/>
       <inertia ixx="0.1" ixy="0.0" ixz="0.0" iyy="0.1" iyz="0.0" izz="0.1"/>
     </inertial>
+  </link>
+  <link name="weld_gun">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry><mesh filename="file:///workspace/meshes/weldgun.stl" scale="0.001 0.001 0.001" /></geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0" />
+      <geometry><mesh filename="file:///workspace/meshes/weldgun.stl" scale="0.001 0.001 0.001" /></geometry>
+    </collision>
   </link>
   <joint name="base_joint" type="fixed">
     <origin xyz="0 0 0" rpy="0 0 0" />
@@ -182,6 +193,16 @@
     <origin xyz="-0.011579 -0.004621 0.359284" rpy="0.485145 0.160648 -1.509479" />
     <parent link="fanuc_flange" />
     <child link="gocator_sensor" />
+  </joint>
+  <joint name="fanuc_flange-weld_gun_joint" type="fixed">
+    <origin xyz="-0.046256 -0.000142 0.375235" rpy="-3.141540 -0.384130 -0.000070" />
+    <parent link="fanuc_flange" />
+    <child link="weld_gun" />
+  </joint>
+  <joint name="fanuc_flange-tool0_joint" type="fixed">
+    <origin xyz="-0.046256 -0.000142 0.375235" rpy="-3.141540 -0.384130 -0.000070" />
+    <parent link="fanuc_flange" />
+    <child link="tool0" />
   </joint>
   <joint name="child_joint_joint" type="fixed">
     <origin xyz="0 0 0" rpy="0 0 0" />

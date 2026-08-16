@@ -25,6 +25,11 @@ def test_twelve_dof_v2_recovers_noise_free_scene():
     )
     assert result.converged
     assert result.diagnostics.rank == 9
+    assert result.diagnostics.prior_augmented_rank == 9
+    assert np.allclose(
+        result.diagnostics.singular_values,
+        result.diagnostics.prior_augmented_singular_values,
+    )
     assert rotation_distance_deg(
         result.estimate.handeye_rotation, scene.handeye_rotation
     ) < 1e-5
@@ -95,3 +100,20 @@ def test_projected_corner_is_counted_in_residual_variance_dof():
     )
     # 15 residuals - 9 nonlinear states - 3 projected corner coordinates.
     assert np.isclose(variance, float(residual @ residual) / 3.0)
+
+
+def test_prior_rows_do_not_count_as_measurement_variance_samples():
+    jacobian = np.vstack((np.eye(9), np.eye(9)))
+    data_residual = np.ones(12) * 0.1
+    augmented_residual = np.concatenate(
+        (data_residual, np.ones(6) * 100.0)
+    )
+    _, variance = covariance_from_jacobian(
+        jacobian,
+        augmented_residual,
+        variance_residual=data_residual,
+    )
+    assert np.isclose(
+        variance,
+        float(data_residual @ data_residual) / (len(data_residual) - 9),
+    )

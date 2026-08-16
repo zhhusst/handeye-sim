@@ -31,7 +31,7 @@ def test_scanline_accepts_scene_publisher_keyword_interface():
 
 def test_factory_fov_places_sensor_origin_inside_laser_plane():
     path = Path(
-        "ros2_ws/src/handeye_sim_bridge/config/fov_factory_calib.json"
+        "ros2_ws/src/handeye_sim_backend/config/fov_factory_calib.json"
     )
     corners = np.asarray(
         json.loads(path.read_text(encoding="utf-8"))["fov_corners_S"],
@@ -63,7 +63,7 @@ def test_factory_fov_places_sensor_origin_inside_laser_plane():
 def test_github_initial_observation_pose_produces_a_scanline():
     corners = json.loads(
         Path(
-            "ros2_ws/src/handeye_sim_bridge/config/fov_factory_calib.json"
+            "ros2_ws/src/handeye_sim_backend/config/fov_factory_calib.json"
         ).read_text(encoding="utf-8")
     )["fov_corners_S"]
     rotation_sensor_base = np.array(

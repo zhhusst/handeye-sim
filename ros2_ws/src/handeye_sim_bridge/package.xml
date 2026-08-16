@@ -23,6 +23,9 @@
   <depend>moveit_msgs</depend>
   <depend>shape_msgs</depend>
   <depend>ament_index_python</depend>
+  <depend>handeye_calibration_core</depend>
+  <depend>fanuc_m20id25_support</depend>
+  <exec_depend>handeye_sim_backend</exec_depend>
 
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>

@@ -1,12 +1,12 @@
 Panels:
   - Class: rviz_common/Displays
-    Help Height: 70
+    Help Height: 0
     Name: Displays
     Property Tree Widget:
       Expanded:
         - /TF1/Frames1
       Splitter Ratio: 0.5
-    Tree Height: 155
+    Tree Height: 292
   - Class: rviz_common/Views
     Expanded:
       - /Current View1
@@ -103,6 +103,15 @@ Visualization Manager:
           Show Axes: false
           Show Trail: false
           Value: true
+        tool0:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+        weld_gun:
+          Alpha: 1
+          Show Axes: false
+          Show Trail: false
+          Value: true
         world:
           Alpha: 1
           Show Axes: false
@@ -119,20 +128,27 @@ Visualization Manager:
       Enabled: true
       Name: CalibMarkers
       Namespaces:
-        endpoints: true
-        fov_plane_edge: true
-        fov_plane_surface: true
-        intersection_line: true
-        plate: true
-        plate_edge: true
-        scanline: true
-        sensor_frame: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /calib/markers
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: ProfileDetection
+      Namespaces:
+        axes: true
+        detection_guide: true
+        profile: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /gocator/profile_viz
       Value: true
     - Class: rviz_default_plugins/InteractiveMarkers
       Enable Transparency: true
@@ -173,63 +189,7 @@ Visualization Manager:
           Expand Joint Details: false
           Expand Link Details: false
           Expand Tree: false
-          J1_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J2_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J3_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J4_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J5_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J6_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
           Link Tree Style: Links in Alphabetic Order
-          base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          ee_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          fanuc_flange:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          flange:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          gocator_sensor:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          world:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
         Loop Animation: false
         Robot Alpha: 0.5
         Robot Color: 150; 50; 150
@@ -275,168 +235,28 @@ Visualization Manager:
           Expand Joint Details: false
           Expand Link Details: false
           Expand Tree: false
-          J1_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J2_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J3_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J4_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J5_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          J6_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
           Link Tree Style: Links in Alphabetic Order
-          base_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          ee_link:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          fanuc_flange:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          flange:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-          gocator_sensor:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
-            Value: true
-          world:
-            Alpha: 1
-            Show Axes: false
-            Show Trail: false
         Robot Alpha: 1
         Show Robot Collision: false
         Show Robot Visual: true
       Value: true
       Velocity_Scaling_Factor: 0.1
-    - Alpha: 1
-      Autocompute Intensity Bounds: true
-      Autocompute Value Bounds:
-        Max Value: 10
-        Min Value: -10
-        Value: true
-      Axis: Z
-      Channel Name: intensity
-      Class: rviz_default_plugins/PointCloud2
-      Color: 255; 255; 255
-      Color Transformer: Intensity
-      Decay Time: 0
-      Enabled: true
-      Invert Rainbow: false
-      Max Color: 255; 255; 255
-      Max Intensity: 4096
-      Min Color: 0; 0; 0
-      Min Intensity: 0
-      Name: PointCloud2
-      Position Transformer: XYZ
-      Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.009999999776482582
-      Style: Flat Squares
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /gocator/profile
-      Use Fixed Frame: true
-      Use rainbow: true
-      Value: true
     - Class: rviz_default_plugins/TF
-      Enabled: true
+      Enabled: false
       Filter (blacklist): ""
       Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
         All Enabled: false
-        J1_link:
-          Value: false
-        J2_link:
-          Value: false
-        J3_link:
-          Value: false
-        J4_link:
-          Value: false
-        J5_link:
-          Value: false
-        J6_link:
-          Value: false
-        base_link:
-          Value: false
-        ee_link:
-          Value: false
-        fanuc_flange:
-          Value: false
-        flange:
-          Value: false
-        gocator_sensor:
-          Value: true
-        world:
-          Value: false
       Marker Scale: 1
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: false
       Tree:
-        world:
-          base_link:
-            J1_link:
-              J2_link:
-                J3_link:
-                  J4_link:
-                    J5_link:
-                      J6_link:
-                        flange:
-                          ee_link:
-                            {}
-                          fanuc_flange:
-                            gocator_sensor:
-                              {}
+        {}
       Update Interval: 0
-      Value: true
-    - Class: rviz_default_plugins/Image
-      Enabled: true
-      Max Value: 1
-      Median window: 5
-      Min Value: 0
-      Name: Image
-      Normalize Range: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /gocator/profile_2d
-      Value: true
+      Value: false
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -476,7 +296,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 2.6301469802856445
+      Distance: 0.6602567434310913
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -491,10 +311,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.9347966313362122
+      Pitch: -0.04520251601934433
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 2.378183364868164
+      Yaw: 0.32318663597106934
     Saved: ~
 Window Geometry:
   Displays:
@@ -502,15 +322,13 @@ Window Geometry:
   Height: 1142
   Hide Left Dock: false
   Hide Right Dock: false
-  Image:
-    collapsed: false
   MotionPlanning:
     collapsed: false
   MotionPlanning - Trajectory Slider:
     collapsed: false
-  QMainWindow State: 000000ff00000000fd0000000100000000000001c900000420fc0200000007fb000000100044006900730070006c006100790073010000003b0000011c000000c700fffffffb0000000a00560069006500770073010000015d000000c5000000a000fffffffb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e006701000002280000016b0000016900fffffffb000000280020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000000000000000fb0000000a0049006d0061006700650100000399000000c20000001600fffffffb0000000a0049006d0061006700650100000508000000dd00000000000000000000056f0000042000000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
+  QMainWindow State: 000000ff00000000fd0000000100000000000001c900000420fc0200000007fb000000100044006900730070006c006100790073010000003b0000015f000000c700fffffffb0000000a0056006900650077007301000001a0000000f4000000a000fffffffb00000044004d006f00740069006f006e0050006c0061006e006e0069006e00670020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000003f00fffffffb0000001c004d006f00740069006f006e0050006c0061006e006e0069006e0067010000029a000001c10000016900fffffffb000000280020002d0020005400720061006a006500630074006f0072007900200053006c00690064006500720000000000ffffffff0000000000000000fb0000000a0049006d0061006700650100000399000000c20000000000000000fb0000000a0049006d0061006700650100000508000000dd00000000000000000000056f0000042000000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
   Views:
     collapsed: false
   Width: 1854
-  X: -604
+  X: 88
   Y: 31

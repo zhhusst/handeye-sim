@@ -31,8 +31,9 @@ import yaml
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
-PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_bridge"
-sys.path.insert(0, str(PACKAGE_ROOT))
+CORE_PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_calibration_core"
+ROS_PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_bridge"
+sys.path.insert(0, str(CORE_PACKAGE_ROOT))
 
 from calibration_pipeline.dataset_io import (  # noqa: E402
     SeedObservationGroup,
@@ -610,8 +611,8 @@ def complexity_inventory(config_path: Path) -> dict:
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     parameters = config["/**"]["ros__parameters"]
     roots = {
-        "algorithm_core": PACKAGE_ROOT / "calibration_pipeline",
-        "ros_nodes": PACKAGE_ROOT / "handeye_sim_bridge",
+        "algorithm_core": CORE_PACKAGE_ROOT / "calibration_pipeline",
+        "ros_nodes": ROS_PACKAGE_ROOT / "handeye_sim_bridge",
         "scripts": WORKSPACE / "scripts",
     }
     lines = {}
@@ -636,14 +637,14 @@ def complexity_inventory(config_path: Path) -> dict:
             "seed_collection_node.py": sum(
                 1
                 for _ in (
-                    PACKAGE_ROOT
+                    ROS_PACKAGE_ROOT
                     / "handeye_sim_bridge/seed_collection_node.py"
                 ).open(encoding="utf-8")
             ),
             "active_calibration_sim_node.py": sum(
                 1
                 for _ in (
-                    PACKAGE_ROOT
+                    ROS_PACKAGE_ROOT
                     / "handeye_sim_bridge/active_calibration_sim_node.py"
                 ).open(encoding="utf-8")
             ),
@@ -1021,7 +1022,7 @@ def main() -> int:
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "scope": "simulation evidence only",
         "complexity": complexity_inventory(
-            PACKAGE_ROOT / "config/calibration.yaml"
+            ROS_PACKAGE_ROOT / "config/calibration.yaml"
         ),
         "detector": detector_ablation(
             args.detector_frames, args.random_seed

@@ -8,6 +8,7 @@ RUN apt-get update -qq && \
       python3-yaml \
       python3-matplotlib \
       python3-pytest \
+      python3-pip \
       novnc \
       openbox \
       websockify \
@@ -19,6 +20,11 @@ RUN apt-get update -qq && \
       ros-jazzy-gz-ros2-control \
       ros-jazzy-ros-gz-bridge \
     && rm -rf /var/lib/apt/lists/*
+
+# FANUC explicit EtherNet/IP transport used by the real-hardware backend.
+COPY requirements-real.txt /tmp/requirements-real.txt
+RUN python3 -m pip install --break-system-packages --no-cache-dir \
+      -r /tmp/requirements-real.txt && rm /tmp/requirements-real.txt
 
 ENV SHELL=/bin/bash
 RUN echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc

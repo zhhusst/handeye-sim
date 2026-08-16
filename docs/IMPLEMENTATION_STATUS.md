@@ -25,19 +25,21 @@ V5保留为历史推导，V6以当前代码实际行为为准。
 | 完整变量投影信息增益 | `nbv/scoring.py` | 已实现 |
 | 自适应停止 | `nbv/stopping.py` | 已实现 |
 | 事务性试更新与跳变拒绝 | `pipeline.py` | 已实现 |
-| IK、关节限位 | ROS 运动适配层 | 已接入仿真流水线 |
-| NBV碰撞与整条路径检查 | MoveIt规划服务 | 已接入仿真流水线 |
-| 候选级联与运动感知排序 | `pipeline.py`、`active_calibration_sim_node.py` | 已实现平板侧、IK、运动增量、目标碰撞和路径级联 |
-| 真实帧拒绝与安全回退重选 | `active_calibration_sim_node.py` | 已实现候选黑名单、回退后新鲜双边验证和有限次数重选 |
-| 轮廓/断点/编码器触发同步 | `scene_publisher_node.py`、两个采集节点 | 已实现同时间戳配对；NBV多帧各自保留法兰位姿 |
+| IK、关节限位 | ROS 运动适配层 | 仿真已接入；真机运动仍关闭 |
+| NBV碰撞与整条路径检查 | MoveIt规划服务 | 仿真已接入；真机plan-only待验收 |
+| 候选级联与运动感知排序 | `pipeline.py`、`active_calibration_node.py` | 已实现平板侧、IK、运动增量、目标碰撞和路径级联 |
+| 真实帧拒绝与安全回退重选 | `active_calibration_node.py` | 已实现候选黑名单、回退后新鲜双边验证和有限次数重选 |
+| 轮廓/断点/编码器触发同步 | `handeye_sim_backend/scene_publisher_node.py`、`fanuc_gocator_bridge/measurement_sync_node.py`、两个采集节点 | 仿真已实现同时间戳配对；真机只观察链路待现场验收 |
 | 六种子多帧稳健初解 | `seed_collection/multiframe.py`、`dataset_io.py`、`initial_validation.py` | 已实现每物理姿态20帧、整帧断点MAD筛选、schema 3分组、bootstrap门控与首轮协方差膨胀 |
-| 综合仿真噪声 | `simulation/noise.py`、`scene_publisher_node.py` | 已实现轮廓/断点、机器人、固定平面度、同步、离群与漏检；YAML可配且可复现 |
-| 完整ROS NBV自动执行 | `active_calibration_sim_node.py` | 仿真已跑通；实物明确不在当前范围 |
+| 综合仿真噪声 | `simulation/noise.py`、`handeye_sim_backend/scene_publisher_node.py` | 已实现轮廓/断点、机器人、固定平面度、同步、离群与漏检；YAML可配且可复现 |
+| 完整ROS NBV自动执行 | `active_calibration_node.py` | 仿真已跑通；真机只观察阶段禁止运动 |
+| 真机Gocator原始轮廓与米制适配 | `gocator_profile_driver`、`fanuc_gocator_bridge/profile_metric_adapter_node.py` | 已迁移并构建通过；待实物联调 |
+| FANUC只读关节与J2/J3安全门 | `fanuc_gocator_bridge/joint_state_node.py` | 已实现；未验证J2/J3时不发布标定关节状态 |
 | 两终端中文交互与人工六种子模式 | `scripts/start_calibration.sh`、`calibration_console.py` | 已实现并完成仿真联调 |
 
 “已实现”表示模块、数值约束和单元/仿真测试存在，不表示文档第20节中的实物实验参数
-已经得到证明。当前只能做仿真，Sigma点概率阈值、停止阈值、真实材质反射和真实Gocator
-断点鲁棒性仍未验证。
+已经得到证明。当前真机代码仅开放`observe_only`，Sigma点概率阈值、停止阈值、真实材质反射、真实Gocator
+断点鲁棒性以及机器人运动链均尚未验收。
 
 ## 重要边界
 

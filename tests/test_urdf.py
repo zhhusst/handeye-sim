@@ -53,3 +53,35 @@ def test_simulation_truth_matches_urdf_fixed_handeye_joint():
         scene.handeye_rotation,
         Rotation.from_euler("xyz", rpy).as_matrix(),
     )
+
+
+def test_welding_torch_is_attached_at_validated_tcp():
+    root = ET.fromstring(Path("urdf/calib_robot.urdf").read_text(encoding="utf-8"))
+    links = {link.attrib["name"]: link for link in root.findall("link")}
+    assert "weld_gun" in links
+    visual_mesh = links["weld_gun"].find("visual/geometry/mesh")
+    assert visual_mesh is not None
+    assert visual_mesh.attrib["filename"].endswith("/meshes/weldgun.stl")
+    assert visual_mesh.attrib["scale"] == "0.001 0.001 0.001"
+
+    torch_joint = root.find("./joint[@name='fanuc_flange-weld_gun_joint']")
+    tool0_joint = root.find("./joint[@name='fanuc_flange-tool0_joint']")
+    assert torch_joint is not None
+    assert tool0_joint is not None
+    assert torch_joint.find("parent").attrib["link"] == "fanuc_flange"
+    assert torch_joint.find("child").attrib["link"] == "weld_gun"
+    assert tool0_joint.find("child").attrib["link"] == "tool0"
+
+    torch_origin = torch_joint.find("origin")
+    tool0_origin = tool0_joint.find("origin")
+    assert torch_origin is not None
+    assert tool0_origin is not None
+    assert np.allclose(
+        np.fromstring(torch_origin.attrib["xyz"], sep=" "),
+        [-0.046256, -0.000142, 0.375235],
+    )
+    assert np.allclose(
+        np.fromstring(torch_origin.attrib["rpy"], sep=" "),
+        [-3.141540, -0.384130, -0.000070],
+    )
+    assert tool0_origin.attrib == torch_origin.attrib

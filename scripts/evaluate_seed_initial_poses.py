@@ -17,8 +17,13 @@ import numpy as np
 
 
 WORKSPACE = Path("/workspace")
-PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_bridge"
-sys.path.insert(0, str(PACKAGE_ROOT))
+CORE_PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_calibration_core"
+ROS_PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_bridge"
+FANUC_SUPPORT_ROOT = WORKSPACE / "ros2_ws/src/fanuc_m20id25_support"
+SIM_BACKEND_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_backend"
+sys.path.insert(0, str(ROS_PACKAGE_ROOT))
+sys.path.insert(0, str(FANUC_SUPPORT_ROOT))
+sys.path.insert(0, str(CORE_PACKAGE_ROOT))
 
 from calibration_pipeline.geometry import (
     invert_transform,
@@ -42,7 +47,7 @@ from calibration_pipeline.simulation.scene_truth import (
     HAND_EYE_ROTATION,
     HAND_EYE_TRANSLATION,
 )
-from handeye_sim_bridge.fanuc_kinematic import (
+from fanuc_m20id25_support.fanuc_kinematic import (
     JOINT_LIMITS_DEG,
     forward_kinematics_urdf,
     inverse_kinematics_numeric,
@@ -82,7 +87,7 @@ class VirtualSeedStudy:
         )
         factory = json.loads(
             (
-                PACKAGE_ROOT / "config/fov_factory_calib.json"
+                SIM_BACKEND_ROOT / "config/fov_factory_calib.json"
             ).read_text(encoding="utf-8")
         )
         self.fov_corners = np.asarray(factory["fov_corners_S"], dtype=float)

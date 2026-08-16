@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate the self-contained FANUC M-20iD/25 + Gocator URDF."""
+"""Generate the self-contained FANUC M-20iD/25 + tool URDF."""
 
 import math
 from pathlib import Path
@@ -41,6 +41,15 @@ JOINTS = [
     ('fanuc_flange-gocator_sensor', 'fixed',
      '-0.011579 -0.004621 0.359284', '0.485145 0.160648 -1.509479', None,
      'fanuc_flange', 'gocator_sensor', None),
+    # Physical welding torch copied from the validated welding workspace.
+    # The weld_gun frame origin is the nozzle/TCP.  tool0 is a geometry-free
+    # alias of that same TCP for compatibility with the welding stack.
+    ('fanuc_flange-weld_gun', 'fixed',
+     '-0.046256 -0.000142 0.375235', '-3.141540 -0.384130 -0.000070', None,
+     'fanuc_flange', 'weld_gun', None),
+    ('fanuc_flange-tool0', 'fixed',
+     '-0.046256 -0.000142 0.375235', '-3.141540 -0.384130 -0.000070', None,
+     'fanuc_flange', 'tool0', None),
     ('child_joint', 'fixed', '0 0 0', '0 0 0', None,
      'flange', 'ee_link', None),
 ]
@@ -85,7 +94,7 @@ def gen():
       'iyy="0.1" iyz="0.0" izz="0.1"/>')
     w('    </inertial>')
     w('  </link>')
-    for name in ('fanuc_flange', 'ee_link'):
+    for name in ('fanuc_flange', 'ee_link', 'tool0'):
         w(f'  <link name="{name}" />')
 
     # GoCator
@@ -103,6 +112,25 @@ def gen():
     w('      <inertia ixx="0.1" ixy="0.0" ixz="0.0" '
       'iyy="0.1" iyz="0.0" izz="0.1"/>')
     w('    </inertial>')
+    w('  </link>')
+
+    # Welding gun.  The STL is expressed in millimetres and its model origin
+    # is the nozzle tip, so the mesh and weld_gun TF share the physical TCP.
+    w('  <link name="weld_gun">')
+    w('    <visual>')
+    w('      <origin xyz="0 0 0" rpy="0 0 0" />')
+    w(
+        f'      <geometry><mesh filename="{MESH}/weldgun.stl" '
+        'scale="0.001 0.001 0.001" /></geometry>'
+    )
+    w('    </visual>')
+    w('    <collision>')
+    w('      <origin xyz="0 0 0" rpy="0 0 0" />')
+    w(
+        f'      <geometry><mesh filename="{MESH}/weldgun.stl" '
+        'scale="0.001 0.001 0.001" /></geometry>'
+    )
+    w('    </collision>')
     w('  </link>')
 
     # base_joint: world → base_link

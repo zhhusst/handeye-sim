@@ -24,8 +24,9 @@ import yaml
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
-PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_bridge"
-sys.path.insert(0, str(PACKAGE_ROOT))
+CORE_PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_calibration_core"
+ROS_PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_bridge"
+sys.path.insert(0, str(CORE_PACKAGE_ROOT))
 
 from calibration_pipeline.dataset_io import (  # noqa: E402
     SeedObservationGroup,
@@ -64,7 +65,7 @@ from calibration_pipeline.v2_backend.residual import (  # noqa: E402
 )
 
 
-CONFIG_PATH = PACKAGE_ROOT / "config/calibration.yaml"
+CONFIG_PATH = ROS_PACKAGE_ROOT / "config/calibration.yaml"
 DEFAULT_JSON = WORKSPACE / "data/precision_error_budget.json"
 DEFAULT_REPORT = WORKSPACE / "docs/精度误差预算与归因报告.md"
 

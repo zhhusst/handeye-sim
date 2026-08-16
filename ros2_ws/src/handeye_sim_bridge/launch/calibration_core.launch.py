@@ -26,8 +26,8 @@ def generate_launch_description():
             DeclareLaunchArgument("collect_seeds", default_value="false"),
             DeclareLaunchArgument("run_active", default_value="false"),
             Node(
-                package="handeye_sim_bridge",
-                executable="scene_publisher_node",
+                package="handeye_sim_backend",
+                executable="scene_publisher",
                 name="calibration_scene",
                 parameters=[config, {"use_sim_time": use_sim_time}],
                 output="screen",

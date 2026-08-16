@@ -165,3 +165,352 @@ def test_detector_recovers_hidden_simulation_endpoints_without_truth_input():
         + np.linalg.norm(detection.second - truth[0])
     )
     assert min(direct, swapped) / 2.0 < 0.0005
+
+
+def _target_surface_config():
+    return EndpointDetectionConfig(
+        minimum_segment_length_m=0.10,
+        maximum_segment_length_m=0.14,
+        maximum_residual_rms_m=0.00015,
+        smoothing_window=5,
+        local_fit_window=16,
+        angle_change_threshold_deg=10.0,
+        height_jump_threshold_m=0.0002,
+        breakpoint_cluster_points=12,
+    )
+
+
+def test_detector_extracts_thin_plate_between_small_parallel_height_steps():
+    rng = np.random.default_rng(20260814)
+    x = np.linspace(-0.15, 0.15, 1201)
+    z = 0.30 + 0.15 * x
+    on_plate = (x >= -0.06) & (x <= 0.06)
+    z[on_plate] -= 0.0008
+    z += rng.normal(0.0, 0.00003, len(z))
+    profile = np.column_stack((x, np.zeros(len(x)), z))
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    result = detector.detect(profile)
+
+    assert result is not None
+    assert result.selection_mode == "change_point"
+    assert result.breakpoint_count == 2
+    assert len(result.surface_points) == result.support_count
+    assert np.min(result.surface_points[:, 0]) > -0.061
+    assert np.max(result.surface_points[:, 0]) < 0.061
+    assert abs(result.first[0] + 0.06) < 0.0005
+    assert abs(result.second[0] - 0.06) < 0.0005
+
+
+def test_detector_rejects_thick_side_walls_and_selects_top_surface():
+    rng = np.random.default_rng(8)
+
+    def segment(x0, z0, x1, z1, count, *, endpoint=False):
+        x = np.linspace(x0, x1, count, endpoint=endpoint)
+        z = np.linspace(z0, z1, count, endpoint=endpoint)
+        return np.column_stack((x, np.zeros(count), z))
+
+    profile = np.vstack(
+        (
+            segment(-0.15, 0.30, -0.06, 0.30, 360),
+            segment(-0.06, 0.30, -0.06, 0.285, 60),
+            segment(-0.06, 0.285, 0.06, 0.285, 480),
+            segment(0.06, 0.285, 0.06, 0.30, 60),
+            segment(0.06, 0.30, 0.15, 0.30, 361, endpoint=True),
+        )
+    )
+    profile[:, (0, 2)] += rng.normal(
+        0.0, 0.00002, (len(profile), 2)
+    )
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    result = detector.detect(profile)
+
+    assert result is not None
+    assert result.selection_mode == "change_point"
+    assert len(result.surface_points) > 400
+    assert np.ptp(result.surface_points[:, 0]) > 0.11
+    assert np.ptp(result.surface_points[:, 2]) < 0.0002
+    assert abs(result.first[0] + 0.06) < 0.001
+    assert abs(result.second[0] - 0.06) < 0.001
+
+
+def test_guided_detector_selects_target_instead_of_longer_parallel_table():
+    rng = np.random.default_rng(91)
+    table_left_x = np.linspace(-0.18, -0.05, 520, endpoint=False)
+    target_x = np.linspace(-0.05, 0.05, 400, endpoint=False)
+    table_right_x = np.linspace(0.05, 0.18, 521)
+    profile_x = np.concatenate((table_left_x, target_x, table_right_x))
+    profile_z = np.concatenate(
+        (
+            np.full(len(table_left_x), 0.3000),
+            np.full(len(target_x), 0.2992),
+            np.full(len(table_right_x), 0.3000),
+        )
+    )
+    profile_z += rng.normal(0.0, 0.000025, len(profile_z))
+    profile = np.column_stack(
+        (profile_x, np.zeros(len(profile_x)), profile_z)
+    )
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    result = detector.detect_guided(
+        profile,
+        np.array([-0.05, 0.0, 0.2992]),
+        np.array([0.05, 0.0, 0.2992]),
+        normal_gate_m=0.00045,
+        endpoint_gate_m=0.008,
+        maximum_angle_difference_deg=8.0,
+        selection_mode="guided_align",
+    )
+
+    assert result is not None
+    assert result.selection_mode == "guided_align"
+    assert abs(result.first[0] + 0.05) < 0.001
+    assert abs(result.second[0] - 0.05) < 0.001
+    assert np.max(result.surface_points[:, 2]) < 0.2995
+
+
+def test_guided_detector_does_not_jump_to_unrelated_line_when_target_is_lost():
+    x = np.linspace(-0.18, 0.18, 1201)
+    table = np.column_stack(
+        (x, np.zeros(len(x)), np.full(len(x), 0.3000))
+    )
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    result = detector.detect_guided(
+        table,
+        np.array([-0.05, 0.0, 0.2900]),
+        np.array([0.05, 0.0, 0.2900]),
+        normal_gate_m=0.001,
+        endpoint_gate_m=0.01,
+        selection_mode="guided_track",
+    )
+
+    assert result is None
+    assert detector.last_rejection_reason in {
+        "guided_roi_has_too_few_points",
+        "guided_target_not_found",
+    }
+
+
+def test_wide_guided_recovery_resplits_top_surface_and_side_walls():
+    """A wider recall ROI must not merge several physical surfaces."""
+
+    def segment(x0, z0, x1, z1, count, *, endpoint=False):
+        x = np.linspace(x0, x1, count, endpoint=endpoint)
+        z = np.linspace(z0, z1, count, endpoint=endpoint)
+        return np.column_stack((x, np.zeros(count), z))
+
+    profile = np.vstack(
+        (
+            segment(-0.15, 0.30, -0.06, 0.30, 360),
+            segment(-0.06, 0.30, -0.06, 0.285, 60),
+            segment(-0.06, 0.285, 0.06, 0.285, 480),
+            segment(0.06, 0.285, 0.06, 0.30, 60),
+            segment(0.06, 0.30, 0.15, 0.30, 361, endpoint=True),
+        )
+    )
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    result = detector.detect_guided(
+        profile,
+        np.array([-0.06, 0.0, 0.285]),
+        np.array([0.06, 0.0, 0.285]),
+        # This deliberately includes both side walls and nearby table points.
+        normal_gate_m=0.020,
+        endpoint_gate_m=0.040,
+        maximum_angle_difference_deg=35.0,
+        selection_mode="local_reacquire",
+    )
+
+    assert result is not None
+    assert result.selection_mode == "local_reacquire"
+    assert abs(result.first[0] + 0.06) < 0.001
+    assert abs(result.second[0] - 0.06) < 0.001
+    # At most one acquisition cell from each adjoining wall is retained at
+    # the fitted physical boundary; the wall itself is not merged.
+    assert np.ptp(result.surface_points[:, 2]) < 0.0003
+
+
+def test_temporal_breakpoint_pair_tracks_shifted_top_between_physical_edges():
+    rng = np.random.default_rng(41)
+
+    def segment(x0, z0, x1, z1, count, *, endpoint=False):
+        x = np.linspace(x0, x1, count, endpoint=endpoint)
+        z = np.linspace(z0, z1, count, endpoint=endpoint)
+        return np.column_stack((x, np.zeros(count), z))
+
+    shift = np.array([0.0018, 0.0, -0.0012])
+    profile = np.vstack(
+        (
+            segment(-0.15, 0.30, -0.06, 0.30, 360),
+            segment(-0.06, 0.30, -0.06, 0.285, 60),
+            segment(-0.06, 0.285, 0.06, 0.285, 480),
+            segment(0.06, 0.285, 0.06, 0.30, 60),
+            segment(0.06, 0.30, 0.15, 0.30, 361, endpoint=True),
+        )
+    )
+    profile += shift
+    profile[:, (0, 2)] += rng.normal(0.0, 0.00002, (len(profile), 2))
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    result = detector.detect_temporal_breakpoint_pair(
+        profile,
+        np.array([-0.06, 0.0, 0.285]) + shift,
+        np.array([0.06, 0.0, 0.285]) + shift,
+        endpoint_gate_m=0.004,
+        normal_gate_m=0.002,
+        maximum_angle_difference_deg=10.0,
+    )
+
+    assert result is not None
+    assert result.selection_mode == "seed_temporal_track"
+    assert abs(result.first[0] - (-0.06 + shift[0])) < 0.001
+    assert abs(result.second[0] - (0.06 + shift[0])) < 0.001
+    assert np.ptp(result.surface_points[:, 2]) < 0.00035
+
+
+def test_temporal_breakpoint_pair_does_not_use_roi_crop_as_fake_endpoints():
+    profile = make_profile((-0.15, 0.30), (0.15, 0.30), count=1201)
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    result = detector.detect_temporal_breakpoint_pair(
+        profile,
+        np.array([-0.05, 0.0, 0.30]),
+        np.array([0.05, 0.0, 0.30]),
+        endpoint_gate_m=0.005,
+        normal_gate_m=0.002,
+    )
+
+    assert result is None
+    assert detector.last_rejection_reason == "tracked_breakpoint_pair_not_found"
+
+
+def test_temporal_pair_spans_internal_false_change_point_between_real_edges():
+    def segment(x0, z0, x1, z1, count, *, endpoint=False):
+        x = np.linspace(x0, x1, count, endpoint=endpoint)
+        z = np.linspace(z0, z1, count, endpoint=endpoint)
+        return np.column_stack((x, np.zeros(count), z))
+
+    profile = np.vstack(
+        (
+            segment(-0.15, 0.30, -0.06, 0.30, 360),
+            segment(-0.06, 0.30, -0.06, 0.285, 60),
+            segment(-0.06, 0.285, 0.06, 0.285, 480),
+            segment(0.06, 0.285, 0.06, 0.30, 60),
+            segment(0.06, 0.30, 0.15, 0.30, 361, endpoint=True),
+        )
+    )
+    detector = ProfileEndpointDetector(_target_surface_config())
+    # The extra index 660 imitates a weak response inside the target surface.
+    # An adjacency-only implementation incorrectly returns a short half plate.
+    detector._change_points = lambda _component: [360, 420, 660, 900, 960]
+
+    result = detector.detect_temporal_breakpoint_pair(
+        profile,
+        np.array([-0.06, 0.0, 0.285]),
+        np.array([0.06, 0.0, 0.285]),
+        endpoint_gate_m=0.004,
+        normal_gate_m=0.002,
+        maximum_angle_difference_deg=10.0,
+    )
+
+    assert result is not None
+    assert abs(result.first[0] + 0.06) < 0.001
+    assert abs(result.second[0] - 0.06) < 0.001
+    assert result.segment_length_m > 0.119
+
+
+def test_guided_pair_spans_weak_internal_changes_between_real_edges():
+    """ALIGN must evaluate the full physical chord, not only adjacent ripples."""
+
+    def segment(x0, z0, x1, z1, count, *, endpoint=False):
+        x = np.linspace(x0, x1, count, endpoint=endpoint)
+        z = np.linspace(z0, z1, count, endpoint=endpoint)
+        return np.column_stack((x, np.zeros(count), z))
+
+    profile = np.vstack(
+        (
+            segment(-0.15, 0.30, -0.06, 0.30, 360),
+            segment(-0.06, 0.30, -0.06, 0.285, 60),
+            segment(-0.06, 0.285, 0.06, 0.285, 480),
+            segment(0.06, 0.285, 0.06, 0.30, 60),
+            segment(0.06, 0.30, 0.15, 0.30, 361, endpoint=True),
+        )
+    )
+    detector = ProfileEndpointDetector(_target_surface_config())
+    # Several weak responses lie between the two real edges.  The old ALIGN
+    # implementation considered only adjacent spans and could never propose
+    # the complete top surface.
+    detector._change_points = lambda component: [
+        len(component) // 5,
+        len(component) // 2,
+        4 * len(component) // 5,
+    ]
+
+    result = detector.detect_guided(
+        profile,
+        np.array([-0.055, 0.0, 0.285]),
+        np.array([0.072, 0.0, 0.285]),
+        normal_gate_m=0.003,
+        endpoint_gate_m=0.016,
+        maximum_angle_difference_deg=12.0,
+        selection_mode="guided_align",
+    )
+
+    assert result is not None
+    assert abs(result.first[0] + 0.06) < 0.001
+    assert abs(result.second[0] - 0.06) < 0.001
+    assert result.segment_length_m > 0.119
+
+
+def test_detector_accepts_a_measured_twelve_millimetre_surface_chord():
+    profile = make_profile(
+        (-0.006, 0.30), (0.006, 0.30), count=121, noise_std=2.0e-5
+    )
+    detector = ProfileEndpointDetector(
+        EndpointDetectionConfig(
+            minimum_segment_length_m=0.010,
+            maximum_segment_length_m=0.020,
+            maximum_residual_rms_m=0.0002,
+        )
+    )
+
+    result = detector.detect(profile)
+
+    assert result is not None
+    assert 0.0115 < result.segment_length_m < 0.0125
+
+
+def test_temporal_candidates_keep_one_visible_physical_breakpoint():
+    def segment(x0, z0, x1, z1, count, *, endpoint=False):
+        x = np.linspace(x0, x1, count, endpoint=endpoint)
+        z = np.linspace(z0, z1, count, endpoint=endpoint)
+        return np.column_stack((x, np.zeros(count), z))
+
+    # The left table/top transition is present at x=-60 mm, while the profile
+    # ends before the expected right transition at x=+60 mm.
+    profile = np.vstack(
+        (
+            segment(-0.15, 0.30, -0.06, 0.30, 360),
+            segment(-0.06, 0.30, -0.06, 0.285, 60),
+            segment(-0.06, 0.285, 0.00, 0.285, 240, endpoint=True),
+        )
+    )
+    detector = ProfileEndpointDetector(_target_surface_config())
+
+    first, second = detector.temporal_breakpoint_candidates(
+        profile,
+        np.array(
+            [
+                [-0.06, 0.0, 0.285],
+                [0.06, 0.0, 0.285],
+            ]
+        ),
+        endpoint_gate_m=(0.004, 0.004),
+    )
+
+    assert len(first) >= 1
+    assert np.min(np.linalg.norm(first[:, (0, 2)] - [-0.06, 0.285], axis=1)) < 0.001
+    assert len(second) == 0

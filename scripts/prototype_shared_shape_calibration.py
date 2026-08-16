@@ -25,8 +25,8 @@ import numpy as np
 
 
 WORKSPACE = Path(__file__).resolve().parents[1]
-PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_sim_bridge"
-sys.path.insert(0, str(PACKAGE_ROOT))
+CORE_PACKAGE_ROOT = WORKSPACE / "ros2_ws/src/handeye_calibration_core"
+sys.path.insert(0, str(CORE_PACKAGE_ROOT))
 sys.path.insert(0, str(WORKSPACE / "scripts"))
 
 from analyze_precision_error_budget import (  # noqa: E402

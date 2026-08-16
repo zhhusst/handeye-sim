@@ -3,6 +3,7 @@
 
 import matplotlib
 import numpy as np
+import pycomm3
 import rclpy
 import scipy
 import yaml
@@ -19,3 +20,4 @@ print(f"numpy={np.__version__}")
 print(f"scipy={scipy.__version__}")
 print(f"matplotlib={matplotlib.__version__}")
 print(f"yaml={yaml.__version__}")
+print(f"pycomm3={getattr(pycomm3, '__version__', 'installed')}")

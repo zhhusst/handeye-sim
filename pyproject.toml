@@ -1,6 +1,12 @@
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["ros2_ws/src/handeye_sim_bridge"]
+pythonpath = [
+  "ros2_ws/src/handeye_calibration_core",
+  "ros2_ws/src/fanuc_m20id25_support",
+  "ros2_ws/src/handeye_sim_bridge",
+  "ros2_ws/src/handeye_sim_backend",
+  "ros2_ws/src/fanuc_gocator_bridge",
+]
 addopts = "-ra"
 
 [tool.ruff]

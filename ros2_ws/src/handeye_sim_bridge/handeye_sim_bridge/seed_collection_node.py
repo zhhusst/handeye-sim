@@ -18,6 +18,7 @@ from rclpy.time import Time
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState, PointCloud2
 import sensor_msgs_py.point_cloud2 as point_cloud2
+from std_msgs.msg import Header, String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
 from tf2_ros import Buffer, TransformListener
@@ -42,14 +43,14 @@ from calibration_pipeline.seed_collection import (
     rotation_diversity,
     seed_feature_is_acceptable,
 )
-from handeye_sim_bridge.fanuc_kinematic import (
+from fanuc_m20id25_support.fanuc_kinematic import (
     JOINT_LIMITS_DEG,
     forward_kinematics_urdf,
     inverse_kinematics_numeric,
 )
 
 
-JOINT_NAMES = (
+DEFAULT_JOINT_NAMES = (
     "J1_joint",
     "J2_joint",
     "J3_joint",
@@ -95,7 +96,7 @@ class SeedCollectionNode(Node):
         self.declare_parameter("seed.initial.minimum_z_mid_m", 0.30)
         self.declare_parameter("seed.initial.maximum_z_mid_m", 0.55)
         self.declare_parameter("seed.initial.minimum_domain_margin_m", 0.020)
-        self.declare_parameter("seed.initial.minimum_profile_length_m", 0.05)
+        self.declare_parameter("seed.initial.minimum_profile_length_m", 0.01)
         self.declare_parameter("seed.initial.maximum_profile_length_m", 0.25)
         self.declare_parameter(
             "seed.initial.minimum_absolute_endpoint_depth_delta_m", 0.015
@@ -124,6 +125,42 @@ class SeedCollectionNode(Node):
         self.declare_parameter("maximum_measurement_skew_s", 0.1)
         self.declare_parameter("maximum_measurement_age_s", 0.5)
         self.declare_parameter("measurement.pose_source", "topic")
+        self.declare_parameter("interfaces.joint_state_topic", "/joint_states")
+        self.declare_parameter("interfaces.profile_topic", "/gocator/profile")
+        self.declare_parameter(
+            "interfaces.target_surface_topic",
+            "/calibration/target_surface_points",
+        )
+        self.declare_parameter(
+            "interfaces.endpoint_topic", "/calibration/endpoints"
+        )
+        self.declare_parameter(
+            "interfaces.flange_pose_topic", "/calibration/flange_pose"
+        )
+        self.declare_parameter(
+            "interfaces.detection_prior_topic",
+            "/calibration/detection_prior",
+        )
+        self.declare_parameter(
+            "interfaces.measured_detection_prior_topic",
+            "/calibration/detection_measured_prior",
+        )
+        self.declare_parameter(
+            "interfaces.detection_control_topic",
+            "/calibration/detection_control",
+        )
+        self.declare_parameter(
+            "interfaces.seed_motion_state_topic",
+            "/calibration/seed_motion_state",
+        )
+        self.declare_parameter(
+            "interfaces.trajectory_action",
+            "/joint_trajectory_controller/follow_joint_trajectory",
+        )
+        self.declare_parameter("interfaces.base_frame", "base_link")
+        self.declare_parameter("interfaces.flange_frame", "fanuc_flange")
+        self.declare_parameter("interfaces.sensor_frame", "gocator_sensor")
+        self.declare_parameter("interfaces.joint_names", list(DEFAULT_JOINT_NAMES))
         self.declare_parameter("output_file", "data/seed_measurements.json")
         self.declare_parameter("sensor.min_range_m", 0.27)
         self.declare_parameter("sensor.max_range_m", 0.82)
@@ -350,26 +387,88 @@ class SeedCollectionNode(Node):
                 "collection_mode must be either 'automatic' or 'manual'"
             )
 
-        self.create_subscription(JointState, "/joint_states", self._joint_callback, 10)
-        self.create_subscription(PointCloud2, "/gocator/profile", self._profile_callback, 10)
+        self.joint_names = tuple(
+            str(value)
+            for value in self.get_parameter("interfaces.joint_names").value
+        )
+        if len(self.joint_names) != 6:
+            raise ValueError("interfaces.joint_names must contain six names")
+        self.base_frame = str(
+            self.get_parameter("interfaces.base_frame").value
+        )
+        self.flange_frame = str(
+            self.get_parameter("interfaces.flange_frame").value
+        )
+        joint_state_topic = str(
+            self.get_parameter("interfaces.joint_state_topic").value
+        )
+        target_surface_topic = str(
+            self.get_parameter("interfaces.target_surface_topic").value
+        )
+        endpoint_topic = str(
+            self.get_parameter("interfaces.endpoint_topic").value
+        )
+        flange_pose_topic = str(
+            self.get_parameter("interfaces.flange_pose_topic").value
+        )
+        measured_detection_prior_topic = str(
+            self.get_parameter(
+                "interfaces.measured_detection_prior_topic"
+            ).value
+        )
+        detection_control_topic = str(
+            self.get_parameter(
+                "interfaces.detection_control_topic"
+            ).value
+        )
+        seed_motion_state_topic = str(
+            self.get_parameter(
+                "interfaces.seed_motion_state_topic"
+            ).value
+        )
+        self.sensor_frame = str(
+            self.get_parameter("interfaces.sensor_frame").value
+        )
+        trajectory_action = str(
+            self.get_parameter("interfaces.trajectory_action").value
+        )
+
+        self.create_subscription(JointState, joint_state_topic, self._joint_callback, 10)
+        # Only the detector-selected target top surface is a calibration
+        # constraint. The raw profile may also contain table and side points.
         self.create_subscription(
             PointCloud2,
-            "/calibration/endpoints",
+            target_surface_topic,
+            self._profile_callback,
+            10,
+        )
+        self.create_subscription(
+            PointCloud2,
+            endpoint_topic,
             self._endpoint_callback,
             10,
         )
         self.create_subscription(
             PoseStamped,
-            "/calibration/flange_pose",
+            flange_pose_topic,
             self._flange_pose_callback,
             10,
+        )
+        self.measured_detection_prior_publisher = self.create_publisher(
+            PointCloud2, measured_detection_prior_topic, 10
+        )
+        self.detection_control_publisher = self.create_publisher(
+            String, detection_control_topic, 10
+        )
+        self.seed_motion_state_publisher = self.create_publisher(
+            String, seed_motion_state_topic, 10
         )
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self._trajectory = ActionClient(
             self,
             FollowJointTrajectory,
-            "/joint_trajectory_controller/follow_joint_trajectory",
+            trajectory_action,
         )
         self.create_service(Trigger, "~/start", self._start_callback)
         self.create_service(Trigger, "~/capture", self._capture_callback)
@@ -411,6 +510,8 @@ class SeedCollectionNode(Node):
         self.seed_capture_started_wall_ns = 0
         self.seed_capture_deadline_wall_ns = 0
         self.seed_capture_last_diagnostics = None
+        self.seed_capture_filter_counts: dict[str, int] = {}
+        self.seed_capture_last_filter_counts: dict[str, int] = {}
         self.pending_partial_label = ""
         self.plan = adaptive_rotation_plan()
         self.preflight_plan = (
@@ -464,7 +565,7 @@ class SeedCollectionNode(Node):
 
     def _joint_callback(self, message: JointState) -> None:
         try:
-            indices = [message.name.index(name) for name in JOINT_NAMES]
+            indices = [message.name.index(name) for name in self.joint_names]
             self.latest_joints = np.array(
                 [message.position[index] for index in indices], dtype=float
             )
@@ -479,10 +580,12 @@ class SeedCollectionNode(Node):
             return
 
     def _profile_callback(self, message: PointCloud2) -> None:
+        self._count_seed_capture_event("surface_messages")
         points = point_cloud2.read_points(
             message, field_names=("x", "y", "z"), skip_nans=True
         )
         if len(points) == 0:
+            self._count_seed_capture_event("empty_surface_messages")
             self.latest_profile = None
             return
         if getattr(points.dtype, "names", None):
@@ -500,12 +603,15 @@ class SeedCollectionNode(Node):
         self._trim_pending_frames()
 
     def _endpoint_callback(self, message: PointCloud2) -> None:
+        self._count_seed_capture_event("endpoint_messages")
         values = point_cloud2.read_points(
             message, field_names=("x", "y", "z"), skip_nans=True
         )
         if len(values) != 2:
+            self._count_seed_capture_event("invalid_endpoint_messages")
             self.latest_endpoints = None
             return
+        self._count_seed_capture_event("valid_endpoint_messages")
         if getattr(values.dtype, "names", None):
             endpoints = np.column_stack(
                 tuple(
@@ -527,6 +633,7 @@ class SeedCollectionNode(Node):
         self._trim_pending_frames()
 
     def _flange_pose_callback(self, message: PoseStamped) -> None:
+        self._count_seed_capture_event("flange_pose_messages")
         position = message.pose.position
         orientation = message.pose.orientation
         transform = make_transform(
@@ -571,6 +678,7 @@ class SeedCollectionNode(Node):
     def _accept_matched_frame(
         self, profile, endpoints, transform, stamp
     ) -> None:
+        self._count_seed_capture_event("matched_frames")
         self.latest_profile = np.asarray(profile, dtype=float)
         self.latest_endpoints = tuple(
             np.asarray(endpoint, dtype=float) for endpoint in endpoints
@@ -600,8 +708,8 @@ class SeedCollectionNode(Node):
     def _lookup_flange_transform(self, stamp) -> np.ndarray | None:
         try:
             stamped = self.tf_buffer.lookup_transform(
-                "base_link",
-                "fanuc_flange",
+                self.base_frame,
+                self.flange_frame,
                 Time.from_msg(stamp),
             )
         except Exception:
@@ -630,12 +738,18 @@ class SeedCollectionNode(Node):
         self.started = True
         response.success = True
         if self.collection_mode == "manual":
+            self._publish_detection_control("SEED_TRACK_STOP")
             response.message = (
                 "manual seed collection armed; call ~/capture at each stable pose"
             )
         else:
+            # The operator has already locked a stable bounded observation.
+            # Keep that measured guide for the stationary reference batch;
+            # temporal prediction is needed only once robot motion begins.
+            self._publish_detection_control("SEED_TRACK_STOP")
             response.message = (
-                "automatic seed collection armed; waiting for stable bilateral data"
+                "automatic seed collection armed; collecting the stationary "
+                "reference before dual-breakpoint Kalman tracking starts"
             )
         return response
 
@@ -932,7 +1046,7 @@ class SeedCollectionNode(Node):
             self.get_logger().error("joint trajectory action server is unavailable")
             return False
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = list(JOINT_NAMES)
+        goal.trajectory.joint_names = list(self.joint_names)
         point = JointTrajectoryPoint()
         point.positions = [float(value) for value in joints]
         duration_sec = int(self.motion_duration)
@@ -987,11 +1101,75 @@ class SeedCollectionNode(Node):
         self.measurement_not_before_wall_ns = time.monotonic_ns()
         self.measurement_retry_deadline_wall_ns = (
             self.measurement_not_before_wall_ns
+            + int(self.settling_time * 1e9)
             + self.measurement_retry_timeout_ns
         )
         self.state = "SETTLING"
 
+    def _publish_motion_state(self) -> None:
+        """Record the hybrid motion context needed to evaluate tracking."""
+        if (
+            self.collection_phase == "PREFLIGHT"
+            and self.preflight_index < len(self.preflight_plan)
+        ):
+            target = self.preflight_plan[self.preflight_index].name
+        elif self.target_index < len(self.plan):
+            target = self.plan[self.target_index].name
+        elif not self.records:
+            target = "reference"
+        else:
+            target = "complete"
+        endpoints = None
+        separation_mm = None
+        if self.latest_endpoints is not None:
+            endpoints = [
+                np.asarray(endpoint, dtype=float).tolist()
+                for endpoint in self.latest_endpoints
+            ]
+            separation_mm = 1000.0 * float(
+                np.linalg.norm(
+                    self.latest_endpoints[1] - self.latest_endpoints[0]
+                )
+            )
+        message = String()
+        message.data = json.dumps(
+            {
+                "state": self.state,
+                "phase": self.collection_phase,
+                "motion_stage": self.after_settle or "",
+                "target": target,
+                "target_index": self.target_index,
+                "stage_index": self.stage_index,
+                "started": self.started,
+                "seed_count": len(self.records),
+                "failure_count": self.failure_count,
+                "accumulated_rotation_deg": float(
+                    np.rad2deg(self.accumulated_angle)
+                ),
+                "pending_rotation_deg": float(
+                    np.rad2deg(self.pending_rotation)
+                ),
+                "joint_speed_rad_s": (
+                    None
+                    if not np.isfinite(self.latest_joint_speed)
+                    else float(self.latest_joint_speed)
+                ),
+                "joints_rad": (
+                    None
+                    if self.latest_joints is None
+                    else self.latest_joints.tolist()
+                ),
+                "endpoints_S": endpoints,
+                "endpoint_separation_mm": separation_mm,
+                "failure_reason": self.failure_reason,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.seed_motion_state_publisher.publish(message)
+
     def _tick(self) -> None:
+        self._publish_motion_state()
         if self.state == "MOVING":
             if time.monotonic_ns() >= self.motion_deadline_wall_ns:
                 self._fail(
@@ -1010,6 +1188,9 @@ class SeedCollectionNode(Node):
                     "CACHED_SERVO_RECOVERY",
                     "ROLLBACK",
                     "RETURN_REFERENCE",
+                    "RETURN_REFERENCE_REACQUIRE",
+                    "ROLLBACK_REFERENCE_RECOVERY",
+                    "ROLLBACK_REFERENCE_REACQUIRE",
                     "PARTIAL_CAPTURE_READY",
                 }
                 if (
@@ -1030,9 +1211,7 @@ class SeedCollectionNode(Node):
                 if not self._try_finish_seed_capture(force=True):
                     self._complete_seed_capture(
                         False,
-                        "stationary seed batch timed out: "
-                        f"raw={len(self.seed_capture_frames)}, "
-                        f"required_inliers={self.minimum_batch_inliers}",
+                        self._seed_capture_timeout_reason(),
                     )
             return
         if not self.started or self.state != "WAIT_MANUAL_INIT":
@@ -1067,25 +1246,22 @@ class SeedCollectionNode(Node):
             self.preflight_was_required,
             self.preflight_decision_reason,
         ) = self._dynamic_preflight_decision(assessment)
+        self.collection_phase = "REFERENCE"
+        self.plan = adaptive_rotation_plan()
         if self.preflight_was_required:
-            self.collection_phase = "PREFLIGHT"
             self.get_logger().info(
-                "static initial envelope accepted; starting measured local "
-                "+/-X/+/-Y preflight; "
+                "static initial envelope accepted; collecting the stationary "
+                "reference before measured local +/-X/+/-Y preflight; "
                 f"mode={self.preflight_mode}; "
                 f"reason={self.preflight_decision_reason}"
             )
-            self._return_reference()
-            return
-
-        self.collection_phase = "REFERENCE"
-        self.plan = adaptive_rotation_plan()
-        self.get_logger().info(
-            "static initial envelope accepted; standalone dynamic preflight "
-            f"skipped; mode={self.preflight_mode}; "
-            f"reason={self.preflight_decision_reason}; real seed motions "
-            "retain bilateral validation and rollback"
-        )
+        else:
+            self.get_logger().info(
+                "static initial envelope accepted; standalone dynamic preflight "
+                f"skipped; mode={self.preflight_mode}; "
+                f"reason={self.preflight_decision_reason}; real seed motions "
+                "retain bilateral validation and rollback"
+            )
         if not self._begin_seed_capture("reference", "REFERENCE"):
             self._fail("reference multi-frame capture could not start")
 
@@ -1093,6 +1269,10 @@ class SeedCollectionNode(Node):
         if self.reference_joints is None:
             self._fail("reference joints are unavailable")
             return
+        # The reference was explicitly aligned to the purple template.  Use
+        # that same narrow, bounded ROI instead of treating the known return
+        # pose as an uncertain future-view prediction.
+        self._publish_detection_control("REFERENCE_REACQUIRE")
         self.rotation_step = self.rotation_step_default
         self.accumulated_angle = 0.0
         self.stage_index = 0
@@ -1101,6 +1281,23 @@ class SeedCollectionNode(Node):
             self._fail("cannot return to the reference pose: controller unavailable")
 
     def _after_return_reference(self) -> None:
+        feature_at_reference = self._feature()
+        if feature_at_reference is None or not feature_at_reference.safe:
+            if self._request_reference_reacquire(
+                "RETURN_REFERENCE_REACQUIRE"
+            ):
+                self.get_logger().warning(
+                    "reference pose was reached without a valid bilateral "
+                    "measurement; resetting the bounded detector guide and "
+                    "waiting for reacquisition"
+                )
+                return
+            self._fail(
+                "reference pose did not restore bilateral visibility and "
+                "detector reacquisition could not be started"
+            )
+            return
+        self._publish_detection_control("PREDICTION_COMMIT")
         if self.collection_phase == "PREFLIGHT":
             if self.preflight_index >= len(self.preflight_plan):
                 feasible = [
@@ -1120,28 +1317,26 @@ class SeedCollectionNode(Node):
                         f"spanning X and Y; {details}"
                     )
                     return
-                if not self._begin_seed_capture("reference", "REFERENCE"):
-                    self._fail("reference multi-frame capture could not start")
-                    return
                 self.plan = preflight_guided_rotation_plan(
                     self.preflight_results
                 )
+                self.collection_phase = "COLLECT"
                 self.get_logger().info(
                     f"dynamic preflight accepted "
                     f"({len(feasible)}/{len(self.preflight_plan)} directions); "
                     "reordered seed plan from measured-safe directions; "
-                    "collecting the reference stationary frame batch"
+                    "starting the adaptive star rotation plan"
                 )
+            else:
+                self.last_valid_joints = self.latest_joints.copy()
+                feature = self._feature()
+                if feature is not None and feature.safe:
+                    self._remember_last_valid(feature)
+                self._reset_servo()
+                target = self.preflight_plan[self.preflight_index]
+                self.get_logger().info(f"preflight target {target.name}")
+                self._issue_micro_rotation()
                 return
-            self.last_valid_joints = self.latest_joints.copy()
-            feature = self._feature()
-            if feature is not None and feature.safe:
-                self._remember_last_valid(feature)
-            self._reset_servo()
-            target = self.preflight_plan[self.preflight_index]
-            self.get_logger().info(f"preflight target {target.name}")
-            self._issue_micro_rotation()
-            return
         if len(self.records) >= self.target_count or self.target_index >= len(
             self.plan
         ):
@@ -1154,6 +1349,19 @@ class SeedCollectionNode(Node):
         self._reset_servo()
         self.get_logger().info(f"target {self.plan[self.target_index].name}")
         self._issue_micro_rotation()
+
+    def _after_return_reference_reacquire(self) -> None:
+        feature = self._feature()
+        if feature is None or not feature.safe:
+            self._fail(
+                "bounded detector reacquisition failed at the verified "
+                "reference pose"
+            )
+            return
+        self.get_logger().info(
+            "bilateral observation reacquired at the reference pose"
+        )
+        self._after_return_reference()
 
     def _issue_micro_rotation(self) -> None:
         current = self._current_transform()
@@ -1434,6 +1642,9 @@ class SeedCollectionNode(Node):
                 )
                 if (
                     self.last_valid_joints is not None
+                    and self._publish_detection_prior_for_feature(
+                        self.last_valid_feature
+                    )
                     and self._command_joints(
                         self.last_valid_joints, "PARTIAL_CAPTURE_READY"
                     )
@@ -1456,6 +1667,7 @@ class SeedCollectionNode(Node):
         if self.last_valid_joints is None:
             self._fail("no valid rollback pose")
             return
+        self._publish_detection_prior_for_feature(self.last_valid_feature)
         if not self._command_joints(self.last_valid_joints, "ROLLBACK"):
             self._fail(
                 f"{reason}; cannot execute rollback because the controller "
@@ -1468,8 +1680,8 @@ class SeedCollectionNode(Node):
             if (
                 self.collection_phase != "PREFLIGHT"
                 and self.reference_joints is not None
-                and self._command_joints(
-                    self.reference_joints, "ROLLBACK_REFERENCE_RECOVERY"
+                and self._request_reference_reacquire(
+                    "ROLLBACK_REFERENCE_REACQUIRE"
                 )
             ):
                 self.get_logger().warning(
@@ -1480,16 +1692,40 @@ class SeedCollectionNode(Node):
                 return
             self._fail("rollback did not restore bilateral visibility")
             return
+        self._publish_detection_control("PREDICTION_COMMIT")
         self._issue_micro_rotation()
 
     def _after_rollback_reference_recovery(self) -> None:
         feature = self._feature()
         if feature is None or not feature.safe:
+            if self._request_reference_reacquire(
+                "ROLLBACK_REFERENCE_REACQUIRE"
+            ):
+                self.get_logger().warning(
+                    "robot returned to the verified reference pose but the "
+                    "detector remained lost; resetting its bounded guide and "
+                    "waiting for fresh synchronized frames"
+                )
+                return
+            self._fail("reference detector reacquisition could not be started")
+            return
+        self._finish_rollback_reference_recovery()
+
+    def _after_rollback_reference_reacquire(self) -> None:
+        feature = self._feature()
+        if feature is None or not feature.safe:
             self._fail(
-                "neither local rollback nor reference recovery restored "
-                "bilateral visibility"
+                "neither local rollback nor bounded detector reacquisition "
+                "at the verified reference pose restored bilateral visibility"
             )
             return
+        self.get_logger().info(
+            "bilateral observation reacquired after reference rollback"
+        )
+        self._finish_rollback_reference_recovery()
+
+    def _finish_rollback_reference_recovery(self) -> None:
+        self._publish_detection_control("PREDICTION_COMMIT")
         self.get_logger().warning(
             f"{self.plan[self.target_index].name} abandoned after reference "
             "recovery; continuing with the next preflight-guided branch"
@@ -1514,6 +1750,7 @@ class SeedCollectionNode(Node):
             self.target_index += 1
             self._return_reference()
             return
+        self._publish_detection_control("PREDICTION_COMMIT")
         label = self.pending_partial_label
         self.pending_partial_label = ""
         if not self._begin_seed_capture(label, "PARTIAL"):
@@ -1539,6 +1776,7 @@ class SeedCollectionNode(Node):
             now + self.measurement_batch_timeout_ns
         )
         self.seed_capture_last_diagnostics = None
+        self.seed_capture_filter_counts = self._empty_seed_capture_counts()
         self.state = "CAPTURING_SEED"
         self.get_logger().info(
             f"stationary seed capture started: {label}, "
@@ -1548,16 +1786,25 @@ class SeedCollectionNode(Node):
         return True
 
     def _collect_seed_frame(self, wall_now: int) -> None:
+        if wall_now <= self.seed_capture_started_wall_ns:
+            self._count_seed_capture_event("stale_frames")
+            return
+        if len(self.seed_capture_frames) >= self.maximum_batch_frames:
+            self._count_seed_capture_event("maximum_batch_frames")
+            return
         if (
-            wall_now <= self.seed_capture_started_wall_ns
-            or len(self.seed_capture_frames) >= self.maximum_batch_frames
-            or self.latest_profile is None
+            self.latest_profile is None
             or self.latest_endpoints is None
             or self.latest_measurement_transform is None
             or self.latest_joints is None
-            or self.latest_joint_speed > self.manual_max_joint_speed
-            or len(self.latest_profile) < self.minimum_profile_points
         ):
+            self._count_seed_capture_event("incomplete_matched_frames")
+            return
+        if self.latest_joint_speed > self.manual_max_joint_speed:
+            self._count_seed_capture_event("moving_frames")
+            return
+        if len(self.latest_profile) < self.minimum_profile_points:
+            self._count_seed_capture_event("short_surface_frames")
             return
         endpoint_u, endpoint_v = self.latest_endpoints
         try:
@@ -1565,8 +1812,10 @@ class SeedCollectionNode(Node):
                 endpoint_u, endpoint_v, self.roi
             )
         except ValueError:
+            self._count_seed_capture_event("invalid_feature_frames")
             return
         if not feature.safe:
+            self._count_seed_capture_event("unsafe_feature_frames")
             return
         self.seed_capture_frames.append(
             {
@@ -1578,6 +1827,65 @@ class SeedCollectionNode(Node):
                 "endpoint_v_S": endpoint_v.copy(),
             }
         )
+        self._count_seed_capture_event("accepted_frames")
+
+    @staticmethod
+    def _empty_seed_capture_counts() -> dict[str, int]:
+        return {
+            "surface_messages": 0,
+            "empty_surface_messages": 0,
+            "endpoint_messages": 0,
+            "invalid_endpoint_messages": 0,
+            "valid_endpoint_messages": 0,
+            "flange_pose_messages": 0,
+            "matched_frames": 0,
+            "stale_frames": 0,
+            "maximum_batch_frames": 0,
+            "incomplete_matched_frames": 0,
+            "moving_frames": 0,
+            "short_surface_frames": 0,
+            "invalid_feature_frames": 0,
+            "unsafe_feature_frames": 0,
+            "accepted_frames": 0,
+        }
+
+    def _count_seed_capture_event(self, name: str) -> None:
+        if self.state != "CAPTURING_SEED":
+            return
+        self.seed_capture_filter_counts[name] = (
+            self.seed_capture_filter_counts.get(name, 0) + 1
+        )
+
+    def _seed_capture_filter_summary(self) -> str:
+        counts = self.seed_capture_filter_counts
+        return (
+            f"surface={counts.get('surface_messages', 0)},"
+            f"surface_empty={counts.get('empty_surface_messages', 0)},"
+            f"endpoints={counts.get('endpoint_messages', 0)},"
+            f"endpoints_valid={counts.get('valid_endpoint_messages', 0)},"
+            f"flange={counts.get('flange_pose_messages', 0)},"
+            f"matched={counts.get('matched_frames', 0)},"
+            f"moving={counts.get('moving_frames', 0)},"
+            f"surface_short={counts.get('short_surface_frames', 0)},"
+            f"feature_invalid={counts.get('invalid_feature_frames', 0)},"
+            f"feature_unsafe={counts.get('unsafe_feature_frames', 0)},"
+            f"accepted={counts.get('accepted_frames', 0)}"
+        )
+
+    def _seed_capture_timeout_reason(self) -> str:
+        reason = (
+            "stationary seed batch timed out: "
+            f"raw={len(self.seed_capture_frames)}, "
+            f"required_inliers={self.minimum_batch_inliers}; "
+            f"filter_counts={self._seed_capture_filter_summary()}"
+        )
+        diagnostics = self.seed_capture_last_diagnostics
+        if diagnostics is not None:
+            reason += (
+                f"; robust_inliers={diagnostics.inlier_count}/"
+                f"{diagnostics.raw_count}"
+            )
+        return reason
 
     def _try_finish_seed_capture(self, *, force: bool = False) -> bool:
         if len(self.seed_capture_frames) < self.minimum_batch_inliers:
@@ -1671,6 +1979,9 @@ class SeedCollectionNode(Node):
     def _complete_seed_capture(self, success: bool, reason: str) -> None:
         continuation = self.seed_capture_continuation
         label = self.seed_capture_label
+        self.seed_capture_last_filter_counts = dict(
+            self.seed_capture_filter_counts
+        )
         self.seed_capture_frames = []
         self.seed_capture_label = ""
         self.seed_capture_continuation = ""
@@ -1680,11 +1991,21 @@ class SeedCollectionNode(Node):
             if not success:
                 self._fail(f"reference seed capture failed: {reason}")
                 return
-            self.collection_phase = "COLLECT"
-            self.get_logger().info(
-                "reference multi-frame seed accepted; starting adaptive "
-                "star rotation plan"
-            )
+            self._publish_detection_control("SEED_TRACK_START")
+            if self.preflight_was_required:
+                self.collection_phase = "PREFLIGHT"
+                self.get_logger().info(
+                    "reference multi-frame seed accepted; dual-breakpoint "
+                    "Kalman tracking enabled; starting measured local "
+                    "+/-X/+/-Y preflight"
+                )
+            else:
+                self.collection_phase = "COLLECT"
+                self.get_logger().info(
+                    "reference multi-frame seed accepted; dual-breakpoint "
+                    "Kalman tracking enabled; starting adaptive star "
+                    "rotation plan"
+                )
             self._return_reference()
             return
         if continuation in {"TARGET", "PARTIAL"}:
@@ -1711,6 +2032,36 @@ class SeedCollectionNode(Node):
         self.last_valid_profile = self.latest_profile.copy()
         self.last_valid_feature = feature
 
+    def _publish_detection_prior_for_feature(self, feature) -> bool:
+        if feature is None:
+            return False
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = self.sensor_frame
+        endpoints = np.vstack(
+            (feature.endpoint_u, feature.endpoint_v)
+        ).astype(np.float32)
+        self.measured_detection_prior_publisher.publish(
+            point_cloud2.create_cloud_xyz32(header, endpoints.tolist())
+        )
+        return True
+
+    def _publish_detection_control(self, command: str) -> None:
+        message = String()
+        message.data = str(command)
+        self.detection_control_publisher.publish(message)
+
+    def _request_reference_reacquire(self, after_settle: str) -> bool:
+        """Re-arm the bounded detector at the known reference robot pose."""
+        if self.reference_joints is None:
+            return False
+        self._publish_detection_control("REFERENCE_REACQUIRE")
+        # Sending the already reached reference joints is intentional.  The
+        # real motion bridge recognizes this as a zero-distance goal, so no TP
+        # motion is triggered, while the normal settling/fresh-frame state
+        # machine is reused for deterministic detector recovery.
+        return self._command_joints(self.reference_joints, after_settle)
+
     def _last_valid_relative_rotation(self) -> float:
         if self.last_valid_transform is None or self.reference_transform is None:
             return 0.0
@@ -1719,6 +2070,7 @@ class SeedCollectionNode(Node):
         return float(np.arccos(cosine))
 
     def _finish(self) -> None:
+        self._publish_detection_control("SEED_TRACK_STOP")
         raw_diversity = rotation_diversity(self.seed_rotations)
         diversity = {
             key: value.tolist() if isinstance(value, np.ndarray) else value
@@ -1766,6 +2118,7 @@ class SeedCollectionNode(Node):
             )
 
     def _fail(self, reason: str) -> None:
+        self._publish_detection_control("SEED_TRACK_STOP")
         self.failure_reason = reason
         self.state = "FAILED"
         self.get_logger().error(reason)

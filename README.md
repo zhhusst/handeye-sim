@@ -1,10 +1,11 @@
 # 双边角点主动手眼标定
 
-本仓库只服务于两件事：
+本仓库服务于三件事：
 
 1. FANUC M-20iD/25、Gocator 线激光和平板角点的 ROS 2 仿真场景；
 2. [完整方法原理 V6](线激光双边角点主动手眼标定_完整方法原理_v6.md) 的可测试实现；
    V6以当前代码为基线，V5保留为历史版本。
+3. FANUC R-30iB与真实Gocator的分阶段、安全接入。
 
 方法主线是：
 
@@ -22,18 +23,25 @@
 
 ```text
 .
-├── calibration_pipeline (位于 ROS Python 包内)
-│   ├── seed_collection/   Phase 0b 纯算法组件
-│   ├── solvers/           12-DOF-V2 求解器
-│   ├── v2_backend/        角点投影、Jacobian、协方差、信息矩阵
-│   ├── nbv/               有限平板候选、预测、有效性、评分、停止
-│   ├── simulation/        无 ROS 的线激光几何与合成数据
-│   └── pipeline.py        数据所有权和阶段状态机
+├── ros2_ws/src/handeye_calibration_core/
+│   └── calibration_pipeline/ 纯算法，不依赖ROS和硬件
+│       ├── seed_collection/ Phase 0b纯算法组件
+│       ├── solvers/         12-DOF-V2求解器
+│       ├── v2_backend/      Jacobian、协方差与信息矩阵
+│       ├── nbv/             候选、预测、评分和停止
+│       ├── simulation/      无ROS的线激光合成数据
+│       └── pipeline.py      数据所有权和阶段状态机
 ├── ros2_ws/src/handeye_sim_bridge/
-│   ├── handeye_sim_bridge/ ROS 话题、运动和可视化适配层
+│   ├── handeye_sim_bridge/ 通用ROS标定节点与仿真兼容层
 │   ├── config/             唯一运行参数
 │   ├── launch/             ROS 2 启动文件
 │   └── rviz/               RViz 配置
+├── ros2_ws/src/handeye_sim_backend/ Gazebo场景、仿真真值与原始轮廓后端
+├── ros2_ws/src/fanuc_m20id25_support/ 共用运动学与坐标约定
+├── ros2_ws/src/fanuc_gocator_bridge/  真机只观察适配层
+├── ros2_ws/src/gocator_profile_driver/ Gocator毫米原始轮廓驱动
+├── ros2_ws/src/handeye_calibration_interfaces/ 后端无关运动接口
+├── third_party/gocator_sdk/ 最小本地SDK运行集
 ├── urdf/                   FANUC、Gocator 与场景模型
 ├── meshes/                 可视化网格
 ├── tests/                  ROS 无关的数值和单元测试
@@ -58,11 +66,13 @@
 ./scripts/build.sh
 ```
 
-启动现有 Gazebo + MoveIt 场景：
+统一环境入口为：
 
 ```bash
-./scripts/start_simulation.sh
+./scripts/start_environment.sh sim
 ```
+
+旧命令`./scripts/start_simulation.sh`继续兼容。
 
 如果宿主机 X11 没有授权，启动脚本会自动切换到浏览器可视化。也可以显式启用：
 
@@ -121,8 +131,31 @@ cd /workspace
 候选真实观测失败时，系统会丢弃该帧、回退到上一安全位姿、验证新鲜双边数据并拉黑
 该候选后继续选择，而不会因一次可恢复失败终止整个标定。
 
-该节点明确是 `simulation-only`：真值只用于生成 Phase 0a 的可控扰动和最终误差评价，
-不会参与种子运动、12-DOF-V2 残差或 NBV 评分。
+主动标定节点已经改为后端无关：名义安装值来自配置，仿真真值只是可选评价器，
+不会参与种子运动、12-DOF-V2残差或NBV评分。真机配置关闭真值评价，只报告
+留出数据、重复性和协方差诊断。
+
+## 真机接入状态
+
+真机默认仍以`observe_only`启动：
+
+```bash
+./scripts/start_environment.sh real
+./scripts/start_calibration.sh --backend real
+```
+
+该模式可以读取FANUC原始关节、Gocator毫米原始轮廓，完成米制转换、断点检测和
+静止状态时间配对，但没有任何运动写入口。Gocator激光默认关闭。
+J2—J3联动规则已经四个真机位姿验证为
+`J3_URDF=J3_controller+J2_controller`，因此只读`/joint_states`已开放。
+自动种子已接入现有`PC_TRACK_ALL`的STEP协议；首次真机运动必须用
+`--motion-mode step_confirm`逐步确认，验证后才使用`automatic`。真机NBV执行仍要等
+MoveIt碰撞环境和回退策略完成安全验收。
+
+真机需要`pycomm3>=1.2,<2`。开发容器Dockerfile已声明该依赖；当前容器缺失时，
+`start_real_environment.sh`会在启动任何节点前给出明确安装提示。
+首次真机联调、激光开关、J2/J3验证与分阶段放行流程见
+[真机安全接入指南](docs/REAL_HARDWARE_BRINGUP.md)。
 
 仿真轮廓、物理断点和编码器法兰位姿使用同一触发时间戳严格配对；启用同步噪声后，
 消息中法兰位姿会按配置从历史编码器快照选取，用于主动模拟内容层面的触发延迟。
@@ -135,8 +168,10 @@ cd /workspace
 
 ## 开发约束
 
-- `calibration_pipeline` 不得导入 `rclpy` 或 ROS 消息类型。
+- `handeye_calibration_core/calibration_pipeline` 不得导入 `rclpy`或ROS消息类型。
 - ROS 节点只负责 I/O、TF、IK、轨迹执行与回退。
+- 仿真和真机后端必须满足同一米制轮廓、同时间戳法兰位姿和统一关节名契约。
+- 真机运动权限按`observe_only → plan_only → step_confirm → automatic`开放。
 - 只有同时通过真实双边验证的观测才能加入标定数据集。
 - 算法参数统一维护在
   [calibration.yaml](ros2_ws/src/handeye_sim_bridge/config/calibration.yaml)。

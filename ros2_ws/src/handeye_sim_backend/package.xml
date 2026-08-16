@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypesns="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>handeye_sim_backend</name>
+  <version>0.1.0</version>
+  <description>Gazebo synthetic raw-profile and optional truth-evaluation backend.</description>
+  <maintainer email="z@z.com">Zhang HaHa</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>interactive_markers</depend>
+  <depend>moveit_msgs</depend>
+  <depend>shape_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>std_srvs</depend>
+  <depend>handeye_calibration_core</depend>
+  <depend>fanuc_m20id25_support</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -3,6 +3,23 @@
     # Phase 0a: URDF truth is perturbed only to create a realistic nominal value.
     handeye_init_rotation_error_deg: 15.0
     handeye_init_translation_error_mm: 200.0
+    runtime:
+      backend: simulation
+    # Mounting nominal used only to start the nonlinear solve and to define
+    # safe candidate motion. It is not treated as a measured observation.
+    initial_handeye:
+      rotation: [0.0604898732, 0.8875159337, -0.4567892759,
+                 -0.9852687180, -0.0202462665, -0.1698106065,
+                 -0.1599578964, 0.4603320063, 0.8732169921]
+      translation_m: [-0.011579, -0.004621, 0.359284]
+    # Only the simulation overlay enables truth-based evaluation. Real runs
+    # set truth_available=false and use held-out/repeatability diagnostics.
+    evaluation:
+      truth_available: true
+      handeye_rotation: [0.0604898732, 0.8875159337, -0.4567892759,
+                         -0.9852687180, -0.0202462665, -0.1698106065,
+                         -0.1599578964, 0.4603320063, 0.8732169921]
+      handeye_translation_m: [-0.011579, -0.004621, 0.359284]
     # Eight uniformly distributed feasible candidates keep each NBV cycle
     # bounded while retaining a diverse fallback set for MoveIt.
     maximum_scored_candidates: 8
@@ -10,6 +27,25 @@
     # Phase 0b can be switched to "manual" by the interactive console.
     collection_mode: automatic
     manual_max_joint_speed_rad_s: 0.02
+
+    # Backend contract. Simulation and real-hardware launch files may remap
+    # these names, while the calibration nodes remain backend-neutral.
+    interfaces:
+      joint_state_topic: /joint_states
+      profile_topic: /gocator/profile
+      target_surface_topic: /calibration/target_surface_points
+      endpoint_topic: /calibration/endpoints
+      detection_prior_topic: /calibration/detection_prior
+      measured_detection_prior_topic: /calibration/detection_measured_prior
+      detection_control_topic: /calibration/detection_control
+      flange_pose_topic: /calibration/flange_pose
+      trajectory_action: /joint_trajectory_controller/follow_joint_trajectory
+      plan_service: /plan_kinematic_path
+      validity_service: /check_state_validity
+      base_frame: base_link
+      flange_frame: fanuc_flange
+      sensor_frame: gocator_sensor
+      joint_names: [J1_joint, J2_joint, J3_joint, J4_joint, J5_joint, J6_joint]
 
     board:
       corner: [0.7, 0.0, 0.25]
@@ -66,9 +102,14 @@
     endpoint_detection:
       input_topic: /gocator/profile
       output_topic: /calibration/endpoints
+      output_surface_topic: /calibration/target_surface_points
+      guide_topic: /calibration/detection_guide
+      prior_topic: /calibration/detection_prior
+      measured_prior_topic: /calibration/detection_measured_prior
+      control_topic: /calibration/detection_control
       minimum_points: 12
       minimum_segment_points: 10
-      minimum_segment_length_m: 0.020
+      minimum_segment_length_m: 0.010
       maximum_segment_length_m: 0.800
       absolute_neighbor_gap_m: 0.004
       neighbor_gap_multiplier: 8.0
@@ -82,11 +123,70 @@
       endpoint_local_fit_points: 24
       candidate_ambiguity_ratio: 0.03
       identity_ambiguity_ratio: 0.05
+      # Detect both a direction change (thick side wall) and a small parallel
+      # height step (thin plate on a flat table). Spatial median filtering is
+      # used only to locate changes; the selected raw inliers are published.
+      smoothing_window: 5
+      local_fit_window: 12
+      angle_change_threshold_deg: 10.0
+      height_jump_threshold_m: 0.00020
+      breakpoint_cluster_points: 8
+      # Zero disables midpoint gating in simulation. The real overlay enables
+      # a broad central ROI to avoid selecting an outer workbench segment.
+      maximum_abs_surface_midpoint_x_m: 0.0
       # At the repository's reference pose, acquisition-order point 0 lies on
       # physical edge e2. A real setup must determine this once during setup;
       # subsequent frames are associated temporally and never re-sorted by X.
       initial_first_label: e2
       minimum_confidence: 0.25
+      # Target association is intentionally stateful. During ALIGN the user
+      # places the measured target over this finite X-Z guide. After locking,
+      # only a local corridor around the previous measured segment is searched.
+      # An executing NBV may temporarily replace it with its predicted segment.
+      guided_enabled: true
+      # This guide coincides with the repository's scripted initial simulation
+      # pose. Real hardware overrides it below with a simpler shop-floor target.
+      alignment_template_center_x_m: 0.021
+      alignment_template_center_z_m: 0.3275
+      alignment_template_length_m: 0.115
+      alignment_template_angle_deg: 28.0
+      alignment_normal_gate_m: 0.004
+      alignment_endpoint_gate_m: 0.025
+      alignment_maximum_angle_difference_deg: 15.0
+      alignment_stability_m: 0.0015
+      minimum_lock_frames: 5
+      tracking_normal_gate_m: 0.008
+      tracking_endpoint_gate_m: 0.030
+      tracking_maximum_angle_difference_deg: 25.0
+      predicted_normal_gate_m: 0.015
+      predicted_endpoint_gate_m: 0.060
+      predicted_maximum_angle_difference_deg: 35.0
+      maximum_lost_frames: 5
+      reacquire_stable_frames: 3
+      reacquire_maximum_segment_length_change_m: 0.020
+      reacquire_maximum_segment_angle_change_deg: 20.0
+      reacquire_stability_m: 0.003
+      # Automatic seed collection alone enables this temporal tracker.  The
+      # filter predicts two local breakpoint search windows; only measured
+      # slope/height boundaries and measured points are published.
+      temporal_tracking_enabled: true
+      temporal_initial_position_std_m: 0.0005
+      temporal_initial_velocity_std_m_s: 0.05
+      temporal_process_acceleration_std_m_s2: 1.0
+      temporal_measurement_std_floor_m: 0.00008
+      temporal_partial_measurement_std_m: 0.0005
+      temporal_mahalanobis_threshold: 13.82
+      temporal_maximum_endpoint_speed_m_s: 0.25
+      temporal_maximum_coast_frames: 5
+      temporal_minimum_search_radius_m: 0.0015
+      temporal_search_sigma_multiplier: 3.0
+      temporal_maximum_local_candidates: 6
+      # Ten millimetres is only an absolute detector floor. Once the operator
+      # locks two physical edges, identity/topology continuity prevents the
+      # tracker from walking inward onto weak changes inside that interval.
+      tracking_maximum_endpoint_step_m: 0.003
+      tracking_minimum_reference_length_ratio: 0.60
+      tracking_maximum_reference_length_ratio: 1.80
 
     sensor:
       # v5: both polygons use the metric X_S-Z_S coordinates published by Gocator.
@@ -147,7 +247,7 @@
         minimum_z_mid_m: 0.30
         maximum_z_mid_m: 0.55
         minimum_domain_margin_m: 0.020
-        minimum_profile_length_m: 0.05
+        minimum_profile_length_m: 0.01
         maximum_profile_length_m: 0.25
         # Physical edge identity is fixed, but either signed depth ordering is
         # valid. Only the magnitude is needed to avoid a nearly level profile.
@@ -191,9 +291,13 @@
       # views. Use "flat" only for the ideal-plane ablation experiment.
       surface_model: "shared"
       surface_basis_kind: "legendre"
-      # Degree four contains 12 quadratic-to-quartic modes; constant and
-      # linear modes are excluded to avoid duplicating target pose DOF.
-      surface_degree: 4
+      # Degree three contains 7 quadratic/cubic modes; constant and linear
+      # modes are excluded to avoid duplicating target pose DOF. In a paired
+      # 30-trial independent-pose validation it met 0.1 deg/0.1 mm P95, while
+      # degree four improved held-out geometry by only about 0.001 mm and made
+      # the data-only condition number about nine times worse. Use degree four
+      # only as the high-complexity accuracy ablation.
+      surface_degree: 3
       shape_scale_m: 0.0005
       shape_regularization: 0.01
       plane_weight: 1.0

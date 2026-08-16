@@ -1,0 +1,3 @@
+# FANUC explicit EtherNet/IP transport. Kept separate from the simulation-only
+# environment so simulation remains usable without hardware dependencies.
+pycomm3>=1.2,<2

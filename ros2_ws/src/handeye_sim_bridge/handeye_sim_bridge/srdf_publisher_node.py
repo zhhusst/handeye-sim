@@ -9,6 +9,7 @@ MoveIt MotionPlanning RViz 显示插件需要订阅 /robot_description_semantic 
 """
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from ament_index_python.packages import get_package_share_directory
 import os
@@ -60,7 +61,14 @@ def main():
     node.get_logger().info(f'Published /robot_description_semantic (transient_local)')
 
     # 持续运行保持话题存活（TRANSIENT_LOCAL 需要 publisher 节点存在）
-    rclpy.spin(node)
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -67,6 +67,13 @@ def test_production_v2_shared_mode_preserves_noise_free_solution_and_state():
     assert result.converged
     assert result.estimate.surface_model == "shared"
     assert result.diagnostics.rank == len(result.estimate.state)
+    assert result.diagnostics.prior_augmented_rank == len(
+        result.estimate.state
+    )
+    assert (
+        result.diagnostics.condition_number
+        > result.diagnostics.prior_augmented_condition_number
+    )
     assert result.diagnostics.state_information.shape == (
         len(result.estimate.state),
         len(result.estimate.state),
@@ -79,8 +86,15 @@ def test_production_v2_shared_mode_preserves_noise_free_solution_and_state():
     ) < 1e-7
     assert result.diagnostics.surface_rms_m < 1e-7
     payload = result_payload(result)
+    assert payload["schema_version"] == 2
     assert payload["surface"]["model"] == "shared"
     assert len(payload["surface"]["coefficients_m"]) == 12
+    assert payload["diagnostics"]["data_only"]["rank"] == 24
+    assert payload["diagnostics"]["prior_augmented"]["rank"] == 24
+    assert (
+        payload["diagnostics"]["data_only"]["condition_number"]
+        > payload["diagnostics"]["prior_augmented"]["condition_number"]
+    )
 
 
 def test_shared_shape_is_used_by_future_profile_and_information_score():

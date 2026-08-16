@@ -8,12 +8,16 @@ profile_viz_node.py — Gocator 2D 轮廓可视化 (独立节点)
   ros2 run handeye_sim_bridge profile_viz
 """
 
+import json
+
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2, Image
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
+from std_msgs.msg import String
 import numpy as np
 
 
@@ -21,30 +25,109 @@ class ProfileVizNode(Node):
     def __init__(self):
         super().__init__('profile_viz_node')
 
-        self.create_subscription(PointCloud2, '/gocator/profile',
+        self.declare_parameter('interfaces.profile_topic', '/gocator/profile')
+        self.declare_parameter(
+            'interfaces.endpoint_topic', '/calibration/endpoints'
+        )
+        self.declare_parameter(
+            'interfaces.target_surface_topic',
+            '/calibration/target_surface_points',
+        )
+        self.declare_parameter(
+            'endpoint_detection.guide_topic',
+            '/calibration/detection_guide',
+        )
+        self.declare_parameter(
+            'endpoint_detection.diagnostics_topic',
+            '/profile_endpoint_detector/diagnostics',
+        )
+        self.declare_parameter(
+            'interfaces.profile_viz_topic', '/gocator/profile_viz'
+        )
+        self.declare_parameter(
+            'interfaces.profile_image_topic', '/gocator/profile_2d'
+        )
+        profile_topic = str(
+            self.get_parameter('interfaces.profile_topic').value
+        )
+        endpoint_topic = str(
+            self.get_parameter('interfaces.endpoint_topic').value
+        )
+        target_surface_topic = str(
+            self.get_parameter('interfaces.target_surface_topic').value
+        )
+        guide_topic = str(
+            self.get_parameter('endpoint_detection.guide_topic').value
+        )
+        diagnostics_topic = str(
+            self.get_parameter(
+                'endpoint_detection.diagnostics_topic'
+            ).value
+        )
+        profile_viz_topic = str(
+            self.get_parameter('interfaces.profile_viz_topic').value
+        )
+        profile_image_topic = str(
+            self.get_parameter('interfaces.profile_image_topic').value
+        )
+
+        self.create_subscription(PointCloud2, profile_topic,
                                   self._cb, 1)
         self.create_subscription(
             PointCloud2,
-            '/calibration/endpoints',
+            endpoint_topic,
             self._endpoint_cb,
+            10,
+        )
+        self.create_subscription(
+            PointCloud2,
+            target_surface_topic,
+            self._target_surface_cb,
+            10,
+        )
+        self.create_subscription(
+            PointCloud2, guide_topic, self._guide_cb, 10
+        )
+        self.create_subscription(
+            String,
+            diagnostics_topic,
+            self._detector_diagnostics_cb,
             10,
         )
 
         self._marker_pub = self.create_publisher(
-            MarkerArray, '/gocator/profile_viz', 10)
+            MarkerArray, profile_viz_topic, 10)
         self._img_pub = self.create_publisher(
-            Image, '/gocator/profile_2d', 10)
+            Image, profile_image_topic, 10)
 
         self._latest = None
         self._endpoints = None
+        self._target_surface = None
+        self._guide = None
+        self._detector_status = {}
+        self._endpoints_time = None
+        self._target_surface_time = None
         self.declare_parameter('visualization_rate_hz', 3.0)
+        self.declare_parameter('visualization_valid_hold_s', 1.5)
         rate = max(
             0.5, float(self.get_parameter('visualization_rate_hz').value)
+        )
+        self._valid_hold_ns = int(
+            1e9 * max(
+                0.0,
+                float(
+                    self.get_parameter(
+                        'visualization_valid_hold_s'
+                    ).value
+                ),
+            )
         )
         self._visualization_period_ns = int(1e9 / rate)
         self._last_viz_time = None
 
-        self.get_logger().info('Profile Viz ready — /gocator/profile_viz + /gocator/profile_2d')
+        self.get_logger().info(
+            f'Profile Viz ready — {profile_viz_topic} + {profile_image_topic}'
+        )
 
     def _cb(self, msg):
         now = self.get_clock().now()
@@ -72,7 +155,6 @@ class ProfileVizNode(Node):
                 msg, field_names=('x', 'y', 'z'), skip_nans=True
             )
             if len(values) != 2:
-                self._endpoints = None
                 return
             if getattr(values.dtype, 'names', None):
                 self._endpoints = np.column_stack(
@@ -85,19 +167,88 @@ class ProfileVizNode(Node):
                 self._endpoints = np.asarray(
                     values, dtype=float
                 ).reshape(2, 3)
+            self._endpoints_time = self.get_clock().now()
         except Exception:
-            self._endpoints = None
+            return
+
+    def _target_surface_cb(self, msg):
+        from sensor_msgs_py.point_cloud2 import read_points
+        try:
+            values = read_points(
+                msg, field_names=('x', 'y', 'z'), skip_nans=True
+            )
+            if len(values) == 0:
+                return
+            if getattr(values.dtype, 'names', None):
+                target_surface = np.column_stack(
+                    tuple(
+                        np.asarray(values[name], dtype=float)
+                        for name in ('x', 'y', 'z')
+                    )
+                )
+            else:
+                target_surface = np.asarray(
+                    values, dtype=float
+                ).reshape(-1, 3)
+            if len(target_surface) == 0:
+                return
+            self._target_surface = target_surface
+            self._target_surface_time = self.get_clock().now()
+        except Exception:
+            return
+
+    def _guide_cb(self, msg):
+        from sensor_msgs_py.point_cloud2 import read_points
+        try:
+            values = read_points(
+                msg, field_names=('x', 'y', 'z'), skip_nans=True
+            )
+            if len(values) != 2:
+                return
+            if getattr(values.dtype, 'names', None):
+                self._guide = np.column_stack(
+                    tuple(
+                        np.asarray(values[name], dtype=float)
+                        for name in ('x', 'y', 'z')
+                    )
+                )
+            else:
+                self._guide = np.asarray(values, dtype=float).reshape(2, 3)
+        except Exception:
+            return
+
+    def _detector_diagnostics_cb(self, msg):
+        try:
+            status = json.loads(msg.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if isinstance(status, dict):
+            self._detector_status = status
+
+    def _is_fresh(self, received_time) -> bool:
+        if received_time is None:
+            return False
+        return (
+            self.get_clock().now() - received_time
+        ).nanoseconds <= self._valid_hold_ns
 
     def _publish_all(self):
         pts = self._latest
-        stamp = self.get_clock().now().to_msg()
+        image_stamp = self.get_clock().now().to_msg()
+        # These markers are a display-only rendering of the timestamped
+        # calibration clouds.  A zero marker stamp asks RViz to use the latest
+        # available transform.  This avoids intermittent visualization drops
+        # when the real Gocator (about 60 Hz) outruns robot TF publication
+        # (about 20 Hz); the original PointCloud2 stamps used by synchronization
+        # and calibration remain untouched.
+        marker_stamp = Time().to_msg()
         FRAME = 'gocator_sensor'
 
         # ── MarkerArray ──
         arr = MarkerArray()
 
         m0 = Marker()
-        m0.header.frame_id = FRAME; m0.header.stamp = stamp
+        m0.header.frame_id = FRAME; m0.header.stamp = marker_stamp
         m0.ns = 'profile'; m0.id = 0
         m0.type = Marker.LINE_STRIP; m0.action = Marker.ADD
         m0.scale.x = 0.002
@@ -106,8 +257,106 @@ class ProfileVizNode(Node):
             m0.points.append(Point(x=float(p[0]), y=0.0, z=float(p[2])))
         arr.markers.append(m0)
 
+        selected = Marker()
+        selected.header.frame_id = FRAME
+        selected.header.stamp = marker_stamp
+        selected.ns = 'target_surface'
+        selected.id = 20
+        if (
+            self._target_surface is None
+            or not self._is_fresh(self._target_surface_time)
+        ):
+            selected.action = Marker.DELETE
+        else:
+            selected.type = Marker.LINE_STRIP
+            selected.action = Marker.ADD
+            selected.scale.x = 0.0035
+            selected.color.r = 0.1
+            selected.color.g = 1.0
+            selected.color.b = 0.2
+            selected.color.a = 1.0
+            # The selected samples lie exactly on the yellow raw profile.
+            # A tiny display-only offset prevents depth-buffer flicker; the
+            # published calibration cloud itself is never modified.
+            selected.pose.position.y = -0.001
+            selected.points = [
+                Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
+                for p in self._target_surface
+            ]
+        arr.markers.append(selected)
+
+        guide = Marker()
+        guide.header.frame_id = FRAME
+        guide.header.stamp = marker_stamp
+        guide.ns = 'detection_guide'
+        guide.id = 30
+        if self._guide is None:
+            guide.action = Marker.DELETE
+        else:
+            guide.type = Marker.LINE_STRIP
+            guide.action = Marker.ADD
+            guide.scale.x = 0.0025
+            guide.color.r = 0.75
+            guide.color.g = 0.10
+            guide.color.b = 1.0
+            guide.color.a = 1.0
+            guide.pose.position.y = -0.002
+            guide.points = [
+                Point(x=float(p[0]), y=float(p[1]), z=float(p[2]))
+                for p in self._guide
+            ]
+        arr.markers.append(guide)
+
+        corridor = Marker()
+        corridor.header.frame_id = FRAME
+        corridor.header.stamp = marker_stamp
+        corridor.ns = 'detection_guide'
+        corridor.id = 31
+        if self._guide is None:
+            corridor.action = Marker.DELETE
+        else:
+            first_xz = self._guide[0, (0, 2)]
+            second_xz = self._guide[1, (0, 2)]
+            vector = second_xz - first_xz
+            length = float(np.linalg.norm(vector))
+            if length <= 1e-9:
+                corridor.action = Marker.DELETE
+            else:
+                direction = vector / length
+                normal = np.array([-direction[1], direction[0]])
+                normal_gate = 0.001 * float(
+                    self._detector_status.get('guide_normal_gate_mm', 3.0)
+                )
+                endpoint_gate = 0.001 * float(
+                    self._detector_status.get('guide_endpoint_gate_mm', 20.0)
+                )
+                start = first_xz - endpoint_gate * direction
+                stop = second_xz + endpoint_gate * direction
+                corners = np.asarray(
+                    [
+                        start + normal_gate * normal,
+                        stop + normal_gate * normal,
+                        stop - normal_gate * normal,
+                        start - normal_gate * normal,
+                        start + normal_gate * normal,
+                    ]
+                )
+                corridor.type = Marker.LINE_STRIP
+                corridor.action = Marker.ADD
+                corridor.scale.x = 0.001
+                corridor.color.r = 0.60
+                corridor.color.g = 0.08
+                corridor.color.b = 0.90
+                corridor.color.a = 0.85
+                corridor.pose.position.y = -0.0025
+                corridor.points = [
+                    Point(x=float(p[0]), y=0.0, z=float(p[1]))
+                    for p in corners
+                ]
+        arr.markers.append(corridor)
+
         m1 = Marker()
-        m1.header.frame_id = FRAME; m1.header.stamp = stamp
+        m1.header.frame_id = FRAME; m1.header.stamp = marker_stamp
         m1.ns = 'axes'; m1.id = 1
         m1.type = Marker.LINE_LIST; m1.action = Marker.ADD
         m1.scale.x = 0.003
@@ -116,7 +365,7 @@ class ProfileVizNode(Node):
         arr.markers.append(m1)
 
         m2 = Marker()
-        m2.header.frame_id = FRAME; m2.header.stamp = stamp
+        m2.header.frame_id = FRAME; m2.header.stamp = marker_stamp
         m2.ns = 'axes'; m2.id = 2
         m2.type = Marker.LINE_LIST; m2.action = Marker.ADD
         m2.scale.x = 0.003
@@ -128,10 +377,13 @@ class ProfileVizNode(Node):
         for index in range(2):
             marker = Marker()
             marker.header.frame_id = FRAME
-            marker.header.stamp = stamp
+            marker.header.stamp = marker_stamp
             marker.ns = 'detected_endpoints'
             marker.id = 10 + index
-            if self._endpoints is None:
+            if (
+                self._endpoints is None
+                or not self._is_fresh(self._endpoints_time)
+            ):
                 marker.action = Marker.DELETE
             else:
                 marker.type = Marker.SPHERE
@@ -154,7 +406,7 @@ class ProfileVizNode(Node):
         self._marker_pub.publish(arr)
 
         # ── 2D Image ──
-        img_msg = self._render_2d(pts, stamp)
+        img_msg = self._render_2d(pts, image_stamp)
         self._img_pub.publish(img_msg)
 
     def _render_2d(self, pts, stamp):

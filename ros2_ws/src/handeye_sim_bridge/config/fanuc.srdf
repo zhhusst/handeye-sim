@@ -19,4 +19,10 @@
   <disable_collisions link1="flange" link2="gocator_sensor" reason="Adjacent"/>
   <disable_collisions link1="flange" link2="ee_link" reason="Adjacent"/>
   <disable_collisions link1="flange" link2="fanuc_flange" reason="Adjacent"/>
+  <!-- weld_gun is rigidly mounted through fanuc_flange/flange to J6. Its
+       mounting mesh intentionally overlaps that rigid wrist assembly; retain
+       collision checking against every movable upstream link and the scene. -->
+  <disable_collisions link1="fanuc_flange" link2="weld_gun" reason="Adjacent"/>
+  <disable_collisions link1="flange" link2="weld_gun" reason="RigidlyConnected"/>
+  <disable_collisions link1="J6_link" link2="weld_gun" reason="RigidlyConnected"/>
 </robot>

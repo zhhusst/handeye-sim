@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-terminal, keyboard-driven console for the simulation calibration workflow."""
+"""Two-terminal console shared by simulation and real calibration backends."""
 
 from __future__ import annotations
 
@@ -23,6 +23,10 @@ WORKSPACE = Path("/workspace")
 PARAM_FILE = (
     WORKSPACE
     / "ros2_ws/src/handeye_sim_bridge/config/calibration.yaml"
+)
+REAL_PARAM_FILE = (
+    WORKSPACE
+    / "ros2_ws/src/fanuc_gocator_bridge/config/real_calibration.yaml"
 )
 RUNS_DIR = WORKSPACE / "data/calibration_runs"
 LEGACY_SEED_FILE = WORKSPACE / "data/seed_measurements_v5.json"
@@ -286,9 +290,22 @@ class ManagedNode:
 
 
 class CalibrationConsole:
-    def __init__(self, *, poll_interval: float = 1.0) -> None:
+    def __init__(
+        self, *, backend: str = "simulation", poll_interval: float = 1.0
+    ) -> None:
+        normalized = backend.strip().lower()
+        aliases = {"sim": "simulation", "simulation": "simulation", "real": "real"}
+        if normalized not in aliases:
+            raise ValueError("backend must be simulation or real")
+        self.backend = aliases[normalized]
         self.poll_interval = poll_interval
         self.children: list[ManagedNode] = []
+
+    def _parameter_file_arguments(self) -> list[str]:
+        arguments = ["--params-file", str(PARAM_FILE)]
+        if self.backend == "real":
+            arguments += ["--params-file", str(REAL_PARAM_FILE)]
+        return arguments
 
     def cleanup(self) -> None:
         for child in reversed(self.children):
@@ -323,6 +340,7 @@ class CalibrationConsole:
         required_topics = {
             "/joint_states",
             "/gocator/profile",
+            "/calibration/target_surface_points",
             "/calibration/endpoints",
             "/calibration/flange_pose",
         }
@@ -330,6 +348,8 @@ class CalibrationConsole:
             "/controller_manager/list_controllers",
             "/scene_publisher/noise_status",
             "/profile_endpoint_detector/status",
+            "/profile_endpoint_detector/lock",
+            "/profile_endpoint_detector/reset",
         }
         missing_nodes = sorted(required_nodes - nodes)
         missing_topics = sorted(required_topics - topics)
@@ -422,7 +442,8 @@ class CalibrationConsole:
             if detector_success:
                 print(
                     "断点检测：有效；"
-                    f"支撑点 {detector.get('support_points', '?')}；"
+                    "目标表面点 "
+                    f"{detector.get('target_surface_points', detector.get('support_points', '?'))}；"
                     f"拟合RMS {float(detector.get('residual_rms_mm', 0.0)):.3f} mm；"
                     f"估计σ {float(detector.get('endpoint_sigma_mm', 0.0)):.3f} mm；"
                     f"置信度 {float(detector.get('confidence', 0.0)):.3f}"
@@ -435,6 +456,145 @@ class CalibrationConsole:
         except (TypeError, ValueError, json.JSONDecodeError):
             print("断点检测状态：" + detector_message)
         return True
+
+    def verify_real(self) -> bool:
+        print("\n[环境检查] 正在检查FANUC与Gocator真机环境……")
+        nodes = ros_list("node")
+        topics = ros_list("topic")
+        services = ros_list("service")
+        required_nodes = {
+            "/fanuc_joint_state",
+            "/gocator_profile_driver",
+            "/gocator_metric_adapter",
+            "/measurement_sync",
+            "/profile_endpoint_detector",
+            "/profile_viz_node",
+        }
+        required_topics = {
+            "/fanuc/joint_states_raw",
+            "/gocator/profile_raw_mm",
+            "/gocator/profile",
+            "/calibration/target_surface_points",
+            "/calibration/endpoints",
+        }
+        required_services = {
+            "/fanuc_joint_state/status",
+            "/gocator_metric_adapter/status",
+            "/measurement_sync/status",
+            "/profile_endpoint_detector/status",
+            "/profile_endpoint_detector/lock",
+            "/profile_endpoint_detector/reset",
+        }
+        missing_nodes = sorted(required_nodes - nodes)
+        missing_topics = sorted(required_topics - topics)
+        missing_services = sorted(required_services - services)
+        if missing_nodes or missing_topics or missing_services:
+            print("真机只观察环境尚未准备好。")
+            if missing_nodes:
+                print("  缺少节点：" + ", ".join(missing_nodes))
+            if missing_topics:
+                print("  缺少话题：" + ", ".join(missing_topics))
+            if missing_services:
+                print("  缺少状态服务：" + ", ".join(missing_services))
+            print("\n请在第一个终端运行：")
+            print("  cd /workspace && ./scripts/start_environment.sh real")
+            return False
+
+        joint_ok, joint_message = call_trigger("/fanuc_joint_state/status")
+        try:
+            joint_status = json.loads(joint_message)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            joint_status = {"last_error": joint_message}
+        if not joint_ok:
+            print("FANUC状态不可用：" + str(joint_status.get("last_error", "未知")))
+            return False
+        if not joint_status.get("j23_validated", False):
+            print(
+                "FANUC通信正常，但J23约定尚未验证；为防止错误FK，"
+                "系统没有发布标定用/joint_states。"
+            )
+            print("当前只能查看原始控制器关节，不能开始采集。")
+            return False
+        required_calibration_topics = {
+            "/joint_states",
+            "/calibration/flange_pose",
+        }
+        unavailable = sorted(
+            topic
+            for topic in required_calibration_topics
+            if topic not in topics or not ros_topic_has_publisher(topic)
+        )
+        if unavailable:
+            print("标定同步链尚未输出：" + ", ".join(unavailable))
+            return False
+        if "/fanuc_motion_bridge/status" in services:
+            _, motion_message = call_trigger("/fanuc_motion_bridge/status")
+            try:
+                motion = json.loads(motion_message)
+                print(
+                    "真机测量链正常；运动桥 "
+                    f"mode={motion.get('mode', '?')}，"
+                    f"writes={motion.get('motion_writes_enabled', False)}，"
+                    f"state={motion.get('state', '?')}（启动默认未解锁）。"
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                print("真机测量链正常；运动桥状态暂不可解析。")
+        else:
+            print("真机测量链正常；当前为observe_only，不具备自动运动权限。")
+        return True
+
+    def _real_motion_status(self) -> dict | None:
+        success, message = call_trigger("/fanuc_motion_bridge/status")
+        try:
+            payload = json.loads(message)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            print("无法解析真机运动桥状态：" + message)
+            return None
+        if not success and payload.get("mode") != "plan_only":
+            print("真机运动桥未就绪：" + str(payload.get("last_error", message)))
+        return payload
+
+    def _arm_real_motion(self) -> bool:
+        status = self._real_motion_status()
+        if status is None:
+            print("第一终端没有可用的真机运动桥。请重新启动：")
+            print(
+                "  ./scripts/start_environment.sh real "
+                "--motion-mode automatic"
+            )
+            return False
+        mode = status.get("mode")
+        if mode == "plan_only" or not status.get("motion_writes_enabled", False):
+            print("运动桥当前只规划、不执行。请重新启动第一终端：")
+            print(
+                "  ./scripts/start_environment.sh real "
+                "--motion-mode automatic"
+            )
+            return False
+        print("\n[真机运动安全确认]")
+        print("  · 示教器运行 PC_TRACK_ALL，且程序指针已进入循环；")
+        print("  · 当前 UF/UT 为 1/1，R[100]=0；")
+        print("  · 使用 T1/低速，人员已离开运动范围并可随时按 HOLD/急停；")
+        print("  · 每个目标还会经过关节步长、局部直线路径 IK 和 CURPOS/FK 一致性检查。")
+        phrase = input("确认上述条件后输入大写 ARM（其他输入取消）：").strip()
+        if phrase != "ARM":
+            print("未解锁真机运动。")
+            return False
+        success, message = call_trigger("/fanuc_motion_bridge/arm")
+        if not success:
+            print("运动桥解锁失败：" + message)
+            return False
+        print("真机运动桥已解锁；标定结束或异常退出时会自动软件撤防。")
+        return True
+
+    @staticmethod
+    def _disarm_real_motion() -> None:
+        call_trigger("/fanuc_motion_bridge/disarm", timeout=2.0)
+
+    def verify_environment(self) -> bool:
+        if self.backend == "real":
+            return self.verify_real()
+        return self.verify_simulation()
 
     @staticmethod
     def make_run_directory() -> Path:
@@ -458,11 +618,18 @@ class CalibrationConsole:
         seed_node = self._start_seed_node(
             mode, seed_file, run_directory, preflight_mode
         )
+        real_motion_armed = False
         try:
             if not wait_for_service(
                 "/bilateral_seed_collection/status", seed_node
             ):
                 self._node_start_failure(seed_node)
+                return
+            reset_success, reset_message = call_trigger(
+                "/profile_endpoint_detector/reset"
+            )
+            if not reset_success:
+                print(f"无法复位目标引导检测器：{reset_message}")
                 return
             status = self._confirm_initial_pose(mode, preflight_mode)
             if status is None:
@@ -471,6 +638,10 @@ class CalibrationConsole:
                 if not ask_yes_no("确认开始自动采集 6 个种子位姿？", default=True):
                     print("已取消种子采集。")
                     return
+                if self.backend == "real":
+                    real_motion_armed = self._arm_real_motion()
+                    if not real_motion_armed:
+                        return
                 success, message = call_trigger(
                     "/bilateral_seed_collection/start"
                 )
@@ -493,11 +664,19 @@ class CalibrationConsole:
                     return
         finally:
             self._stop_node(seed_node)
+            if self.backend == "real" and real_motion_armed:
+                self._disarm_real_motion()
 
         if not seed_file.exists():
             print("没有生成种子文件，流程结束。")
             return
         self._print_seed_summary(seed_file)
+        if self.backend == "real":
+            print(
+                "真机observe_only阶段已完成种子数据采集；"
+                "自动运动与NBV执行仍被安全门禁禁用。"
+            )
+            return
         if not ask_yes_no("种子采集完成，确认开始主动标定？", default=True):
             print(f"已保留种子文件：{seed_file}")
             return
@@ -522,8 +701,7 @@ class CalibrationConsole:
             "handeye_sim_bridge",
             "seed_collection",
             "--ros-args",
-            "--params-file",
-            str(PARAM_FILE),
+            *self._parameter_file_arguments(),
             "-p",
             f"collection_mode:={mode}",
             "-p",
@@ -549,13 +727,18 @@ class CalibrationConsole:
     def _confirm_initial_pose(
         self, collection_mode: str, preflight_mode: str
     ) -> dict[str, str] | None:
+        positioning_tool = (
+            "FANUC示教器（T1/手动低速）"
+            if self.backend == "real"
+            else "RViz"
+        )
         print(
-            "\n请在 RViz 中设置初始位姿，使线激光同时稳定看到角点的两条物理边，"
-            "并满足下方初始工作包络。"
+            f"\n请使用{positioning_tool}设置初始位姿，把黄色原始轮廓中的平板"
+            "表面线段移动到 RViz 紫色期望线及其矩形 ROI 内，并满足下方初始工作包络。"
         )
         print(
             "真实现场不需要看见空气中的激光平面：以 Gocator 轮廓、双边断点和"
-            "这里的数值反馈为准；Δz 正负均可，只检查 |Δz|。"
+            "这里的数值反馈为准；绿色线是实际选中的平板表面，Δz 正负均可。"
         )
         print("设置完成后回到这里按 Enter；输入 r 刷新检测状态，输入 q 取消。")
         while True:
@@ -566,6 +749,26 @@ class CalibrationConsole:
                 print(f"  暂时无法读取观测状态：{raw}")
             else:
                 self._print_observation(fields)
+            detector_success, detector_message = call_trigger(
+                "/profile_endpoint_detector/status"
+            )
+            try:
+                detector = json.loads(detector_message)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                detector = {}
+            if detector:
+                guide_first = detector.get("guide_first_mm", ["?", "?", "?"])
+                guide_second = detector.get("guide_second_mm", ["?", "?", "?"])
+                print(
+                    "  引导检测："
+                    f"模式 {detector.get('mode', '?')}；"
+                    f"稳定帧 {detector.get('alignment_stable_frames', 0)}/"
+                    f"{detector.get('minimum_lock_frames', '?')}；"
+                    f"法向ROI ±{detector.get('guide_normal_gate_mm', '?')} mm；"
+                    f"期望端点 XZ=({guide_first[0]}, {guide_first[2]})/"
+                    f"({guide_second[0]}, {guide_second[2]}) mm；"
+                    f"{'已识别' if detector_success else '未稳定识别'}"
+                )
             choice = input("初始位姿 [Enter=确认, r=刷新, q=取消]：").strip().lower()
             if choice == "q":
                 print("已取消。")
@@ -577,6 +780,15 @@ class CalibrationConsole:
                 and fields.get("stable") == "true"
                 and fields.get("initial_ready") == "true"
             ):
+                lock_success, lock_message = call_trigger(
+                    "/profile_endpoint_detector/lock"
+                )
+                if not lock_success:
+                    print(
+                        "目标线段尚不能锁定："
+                        f"{lock_message}。请保持机器人静止后输入 r 刷新。"
+                    )
+                    continue
                 if collection_mode == "manual":
                     print("初始位姿静态检查通过。人工种子模式不执行动态预检。")
                 elif fields.get("preflight_required") == "true":
@@ -597,8 +809,7 @@ class CalibrationConsole:
                 return fields
             print("当前位姿还不满足初始工作包络，请按提示调整后再确认。")
 
-    @staticmethod
-    def _print_observation(fields: dict[str, str]) -> None:
+    def _print_observation(self, fields: dict[str, str]) -> None:
         observation = fields.get("observation", "UNKNOWN")
         stable = fields.get("stable", "false")
         observation_cn = {
@@ -624,16 +835,24 @@ class CalibrationConsole:
             print("  初始工作包络：通过")
             return
         reason_codes = fields.get("initial_reasons", "").split(",")
+        reason_names = dict(INITIAL_REASON_NAMES)
+        if self.backend == "real":
+            reason_names["z_mid"] = "工作深度应在真机配置的 80–450 mm 正深度范围"
         reasons = [
-            INITIAL_REASON_NAMES.get(code, code)
+            reason_names.get(code, code)
             for code in reason_codes
             if code and code != "none"
         ]
         if reasons:
             print("  初始工作包络：不通过；" + "；".join(reasons))
+            depth_advice = (
+                "让 z_mid 保持在 80–450 mm 的真机正深度范围"
+                if self.backend == "real"
+                else "让 z_mid 接近 400–450 mm"
+            )
             print(
                 "  调整建议：一次只做小幅移动并刷新，优先让双边进入安全域，"
-                "再让 z_mid 接近 400–450 mm、x_mid 接近 0；"
+                f"再{depth_advice}、x_mid 接近 0；"
                 "|Δz| 太小时只需增大腕部倾斜，方向正负均可。"
             )
 
@@ -645,6 +864,7 @@ class CalibrationConsole:
         previous_target = ""
         started_at = time.monotonic()
         last_status_at = started_at
+        approval_seen = False
         while True:
             if node.poll() is not None:
                 self._node_start_failure(node, "种子节点意外退出")
@@ -662,6 +882,35 @@ class CalibrationConsole:
                     return False
                 time.sleep(self.poll_interval)
                 continue
+            if self.backend == "real":
+                motion = self._real_motion_status()
+                waiting = motion is not None and motion.get("state") == "WAIT_APPROVAL"
+                if waiting and not approval_seen:
+                    print("\n\n运动桥正在等待本步确认：")
+                    plan = motion.get("last_plan") or {}
+                    print(
+                        "  最大单轴变化 "
+                        f"{float(plan.get('maximum_joint_step_deg', 0.0)):.2f}°；"
+                        "关节距离 "
+                        f"{float(plan.get('joint_distance_rad', 0.0)):.3f} rad；"
+                        "直线位移 "
+                        f"{float(plan.get('translation_mm', 0.0)):.2f} mm；"
+                        "姿态变化 "
+                        f"{float(plan.get('rotation_deg', 0.0)):.2f}°"
+                    )
+                    if not ask_yes_no("允许执行这一步？", default=False):
+                        self._disarm_real_motion()
+                        print("已拒绝该步并撤防。")
+                        return False
+                    approved, approval_message = call_trigger(
+                        "/fanuc_motion_bridge/approve"
+                    )
+                    if not approved:
+                        print("批准失败：" + approval_message)
+                        return False
+                    approval_seen = True
+                elif not waiting:
+                    approval_seen = False
             last_status_at = time.monotonic()
             count_text = fields.get("seeds", "0/6")
             try:
@@ -754,8 +1003,13 @@ class CalibrationConsole:
         self, node: ManagedNode, *, start_index: int
     ) -> bool:
         for index in range(start_index, 7):
+            positioning_tool = (
+                "FANUC示教器（T1/手动低速）"
+                if self.backend == "real"
+                else "RViz"
+            )
             print(
-                f"\n[人工种子 {index}/6] 请在 RViz 中移动到新的安全位姿。"
+                f"\n[人工种子 {index}/6] 请使用{positioning_tool}移动到新的安全位姿。"
             )
             print("建议相对已有位姿改变末端姿态至少 3°，并保持双边可见。")
             while True:
@@ -879,10 +1133,9 @@ class CalibrationConsole:
             "ros2",
             "run",
             "handeye_sim_bridge",
-            "active_calibration_sim",
+            "active_calibration",
             "--ros-args",
-            "--params-file",
-            str(PARAM_FILE),
+            *self._parameter_file_arguments(),
             "-p",
             "auto_start:=false",
             "-p",
@@ -1008,11 +1261,19 @@ class CalibrationConsole:
                 + "] mm"
             )
             print(
-                "  │ 求解："
+                "  │ 求解（仅观测数据）："
                 f"cost={record.get('cost', 0.0):.6g}，"
-                f"rank={record.get('rank')}，"
-                f"condition={record.get('condition_number', 0.0):.3e}"
+                f"rank={record.get('data_only_rank', record.get('rank'))}，"
+                "condition="
+                f"{record.get('data_only_condition_number', record.get('condition_number', 0.0)):.3e}"
             )
+            if "prior_augmented_rank" in record:
+                print(
+                    "  │ 求解（观测+形貌先验）："
+                    f"rank={record.get('prior_augmented_rank')}，"
+                    "condition="
+                    f"{record.get('prior_augmented_condition_number', 0.0):.3e}"
+                )
             if record.get("surface_model") == "shared":
                 print(
                     "  │ 共享形貌："
@@ -1090,9 +1351,18 @@ class CalibrationConsole:
         )
         print(
             f"  cost={float(payload.get('cost', 0.0)):.6g}，"
-            f"rank={diagnostics.get('rank')}，"
-            f"condition={float(diagnostics.get('condition_number', 0.0)):.3e}"
+            "data-only rank="
+            f"{diagnostics.get('data_only', {}).get('rank', diagnostics.get('rank'))}，"
+            "condition="
+            f"{float(diagnostics.get('data_only', {}).get('condition_number', diagnostics.get('condition_number', 0.0))):.3e}"
         )
+        prior = diagnostics.get("prior_augmented")
+        if isinstance(prior, dict):
+            print(
+                "  观测+形貌先验："
+                f"rank={prior.get('rank')}，"
+                f"condition={float(prior.get('condition_number', 0.0)):.3e}"
+            )
         surface = payload.get("surface", {})
         if surface.get("model") == "shared":
             print(
@@ -1142,6 +1412,24 @@ class CalibrationConsole:
             return
         self._print_final_result(candidates[0])
 
+    def run_sphere_validation(self) -> None:
+        if self.backend != "real":
+            print("精密球验证用于真机独立精度评价，请以 --backend real 启动控制台。")
+            return
+        print(
+            "\n将进入独立精密球验证。该程序只订阅同步轮廓和法兰位姿，"
+            "不会向机器人写入运动，也不会用球面数据重新优化手眼结果。"
+        )
+        completed = subprocess.run(
+            [sys.executable, str(WORKSPACE / "scripts/sphere_validation_console.py")],
+            cwd=WORKSPACE,
+            check=False,
+        )
+        if completed.returncode == 2:
+            print("精密球实验已完成，但结果没有达到配置中的精度阈值。")
+        elif completed.returncode not in {0, 130}:
+            print(f"精密球验证异常结束，退出码 {completed.returncode}。")
+
     @staticmethod
     def _node_start_failure(
         node: ManagedNode, title: str = "节点启动失败"
@@ -1153,9 +1441,10 @@ class CalibrationConsole:
 
     def interactive(self) -> int:
         print("=" * 66)
-        print("        线激光双边角点主动手眼标定 — 仿真交互控制台")
+        environment_name = "真机" if self.backend == "real" else "仿真"
+        print(f"        线激光双边角点主动手眼标定 — {environment_name}交互控制台")
         print("=" * 66)
-        if not self.verify_simulation():
+        if not self.verify_environment():
             return 1
         while True:
             print("\n请选择操作：")
@@ -1163,6 +1452,8 @@ class CalibrationConsole:
             print("  2. 新建标定：人工采集 6 个种子位姿")
             print("  3. 使用已有种子，直接执行主动标定")
             print("  4. 查看最近一次标定结果")
+            if self.backend == "real":
+                print("  5. 使用精密球独立验证真机标定精度")
             print("  0. 退出")
             choice = input("选择 [1]：").strip() or "1"
             if choice == "1":
@@ -1170,13 +1461,19 @@ class CalibrationConsole:
             elif choice == "2":
                 self.run_new("manual")
             elif choice == "3":
-                self.run_existing()
+                if self.backend == "real":
+                    print("真机NBV执行尚未通过安全验收，当前保持禁用。")
+                else:
+                    self.run_existing()
             elif choice == "4":
                 self.show_latest_result()
+            elif choice == "5" and self.backend == "real":
+                self.run_sphere_validation()
             elif choice == "0":
                 return 0
             else:
-                print("无效选择，请输入 0～4。")
+                maximum = 5 if self.backend == "real" else 4
+                print(f"无效选择，请输入 0～{maximum}。")
                 continue
             if not ask_yes_no("返回主菜单？", default=False):
                 return 0
@@ -1253,12 +1550,18 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="只检查仿真环境，不进入交互菜单",
     )
+    parser.add_argument(
+        "--backend",
+        choices=("simulation", "sim", "real"),
+        default="simulation",
+        help="选择仿真或真机只观察后端",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     arguments = parse_arguments()
-    console = CalibrationConsole()
+    console = CalibrationConsole(backend=arguments.backend)
 
     def request_shutdown(_signum, _frame):
         raise KeyboardInterrupt
@@ -1267,7 +1570,7 @@ def main() -> int:
     signal.signal(signal.SIGHUP, request_shutdown)
     try:
         if arguments.check:
-            return 0 if console.verify_simulation() else 1
+            return 0 if console.verify_environment() else 1
         return console.interactive()
     except (KeyboardInterrupt, EOFError):
         print("\n收到中断，正在停止本控制台启动的标定节点……")

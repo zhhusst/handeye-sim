@@ -1,0 +1,10 @@
+{
+  "bag": "/workspace/data/breakpoint_tracking_runs/20260814_140754_auto_seed/20260814_140754_auto_seed_0.mcap",
+  "start_frame": 0,
+  "roi": {
+    "xmin_m": -0.043721,
+    "zmin_m": 0.257264,
+    "xmax_m": 0.034019,
+    "zmax_m": 0.303247
+  }
+}

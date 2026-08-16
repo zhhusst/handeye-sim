@@ -1,0 +1,20 @@
+# Backend-neutral flange motion request.
+# target is always base_frame -> flange_frame in SI units.
+geometry_msgs/PoseStamped target
+float64 velocity_scale
+float64 acceleration_scale
+float64 timeout_s
+bool plan_only
+bool require_operator_confirmation
+string request_id
+---
+bool success
+int32 error_code
+string message
+geometry_msgs/PoseStamped reached_pose
+float64 joint_distance_rad
+float64 maximum_joint_step_rad
+---
+string stage
+float32 progress
+string detail
