@@ -366,11 +366,25 @@ class PcTrackAllStepSender:
         saw_busy = False
         while time.monotonic() < deadline:
             state = self._get_r(self.r_step_state)
-            if state == 1:
-                saw_busy = True
-            elif state == 2:
-                return {"step_state": state, "saw_busy": int(saw_busy), "speed": speed}
-            elif state not in (0, 1, 2):
+            if not saw_busy:
+                # The initial R[102] may be 2 from the PREVIOUS step (the TP
+                # program writes R[110]=0 and R[102]=2 only after the motion
+                # completes).  Accepting that stale value as the current
+                # step's completion makes execute() return before the robot
+                # has moved, leaving R[110]=1 pending for the next goal and
+                # tripping the next assert_ready().  A fresh step must first
+                # be observed as busy (1); only then is its done (2)
+                # trustworthy.
+                if state == 1:
+                    saw_busy = True
+            else:
+                if state == 2:
+                    return {
+                        "step_state": state,
+                        "saw_busy": int(saw_busy),
+                        "speed": speed,
+                    }
+            if state not in (0, 1, 2):
                 raise RuntimeError(f"unexpected PC_TRACK_ALL R[102] state: {state}")
             time.sleep(float(poll_s))
         raise TimeoutError(

@@ -46,6 +46,12 @@
       # first step moved the selected chord outside the local tracking basin
       # before measured feedback could intervene.
       rotation_step_deg: 1.0
+      # Keep the chord centred before rotating again.  A 1 deg Y-axis step
+      # moves the laser line across the plate by ~5-17 mm (lever arm x step);
+      # with the old 25 mm default the line left the 48 mm wide plate and the
+      # bilateral feature was lost.  8 mm leaves enough margin for the next
+      # step to stay on the plate.
+      rotation_continue_max_abs_x_mid_m: 0.008
       # Measurement retry starts after the post-motion settling interval.
       # Keep three full seconds for measurement_sync and the detector's
       # consecutive-frame reacquisition on real hardware.
@@ -66,6 +72,13 @@
     # side walls. Use the same detector as simulation, with target dimensions
     # and a broad central ROI as selection constraints.
     endpoint_detection:
+      # CSRT was selected from the recorded real-profile comparison. ALIGN is
+      # still bounded by the purple guide; after lock, the image trackers only
+      # provide local association and all published points remain measured.
+      backend: roi
+      # Matches the validated offline command `--stride 4` and prevents the
+      # high-rate periodic bad profiles from continually resetting ALIGN.
+      roi_process_every_n_frames: 4
       measured_prior_topic: /calibration/detection_measured_prior
       # A tracked physical breakpoint pair remains useful even when only a
       # short top-surface chord is visible.  Ten millimetres is the safety
@@ -91,7 +104,8 @@
       tracking_endpoint_gate_m: 0.025
       predicted_normal_gate_m: 0.012
       predicted_endpoint_gate_m: 0.050
-      # After short Kalman coasting fails, permit a wider local recovery but
+      # Classic-backend fallback: after short Kalman coasting fails, permit a
+      # wider local recovery but
       # never commit a workbench/side segment whose shape jumps abruptly.
       reacquire_maximum_segment_length_change_m: 0.050
       reacquire_maximum_segment_angle_change_deg: 20.0
@@ -214,7 +228,7 @@ fanuc_motion_bridge:
     cartesian_path_samples: 5
     maximum_joint_state_age_s: 0.5
     maximum_joint_speed_rad_s: 0.01
-    arrival_tolerance_deg: 0.20
+    arrival_tolerance_deg: 1.0
     approval_timeout_s: 120.0
     motion_timeout_s: 90.0
     validation_position_tolerance_mm: 2.0

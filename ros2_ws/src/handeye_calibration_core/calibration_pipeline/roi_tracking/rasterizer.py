@@ -70,8 +70,19 @@ class ProfileRasterizer:
             return img
         u = (pts[:, 0] - self.config.x_min_m) / self._r
         v = (self.config.z_max_m - pts[:, 2]) / self._r
-        ui = np.clip(np.round(u).astype(int), 0, W - 1)
-        vi = np.clip(np.round(v).astype(int), 0, H - 1)
+        # Do not clip out-of-view samples onto the image border.  A profile
+        # can legitimately move partly outside the fixed raster during a
+        # wrist motion; clipping would turn all of those samples into a bright
+        # artificial line which CSRT can lock onto.
+        inside = (u >= 0.0) & (u < W) & (v >= 0.0) & (v < H)
+        u = u[inside]
+        v = v[inside]
+        if len(u) == 0:
+            return img
+        ui = np.round(u).astype(int)
+        vi = np.round(v).astype(int)
+        ui = np.minimum(ui, W - 1)
+        vi = np.minimum(vi, H - 1)
         img[vi, ui] = 255
         if self.config.point_radius_px > 1:
             import cv2

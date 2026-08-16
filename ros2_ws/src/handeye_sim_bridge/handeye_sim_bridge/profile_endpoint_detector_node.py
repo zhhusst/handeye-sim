@@ -21,6 +21,10 @@ from calibration_pipeline.perception import (
     ProfileEndpointDetector,
 )
 from calibration_pipeline.seed_collection.endpoint_tracker import EndpointTracker
+from calibration_pipeline.roi_tracking import (
+    ROIBreakpointPipeline,
+    ROIBreakpointPipelineConfig,
+)
 
 
 ENDPOINT_FIELDS = [
@@ -86,6 +90,34 @@ class ProfileEndpointDetectorNode(Node):
         self.declare_parameter(
             "endpoint_detection.control_topic",
             "/calibration/detection_control",
+        )
+        self.declare_parameter("endpoint_detection.backend", "classic")
+        self.declare_parameter("endpoint_detection.roi_size_m", 0.020)
+        self.declare_parameter("endpoint_detection.fail_streak_frames", 3)
+        self.declare_parameter("endpoint_detection.tracker_name", "csrt")
+        self.declare_parameter("endpoint_detection.raster_res_mm", 0.25)
+        self.declare_parameter(
+            "endpoint_detection.roi_process_every_n_frames", 1
+        )
+        self.declare_parameter("endpoint_detection.raster_point_radius_px", 2)
+        self.declare_parameter("endpoint_detection.raster_margin_m", 0.020)
+        self.declare_parameter(
+            "endpoint_detection.raster_maximum_dimension_px", 2400
+        )
+        self.declare_parameter("endpoint_detection.core_fraction", 0.70)
+        self.declare_parameter("endpoint_detection.roi_jump_m", 0.015)
+        self.declare_parameter("endpoint_detection.bp_jump_m", 0.015)
+        self.declare_parameter(
+            "endpoint_detection.roi_tracking_minimum_chord_ratio", 0.45
+        )
+        self.declare_parameter(
+            "endpoint_detection.roi_tracking_maximum_chord_ratio", 2.50
+        )
+        self.declare_parameter(
+            "endpoint_detection.plate_growth_residual_threshold_m", 0.0008
+        )
+        self.declare_parameter(
+            "endpoint_detection.roi_surface_residual_threshold_m", 0.0012
         )
         self.declare_parameter("endpoint_detection.minimum_points", 12)
         self.declare_parameter("endpoint_detection.minimum_segment_points", 10)
@@ -646,10 +678,102 @@ class ProfileEndpointDetectorNode(Node):
             "reason": "not_processed",
             "mode": self.mode,
         }
+        self.endpoint_backend = str(
+            self.get_parameter(prefix + "backend").value
+        ).strip().lower()
+        if self.endpoint_backend not in {"classic", "roi"}:
+            raise ValueError(
+                "endpoint_detection.backend must be 'classic' or 'roi'"
+            )
+        self.roi_pipeline: ROIBreakpointPipeline | None = None
+        self.roi_input_frames = 0
+        self.roi_process_every_n_frames = max(
+            1,
+            int(
+                self.get_parameter(
+                    prefix + "roi_process_every_n_frames"
+                ).value
+            ),
+        )
+        if self.endpoint_backend == "roi":
+            self.roi_pipeline = ROIBreakpointPipeline(
+                ROIBreakpointPipelineConfig(
+                    initial_first_label=self.initial_first_label,
+                    alignment_template_center_x_m=float(self.alignment_center[0]),
+                    alignment_template_center_z_m=float(self.alignment_center[2]),
+                    alignment_template_length_m=self.alignment_length,
+                    alignment_template_angle_deg=float(
+                        np.rad2deg(self.alignment_angle)
+                    ),
+                    alignment_normal_gate_m=self.alignment_normal_gate,
+                    alignment_endpoint_gate_m=self.alignment_endpoint_gate,
+                    alignment_maximum_angle_difference_deg=self.alignment_angle_gate,
+                    alignment_stability_m=self.alignment_stability,
+                    minimum_lock_frames=self.minimum_lock_frames,
+                    minimum_segment_length_m=self.detector.config.minimum_segment_length_m,
+                    maximum_segment_length_m=self.detector.config.maximum_segment_length_m,
+                    tracker_name=str(
+                        self.get_parameter(prefix + "tracker_name").value
+                    ),
+                    roi_size_m=float(
+                        self.get_parameter(prefix + "roi_size_m").value
+                    ),
+                    raster_resolution_m_per_pixel=0.001
+                    * float(self.get_parameter(prefix + "raster_res_mm").value),
+                    raster_point_radius_px=int(
+                        self.get_parameter(prefix + "raster_point_radius_px").value
+                    ),
+                    raster_margin_m=float(
+                        self.get_parameter(prefix + "raster_margin_m").value
+                    ),
+                    raster_maximum_dimension_px=int(
+                        self.get_parameter(
+                            prefix + "raster_maximum_dimension_px"
+                        ).value
+                    ),
+                    core_fraction=float(
+                        self.get_parameter(prefix + "core_fraction").value
+                    ),
+                    roi_jump_m=float(
+                        self.get_parameter(prefix + "roi_jump_m").value
+                    ),
+                    breakpoint_jump_m=float(
+                        self.get_parameter(prefix + "bp_jump_m").value
+                    ),
+                    fail_streak_frames=int(
+                        self.get_parameter(prefix + "fail_streak_frames").value
+                    ),
+                    reacquire_stable_frames=self.reacquire_stable_frames,
+                    reacquire_endpoint_gate_m=self.tracking_endpoint_gate,
+                    reacquire_stability_m=self.reacquire_stability,
+                    tracking_minimum_chord_ratio=float(
+                        self.get_parameter(
+                            prefix + "roi_tracking_minimum_chord_ratio"
+                        ).value
+                    ),
+                    tracking_maximum_chord_ratio=float(
+                        self.get_parameter(
+                            prefix + "roi_tracking_maximum_chord_ratio"
+                        ).value
+                    ),
+                    plate_residual_threshold_m=float(
+                        self.get_parameter(
+                            prefix + "plate_growth_residual_threshold_m"
+                        ).value
+                    ),
+                    surface_residual_threshold_m=float(
+                        self.get_parameter(
+                            prefix + "roi_surface_residual_threshold_m"
+                        ).value
+                    ),
+                    endpoint_sigma_floor_m=self.detector.config.residual_floor_m,
+                )
+            )
+            self._sync_roi_pipeline_state()
         self.get_logger().info(
             f"raw-profile endpoint detector ready: {input_topic} -> "
             f"{output_topic} + {output_surface_topic}; "
-            f"guided_mode={self.guided_enabled}; "
+            f"guided_mode={self.guided_enabled}; backend={self.endpoint_backend}; "
             "no simulator truth subscription"
         )
 
@@ -750,6 +874,98 @@ class ProfileEndpointDetectorNode(Node):
             self.last_status, ensure_ascii=False, sort_keys=True
         )
         self.diagnostic_publisher.publish(diagnostics)
+
+    def _sync_roi_pipeline_state(self) -> None:
+        """Expose the selected backend through the node's legacy status fields."""
+        if self.roi_pipeline is None:
+            return
+        pipeline = self.roi_pipeline
+        self.frames = pipeline.frames
+        self.accepted = pipeline.accepted
+        self.mode = pipeline.mode
+        self.guide_endpoints = pipeline.guide_endpoints.copy()
+        self.last_matched = (
+            None if pipeline.last_matched is None else pipeline.last_matched.copy()
+        )
+        self.alignment_stable_frames = pipeline.alignment_stable_frames
+        self.lost_frames = pipeline.lost_frames
+        self.reacquire_frames = pipeline.reacquire_frames
+        self.tracking_reference_length = pipeline.tracking_reference_length
+
+    def _roi_profile_callback(self, message: PointCloud2) -> None:
+        assert self.roi_pipeline is not None
+        self.roi_input_frames += 1
+        if (
+            (self.roi_input_frames - 1) % self.roi_process_every_n_frames
+            != 0
+        ):
+            return
+        self.last_profile_header = message.header
+        self.last_profile_time_s = self._message_time_seconds(message)
+        try:
+            profile = _profile_array(message)
+            result = self.roi_pipeline.process_profile(
+                profile, self.last_profile_time_s
+            )
+        except Exception as error:
+            # A tracker/backend exception must degrade to an empty observation;
+            # it must never terminate the detector process while the robot moves.
+            self.get_logger().error(f"ROI endpoint backend failed: {error}")
+            self._sync_roi_pipeline_state()
+            self.last_status = {
+                "state": "LOST",
+                "reason": f"roi_backend_exception:{error}",
+                "backend": "roi",
+                "frames": self.frames,
+                "accepted": self.accepted,
+            }
+            self._empty_output(message)
+            self._publish_guide(message.header)
+            self._publish_diagnostics()
+            return
+        self._sync_roi_pipeline_state()
+        self._publish_guide(message.header)
+        self.last_status = result.to_dict()
+        self.last_status.update(self.roi_pipeline.status_extras())
+        self.last_status["input_frames"] = self.roi_input_frames
+        self.last_status["process_every_n_frames"] = (
+            self.roi_process_every_n_frames
+        )
+        self.last_status["initial_first_label"] = self.initial_first_label
+        if (
+            result.state != "VALID"
+            or result.endpoints is None
+            or result.surface_points is None
+        ):
+            self._empty_output(message)
+            self._publish_diagnostics()
+            return
+        confidence = 0.0 if result.confidence is None else float(result.confidence)
+        sigma_m = (
+            self.roi_pipeline.config.endpoint_sigma_floor_m
+            if result.endpoint_sigma_mm is None
+            else 0.001 * float(result.endpoint_sigma_mm)
+        )
+        rows = [
+            (
+                float(endpoint[0]),
+                0.0,
+                float(endpoint[2]),
+                confidence,
+                sigma_m,
+            )
+            for endpoint in result.endpoints
+        ]
+        self.publisher.publish(
+            point_cloud2.create_cloud(message.header, ENDPOINT_FIELDS, rows)
+        )
+        self.surface_publisher.publish(
+            point_cloud2.create_cloud_xyz32(
+                message.header,
+                result.surface_points.astype(np.float32).tolist(),
+            )
+        )
+        self._publish_diagnostics()
 
     def _publish_guide(self, header) -> None:
         self.guide_publisher.publish(
@@ -952,6 +1168,21 @@ class ProfileEndpointDetectorNode(Node):
         self.tracking_reference_length = None
 
     def _reset_callback(self, _request, response):
+        if self.roi_pipeline is not None:
+            self.roi_pipeline.reset()
+            self.roi_input_frames = 0
+            self._sync_roi_pipeline_state()
+            self.last_status = {
+                "state": "WAIT_ALIGNMENT",
+                "reason": "alignment_reset",
+                **self.roi_pipeline.status_extras(),
+                **self._status_context(),
+            }
+            response.success = True
+            response.message = json.dumps(
+                self.last_status, ensure_ascii=False, sort_keys=True
+            )
+            return response
         self._reset_guidance()
         self.frames = 0
         self.accepted = 0
@@ -969,6 +1200,17 @@ class ProfileEndpointDetectorNode(Node):
         return response
 
     def _lock_callback(self, _request, response):
+        if self.roi_pipeline is not None:
+            success = self.roi_pipeline.lock()
+            self._sync_roi_pipeline_state()
+            response.success = success
+            response.message = (
+                "ROI/CSRT target locked; both trackers initialized from the "
+                "current measured profile"
+                if success
+                else "ROI alignment is not stable or CSRT initialization failed"
+            )
+            return response
         if not self.guided_enabled:
             response.success = True
             response.message = "guided detection is disabled"
@@ -1018,6 +1260,10 @@ class ProfileEndpointDetectorNode(Node):
         prior = np.vstack((values[0], values[-1]))
         if np.linalg.norm(prior[1] - prior[0]) <= 1e-9:
             return
+        if self.roi_pipeline is not None:
+            self.roi_pipeline.handle_prior(prior)
+            self._sync_roi_pipeline_state()
+            return
         if self.mode != "PREDICTED_TRACK":
             self.prediction_fallback = (
                 None
@@ -1047,6 +1293,10 @@ class ProfileEndpointDetectorNode(Node):
         prior = np.vstack((values[0], values[-1]))
         if np.linalg.norm(prior[1] - prior[0]) <= 1e-9:
             return
+        if self.roi_pipeline is not None:
+            self.roi_pipeline.handle_measured_prior(prior)
+            self._sync_roi_pipeline_state()
+            return
         self.prediction_fallback = (
             None
             if self.tracking_expected is None
@@ -1070,6 +1320,10 @@ class ProfileEndpointDetectorNode(Node):
 
     def _control_callback(self, message: String) -> None:
         command = message.data.strip().upper()
+        if self.roi_pipeline is not None:
+            self.roi_pipeline.handle_control(command)
+            self._sync_roi_pipeline_state()
+            return
         if command == "SEED_TRACK_START":
             self.temporal_tracking_requested = self.temporal_tracking_enabled
             self.temporal_suspended = False
@@ -1469,6 +1723,9 @@ class ProfileEndpointDetectorNode(Node):
         return True
 
     def _callback(self, message: PointCloud2) -> None:
+        if self.roi_pipeline is not None:
+            self._roi_profile_callback(message)
+            return
         self.frames += 1
         self.last_profile_header = message.header
         self.last_profile_time_s = self._message_time_seconds(message)

@@ -4,6 +4,7 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
+        - /ProfileDetection1/Namespaces1
         - /TF1/Frames1
       Splitter Ratio: 0.5
     Tree Height: 292
@@ -141,8 +142,10 @@ Visualization Manager:
       Name: ProfileDetection
       Namespaces:
         axes: true
+        detected_endpoints: true
         detection_guide: true
         profile: true
+        target_surface: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -150,15 +153,6 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /gocator/profile_viz
       Value: true
-    - Class: rviz_default_plugins/InteractiveMarkers
-      Enable Transparency: true
-      Enabled: false
-      Interactive Markers Namespace: plate_im
-      Name: FOV_Corners
-      Show Axes: true
-      Show Descriptions: true
-      Show Visual Aids: true
-      Value: false
     - Acceleration_Scaling_Factor: 0.1
       Class: moveit_rviz_plugin/MotionPlanning
       Enabled: true
@@ -296,25 +290,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.6602567434310913
+      Distance: 0.12350605428218842
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 1.003542423248291
-        Y: 0.05877434462308884
-        Z: 0.23267266154289246
+        X: 1.1359992027282715
+        Y: -0.02500755712389946
+        Z: 0.10919325053691864
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: -0.04520251601934433
+      Pitch: -0.12020247429609299
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 0.32318663597106934
+      Yaw: 1.1531864404678345
     Saved: ~
 Window Geometry:
   Displays:

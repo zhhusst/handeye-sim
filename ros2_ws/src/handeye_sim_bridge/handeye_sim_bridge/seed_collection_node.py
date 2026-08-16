@@ -749,7 +749,7 @@ class SeedCollectionNode(Node):
             self._publish_detection_control("SEED_TRACK_STOP")
             response.message = (
                 "automatic seed collection armed; collecting the stationary "
-                "reference before dual-breakpoint Kalman tracking starts"
+                "reference before dual-breakpoint temporal tracking starts"
             )
         return response
 
@@ -1277,8 +1277,47 @@ class SeedCollectionNode(Node):
         self.accumulated_angle = 0.0
         self.stage_index = 0
         self.failure_count = 0
-        if not self._command_joints(self.reference_joints, "RETURN_REFERENCE"):
-            self._fail("cannot return to the reference pose: controller unavailable")
+        if not self._command_return_reference_stage():
+            self._fail(
+                "cannot return to the reference pose: controller unavailable"
+            )
+
+    def _command_return_reference_stage(self) -> bool:
+        """Move toward ``reference_joints`` in stages of at most
+        ``_return_max_joint_step_deg`` so a full return (e.g. after a 5 deg
+        seed rotation, the wrist joints can differ by ~9.4 deg) never trips
+        the motion bridge ``maximum_joint_step_deg`` safety gate.
+
+        Each stage is re-planned from the CURRENT joints, so the number of
+        stages adapts to however far the robot actually is.  The final stage
+        reuses the existing ``RETURN_REFERENCE`` settling handler.
+        """
+        if self.latest_joints is None or self.reference_joints is None:
+            return False
+        current = np.asarray(self.latest_joints, dtype=float)
+        target = np.asarray(self.reference_joints, dtype=float)
+        delta = target - current
+        remaining_deg = float(np.max(np.abs(np.rad2deg(delta))))
+        if remaining_deg <= 1.0e-9:
+            # Already at the reference pose (e.g. right after the stationary
+            # reference batch): a zero-distance goal is accepted by the
+            # motion bridge and completes through the normal SETTLING path,
+            # which reuses _after_return_reference.
+            return self._command_joints(current, "RETURN_REFERENCE")
+        max_step_deg = getattr(self, "_return_max_joint_step_deg", 5.0)
+        if remaining_deg <= max_step_deg:
+            after_settle = "RETURN_REFERENCE"
+        else:
+            after_settle = "RETURN_REFERENCE_STAGE"
+            delta = delta * (max_step_deg / remaining_deg)
+        return self._command_joints(current + delta, after_settle)
+
+    def _after_return_reference_stage(self) -> None:
+        """One return stage landed; keep going until the reference pose."""
+        if not self._command_return_reference_stage():
+            self._fail(
+                "cannot continue staged return to the reference pose"
+            )
 
     def _after_return_reference(self) -> None:
         feature_at_reference = self._feature()
@@ -1996,14 +2035,14 @@ class SeedCollectionNode(Node):
                 self.collection_phase = "PREFLIGHT"
                 self.get_logger().info(
                     "reference multi-frame seed accepted; dual-breakpoint "
-                    "Kalman tracking enabled; starting measured local "
+                    "temporal tracking enabled; starting measured local "
                     "+/-X/+/-Y preflight"
                 )
             else:
                 self.collection_phase = "COLLECT"
                 self.get_logger().info(
                     "reference multi-frame seed accepted; dual-breakpoint "
-                    "Kalman tracking enabled; starting adaptive star "
+                    "temporal tracking enabled; starting adaptive star "
                     "rotation plan"
                 )
             self._return_reference()

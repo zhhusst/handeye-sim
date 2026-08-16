@@ -373,6 +373,42 @@ class ProfileVizNode(Node):
         m2.points = [Point(x=0.0, y=0.0, z=-0.05), Point(x=0.0, y=0.0, z=0.6)]
         arr.markers.append(m2)
 
+        # Tracking ROI boxes (from detector diagnostics: roi_boxes_mm).
+        # Red = ROI1, blue = ROI2; same colours as the offline visualizer.
+        roi_colors = ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+        roi_boxes = self._detector_status.get('roi_boxes_mm', [])
+        for index in range(2):
+            box_marker = Marker()
+            box_marker.header.frame_id = FRAME
+            box_marker.header.stamp = marker_stamp
+            box_marker.ns = 'tracking_roi'
+            box_marker.id = 40 + index
+            if index >= len(roi_boxes) or roi_boxes[index] is None:
+                box_marker.action = Marker.DELETE
+            else:
+                box = roi_boxes[index]
+                xmin = 0.001 * float(box.get('xmin_mm', 0.0))
+                zmin = 0.001 * float(box.get('zmin_mm', 0.0))
+                xmax = 0.001 * float(box.get('xmax_mm', 0.0))
+                zmax = 0.001 * float(box.get('zmax_mm', 0.0))
+                corners = [
+                    (xmin, zmin), (xmax, zmin),
+                    (xmax, zmax), (xmin, zmax), (xmin, zmin),
+                ]
+                box_marker.type = Marker.LINE_STRIP
+                box_marker.action = Marker.ADD
+                box_marker.scale.x = 0.002
+                red, green, blue = roi_colors[index]
+                box_marker.color.r = red
+                box_marker.color.g = green
+                box_marker.color.b = blue
+                box_marker.color.a = 1.0
+                box_marker.pose.position.y = -0.0015
+                box_marker.points = [
+                    Point(x=x, y=0.0, z=z) for x, z in corners
+                ]
+            arr.markers.append(box_marker)
+
         endpoint_colors = ((0.1, 0.9, 0.2), (0.2, 0.4, 1.0))
         for index in range(2):
             marker = Marker()

@@ -571,21 +571,20 @@ class CalibrationConsole:
                 "--motion-mode automatic"
             )
             return False
-        print("\n[真机运动安全确认]")
-        print("  · 示教器运行 PC_TRACK_ALL，且程序指针已进入循环；")
-        print("  · 当前 UF/UT 为 1/1，R[100]=0；")
-        print("  · 使用 T1/低速，人员已离开运动范围并可随时按 HOLD/急停；")
-        print("  · 每个目标还会经过关节步长、局部直线路径 IK 和 CURPOS/FK 一致性检查。")
-        phrase = input("确认上述条件后输入大写 ARM（其他输入取消）：").strip()
-        if phrase != "ARM":
-            print("未解锁真机运动。")
-            return False
         success, message = call_trigger("/fanuc_motion_bridge/arm")
         if not success:
             print("运动桥解锁失败：" + message)
             return False
         print("真机运动桥已解锁；标定结束或异常退出时会自动软件撤防。")
         return True
+
+    @staticmethod
+    def _print_motion_safety() -> None:
+        print("\n[真机运动安全确认]")
+        print("  · 示教器运行 PC_TRACK_ALL，且程序指针已进入循环；")
+        print("  · 当前 UF/UT 为 1/1，R[100]=0；")
+        print("  · 使用 T1/低速，人员已离开运动范围并可随时按 HOLD/急停；")
+        print("  · 每个目标还会经过关节步长、局部直线路径 IK 和 CURPOS/FK 一致性检查。")
 
     @staticmethod
     def _disarm_real_motion() -> None:
@@ -635,6 +634,8 @@ class CalibrationConsole:
             if status is None:
                 return
             if mode == "automatic":
+                if self.backend == "real":
+                    self._print_motion_safety()
                 if not ask_yes_no("确认开始自动采集 6 个种子位姿？", default=True):
                     print("已取消种子采集。")
                     return

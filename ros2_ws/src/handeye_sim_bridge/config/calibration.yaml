@@ -100,6 +100,10 @@
     # One detector is shared by synthetic PointCloud2 profiles and a future
     # real Gocator PointCloud2 driver. It never subscribes to simulation truth.
     endpoint_detection:
+      # The simulation keeps the established metric detector as its baseline.
+      # Real hardware overrides this with the ROI/CSRT backend after offline
+      # validation on recorded Gocator profiles.
+      backend: classic                 # classic | roi
       input_topic: /gocator/profile
       output_topic: /calibration/endpoints
       output_surface_topic: /calibration/target_surface_points
@@ -187,6 +191,25 @@
       tracking_maximum_endpoint_step_m: 0.003
       tracking_minimum_reference_length_ratio: 0.60
       tracking_maximum_reference_length_ratio: 1.80
+      # ROI/CSRT backend.  Boxes are generated automatically around the two
+      # bounded ALIGN endpoints; no manual image rectangle is required.
+      roi_size_m: 0.020
+      fail_streak_frames: 3
+      tracker_name: csrt
+      raster_res_mm: 0.25
+      roi_process_every_n_frames: 1
+      raster_point_radius_px: 2
+      raster_margin_m: 0.020
+      raster_maximum_dimension_px: 2400
+      core_fraction: 0.70
+      roi_jump_m: 0.015
+      bp_jump_m: 0.015
+      # Reject gradual collapse of the two tracked physical edges before both
+      # CSRT boxes converge on the same internal feature.
+      roi_tracking_minimum_chord_ratio: 0.45
+      roi_tracking_maximum_chord_ratio: 2.50
+      plate_growth_residual_threshold_m: 0.0008
+      roi_surface_residual_threshold_m: 0.0012
 
     sensor:
       # v5: both polygons use the metric X_S-Z_S coordinates published by Gocator.
