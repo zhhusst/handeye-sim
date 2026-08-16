@@ -105,13 +105,13 @@ class ProfileEndpointDetectorNode(Node):
             "endpoint_detection.raster_maximum_dimension_px", 2400
         )
         self.declare_parameter("endpoint_detection.core_fraction", 0.70)
-        self.declare_parameter("endpoint_detection.roi_jump_m", 0.015)
-        self.declare_parameter("endpoint_detection.bp_jump_m", 0.015)
+        self.declare_parameter("endpoint_detection.roi_jump_m", 0.030)
+        self.declare_parameter("endpoint_detection.bp_jump_m", 0.030)
         self.declare_parameter(
-            "endpoint_detection.roi_tracking_minimum_chord_ratio", 0.45
+            "endpoint_detection.roi_tracking_minimum_chord_ratio", 0.20
         )
         self.declare_parameter(
-            "endpoint_detection.roi_tracking_maximum_chord_ratio", 2.50
+            "endpoint_detection.roi_tracking_maximum_chord_ratio", 6.00
         )
         self.declare_parameter(
             "endpoint_detection.plate_growth_residual_threshold_m", 0.0008

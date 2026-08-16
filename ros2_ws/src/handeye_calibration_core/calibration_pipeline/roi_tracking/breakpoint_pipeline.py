@@ -36,7 +36,7 @@ class ROIBreakpointPipelineConfig:
     alignment_stability_m: float = 0.0015
     minimum_lock_frames: int = 5
     minimum_segment_length_m: float = 0.010
-    maximum_segment_length_m: float = 0.25
+    maximum_segment_length_m: float = 0.35
     tracker_name: str = "csrt"
     roi_size_m: float = 0.020
     raster_resolution_m_per_pixel: float = 0.00025
@@ -44,14 +44,14 @@ class ROIBreakpointPipelineConfig:
     raster_margin_m: float = 0.020
     raster_maximum_dimension_px: int = 2400
     core_fraction: float = 0.70
-    roi_jump_m: float = 0.015
-    breakpoint_jump_m: float = 0.015
+    roi_jump_m: float = 0.030
+    breakpoint_jump_m: float = 0.030
     fail_streak_frames: int = 3
     reacquire_stable_frames: int = 3
     reacquire_endpoint_gate_m: float = 0.025
     reacquire_stability_m: float = 0.003
-    tracking_minimum_chord_ratio: float = 0.45
-    tracking_maximum_chord_ratio: float = 2.50
+    tracking_minimum_chord_ratio: float = 0.20
+    tracking_maximum_chord_ratio: float = 6.00
     plate_residual_threshold_m: float = 0.0008
     surface_residual_threshold_m: float = 0.0012
     minimum_surface_points: int = 8

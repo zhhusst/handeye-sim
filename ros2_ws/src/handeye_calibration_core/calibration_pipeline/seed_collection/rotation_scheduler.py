@@ -13,12 +13,20 @@ class RotationTarget:
 
 
 def star_rotation_plan() -> tuple[RotationTarget, ...]:
-    """Return targets after the reference pose; axes are X=0 and Y=1."""
+    """Return targets after the reference pose; axes are X=0 and Y=1.
+
+    Order is deliberately Y-positive / Y-negative FIRST: on the real rig,
+    positive local-Y rotation ("camera pitch-up") is the motion that most
+    often disturbs the ROI trackers (the laser chord runs toward the plate
+    diagonal and the breakpoints separate fastest).  Running those targets
+    early surfaces any tracking problem before the easier single-axis X
+    branches, so a failure cannot eat the whole tail of the batch.
+    """
     return (
-        RotationTarget("rx_positive", ((0, 1),)),
-        RotationTarget("rx_negative", ((0, -1),)),
         RotationTarget("ry_positive", ((1, 1),)),
         RotationTarget("ry_negative", ((1, -1),)),
+        RotationTarget("rx_positive", ((0, 1),)),
+        RotationTarget("rx_negative", ((0, -1),)),
         RotationTarget("rx_ry_positive", ((0, 1), (1, 1))),
     )
 

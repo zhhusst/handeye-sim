@@ -84,7 +84,20 @@
       # short top-surface chord is visible.  Ten millimetres is the safety
       # floor; the normal operating chord is still expected to be much longer.
       minimum_segment_length_m: 0.01
-      maximum_segment_length_m: 0.25
+      # Absolute breakpoint-span limit.  0.25 m rejected the 20x20 cm plate
+      # diagonal (0.2828 m) before the laser line could reach it; 0.35 m
+      # covers the physical maximum with margin.
+      maximum_segment_length_m: 0.35
+      # Chord ratio limits are relative to the ALIGN-locked reference length.
+      # 6.0 covers the 20x20 cm plate diagonal (5.5x a ~52 mm lock chord) so
+      # a lengthening laser line is not rejected before the physical maximum.
+      roi_tracking_minimum_chord_ratio: 0.20
+      roi_tracking_maximum_chord_ratio: 6.00
+      # Per-processed-frame ROI/breakpoint movement limits.  With
+      # roi_process_every_n_frames=4 a 15 mm limit meant only 3.75 mm per raw
+      # frame; 30 mm still rejects real jumps while tolerating slow lengthen.
+      roi_jump_m: 0.030
+      bp_jump_m: 0.030
       maximum_residual_rms_m: 0.0005
       smoothing_window: 5
       local_fit_window: 12

@@ -223,7 +223,7 @@ def plate_edge_from_midpoint(points_xz: np.ndarray,
                                x_mid_m: float,
                                residual_threshold_m: float = 0.0008,
                                min_grow_points: int = 8,
-                               max_grow_points: int = 400) -> tuple | None:
+                               max_grow_points: int = 2000) -> tuple | None:
     """Method 2: plate-line endpoints from the midpoint.
 
     The X midpoint of the two ROI centres lies on the plate surface (the
@@ -235,6 +235,12 @@ def plate_edge_from_midpoint(points_xz: np.ndarray,
     boundaries.
 
     Returns (E1, E2) as (2,2) X-Z or None.
+
+    ``max_grow_points`` must exceed the number of profile samples across the
+    physical plate half-span (e.g. 2000 samples @ 0.1 mm pitch = 200 mm).
+    A value of 400 capped the detected breakpoint span at ~80-90 mm on the
+    real 0.1 mm-pitch profiles, so a lengthening laser line could never be
+    followed to the plate diagonal.
     """
     pts = np.asarray(points_xz, dtype=float).reshape(-1, 2)
     if len(pts) < 20:

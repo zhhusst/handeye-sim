@@ -147,6 +147,8 @@ record_command=(ros2 bag record --output "${output}" \
   --topics \
   /gocator/profile_raw_mm \
   /gocator/profile \
+  /gocator/profile_2d \
+  /gocator/profile_viz \
   /fanuc/joint_states_raw \
   /joint_states \
   /calibration/flange_pose \
