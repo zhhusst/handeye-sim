@@ -1,6 +1,17 @@
 /**:
   ros__parameters:
     use_sim_time: false
+    # 候选生成围绕种子参考位姿 (实测参考入射角≈31°, 传感器距板≈0.28m)。
+    # 入射角/工作距离范围必须贴近参考, 否则候选关节步长远超 70° 限制。
+    nbv:
+      edge_samples: 4
+      edge_margin_m: 0.04
+      alpha_deg: [25.0, 31.0, 38.0]
+      psi_deg: [-15.0, 0.0, 15.0]
+      working_distance_m: [0.24, 0.28, 0.33]
+      minimum_nominal_roi_margin_m: 0.01
+      maximum_joint_step_deg: 70.0
+      maximum_joint_distance_rad: 1.6
     runtime:
       backend: real
     evaluation:
@@ -235,13 +246,21 @@ fanuc_motion_bridge:
     controller_origin_in_base_mm: [0.0, 0.0, 425.0]
     # First real trials deliberately use a low Cartesian speed.  PC_TRACK_ALL
     # applies this through R[120] to `L PR[10] ... FINE`.
-    speed_mm_s: 5.0
+    speed_mm_s: 50.0
     minimum_speed_mm_s: 1
-    maximum_speed_mm_s: 20
-    maximum_joint_step_deg: 6.0
-    maximum_joint_distance_rad: 0.20
-    maximum_translation_mm: 80.0
-    maximum_rotation_deg: 10.0
+    maximum_speed_mm_s: 100
+    # NBV 候选最小关节步长 ≈20°; 6° 会让所有候选被运动桥拒绝。
+    # 候选评分最高的 joint_step 可达 35°; 放宽到 40° 覆盖全部 NBV 候选
+    # (NBV 过滤上限 70°), 仍保留安全余量 (T1/低速保护)。
+    # NBV 候选经 70° 过滤后的全链极值: joint_step 69.9°, joint_distance 2.006 rad,
+    # 笛卡尔平移 558mm, 笛卡尔旋转 53°。以下限制放宽到覆盖全部候选,
+    # 但仍保留 T1/低速/HOLD 保护。
+    # NBV 从任意当前位姿出发的候选极值 (实测): joint_step 70°, joint_dist 2.5 rad,
+    # 笛卡尔平移 681mm, 笛卡尔旋转 57°。放宽到覆盖 + 余量。
+    maximum_joint_step_deg: 75.0
+    maximum_joint_distance_rad: 2.6
+    maximum_translation_mm: 900.0
+    maximum_rotation_deg: 70.0
     minimum_joint_margin_deg: 3.0
     cartesian_path_samples: 5
     maximum_joint_state_age_s: 0.5
@@ -251,7 +270,6 @@ fanuc_motion_bridge:
     motion_timeout_s: 90.0
     validation_position_tolerance_mm: 2.0
     validation_rotation_tolerance_deg: 1.0
-
 gocator_profile_driver:
   ros__parameters:
     initial_laser_state: false

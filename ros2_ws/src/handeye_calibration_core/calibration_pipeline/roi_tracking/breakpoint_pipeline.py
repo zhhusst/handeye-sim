@@ -219,6 +219,11 @@ class ROIBreakpointPipeline:
             None if self.last_matched is None else self.last_matched.copy()
         )
         self.predicted_expected = values.copy()
+        # NBV candidates move the sensor, so the endpoint chord direction can
+        # differ drastically from the fixed 25-deg alignment template.  Rebuild
+        # the template from the predicted endpoints so ALIGN can match the
+        # candidate pose instead of rejecting it forever.
+        self.template_endpoints = values.copy()
         self._arm_reacquisition(values, "PREDICTED_TRACK")
 
     def handle_measured_prior(self, prior: np.ndarray) -> None:

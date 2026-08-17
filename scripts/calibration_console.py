@@ -1405,18 +1405,22 @@ class CalibrationConsole:
                 "最大绝对高度 "
                 f"{1000.0 * float(surface.get('maximum_abs_m', 0.0)):.4f} mm"
             )
-        print(
-            "  仿真真值误差："
-            f"旋转 {float(simulation.get('rotation_error_deg', 0.0)):.4f}°，"
-            f"平移 {float(simulation.get('translation_error_mm', 0.0)):.4f} mm"
-        )
-        if (
-            float(simulation.get("rotation_error_deg", float("inf")))
-            < SIM_ROTATION_ERROR_TARGET_DEG
-            and float(simulation.get("translation_error_mm", float("inf")))
-            < SIM_TRANSLATION_ERROR_TARGET_MM
-        ):
-            print("  目标判定：已同时达到（仅用于当前仿真真值评价）")
+        simulation = simulation if isinstance(simulation, dict) else {}
+        if simulation.get("rotation_error_deg") is not None:
+            print(
+                "  仿真真值误差："
+                f"旋转 {float(simulation.get('rotation_error_deg', 0.0)):.4f}°，"
+                f"平移 {float(simulation.get('translation_error_mm', 0.0)):.4f} mm"
+            )
+            if (
+                float(simulation.get("rotation_error_deg", float("inf")))
+                < SIM_ROTATION_ERROR_TARGET_DEG
+                and float(simulation.get("translation_error_mm", float("inf")))
+                < SIM_TRANSLATION_ERROR_TARGET_MM
+            ):
+                print("  目标判定：已同时达到（仅用于当前仿真真值评价）")
+        else:
+            print("  真值误差：真机模式无仿真真值（N/A）")
         print(
             f"  使用种子 {simulation.get('seed_count', '?')} 个，"
             f"主动 NBV {simulation.get('nbv_count', '?')} 个；"

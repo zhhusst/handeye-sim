@@ -1352,6 +1352,24 @@ class ActiveCalibrationNode(Node):
             "joint_distance": 0,
             "already_observed": 0,
         }
+        # Local NBV: anchor candidate sampling near the current reference
+        # sensor pose (flange x handeye) so the joint-step gate passes.
+        options = dict(self.candidate_options)
+        try:
+            if self.pipeline is not None and self.pipeline.result is not None:
+                he_R = np.asarray(
+                    self.pipeline.result.estimate.handeye_rotation, dtype=float
+                )
+                he_t = np.asarray(
+                    self.pipeline.result.estimate.handeye_translation, dtype=float
+                )
+                T_flange = forward_kinematics_urdf(self.latest_joints)
+                T_sensor = T_flange @ make_transform(he_R, he_t)
+                options["reference_sensor_transform"] = T_sensor
+        except Exception as error:
+            self.get_logger().warning(
+                f"reference sensor transform unavailable: {error}"
+            )
         self.ranked = self.pipeline.rank_candidates(
             maximum_candidates=self.maximum_scored,
             minimum_valid_probability=self.minimum_valid_probability,
@@ -1359,7 +1377,7 @@ class ActiveCalibrationNode(Node):
             # variance but are not independent geometric excitation.
             virtual_batch_size=1,
             candidate_filter=self._candidate_kinematic_filter,
-            candidate_options=self.candidate_options,
+            candidate_options=options,
         )
         for score in self.ranked:
             joint_distance = float(
@@ -1580,9 +1598,17 @@ class ActiveCalibrationNode(Node):
             self._fail("trajectory controller action unavailable")
             return
         goal = FollowJointTrajectory.Goal()
-        goal.trajectory = response.trajectory.joint_trajectory
-        goal.trajectory.header.stamp.sec = 0
-        goal.trajectory.header.stamp.nanosec = 0
+        # The real motion bridge is a single-point STEP bridge (PC_TRACK_ALL
+        # TP protocol): it plans the small linear move itself and rejects
+        # multi-point MoveIt trajectories.  Send only the terminal point.
+        goal.trajectory.joint_names = list(self.joint_names)
+        terminal_point = response.trajectory.joint_trajectory.points[-1]
+        point = JointTrajectoryPoint()
+        point.positions = list(terminal_point.positions)
+        if terminal_point.velocities:
+            point.velocities = list(terminal_point.velocities)
+        point.time_from_start = Duration(sec=2)
+        goal.trajectory.points = [point]
         self.rollback_joints = self.latest_joints.copy()
         self._publish_detection_prior()
         self.state = "EXECUTING"
