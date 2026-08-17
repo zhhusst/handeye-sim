@@ -13,12 +13,22 @@ from pathlib import Path
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration
 from control_msgs.action import FollowJointTrajectory
-from geometry_msgs.msg import PoseStamped
-from moveit_msgs.msg import Constraints, JointConstraint, MoveItErrorCodes, RobotState
-from moveit_msgs.srv import GetMotionPlan, GetStateValidity
+from geometry_msgs.msg import Pose, PoseStamped
+from visualization_msgs.msg import Marker, MarkerArray
+from moveit_msgs.msg import (
+    CollisionObject,
+    Constraints,
+    JointConstraint,
+    MoveItErrorCodes,
+    PlanningScene,
+    RobotState,
+)
+from moveit_msgs.srv import ApplyPlanningScene, GetMotionPlan, GetStateValidity
+from shape_msgs.msg import SolidPrimitive
 import numpy as np
 import rclpy
 from rclpy.action import ActionClient
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from rclpy.node import Node
 from rclpy.time import Time
 from sensor_msgs.msg import JointState, PointCloud2
@@ -26,7 +36,7 @@ import sensor_msgs_py.point_cloud2 as point_cloud2
 from std_msgs.msg import Header, String
 from std_srvs.srv import Trigger
 from trajectory_msgs.msg import JointTrajectoryPoint
-from tf2_ros import Buffer, TransformListener
+from tf2_ros import Buffer, TransformBroadcaster, TransformListener
 
 from calibration_pipeline.dataset_io import (
     SeedObservationGroup,
@@ -102,6 +112,13 @@ def effective_measurement_timeout_s(
         float(measurement_batch_size) / float(minimum_frame_rate_hz) + 1.0,
     )
 
+
+
+def _pt(x: float, y: float, z: float):
+    from geometry_msgs.msg import Point
+    p = Point()
+    p.x = float(x); p.y = float(y); p.z = float(z)
+    return p
 
 class ActiveCalibrationNode(Node):
     """Run active calibration against any normalized platform backend."""
@@ -204,6 +221,16 @@ class ActiveCalibrationNode(Node):
         self.declare_parameter("nbv.minimum_measurement_frame_rate_hz", 2.0)
         self.declare_parameter("board.length_u_m", 0.4)
         self.declare_parameter("board.length_v_m", 0.5)
+        self.declare_parameter("board.thickness_m", 0.01)
+        self.declare_parameter("board.collision_margin_m", 0.005)
+        self.declare_parameter("board.scene_clear_existing", True)
+        self.declare_parameter("initialization_only", False)
+        self.declare_parameter(
+            "board.physical_long_edge_axis", "y"
+        )
+        self.declare_parameter(
+            "interfaces.marker_topic", "/calib/markers"
+        )
         self.declare_parameter("handeye_init_rotation_error_deg", 3.0)
         self.declare_parameter("handeye_init_translation_error_mm", 10.0)
         self.declare_parameter("solver.plane_weight", 1.0)
@@ -502,6 +529,23 @@ class ActiveCalibrationNode(Node):
         self.detection_prior_publisher = self.create_publisher(
             PointCloud2, detection_prior_topic, 10
         )
+        # RViz's MarkerArray display subscribes with a volatile durability
+        # policy; use the same so discovery always succeeds, and republish on
+        # a timer so the plate marker remains visible even if RViz added the
+        # topic after the plate was first published.
+        marker_qos = QoSProfile(
+            depth=10,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+        )
+        self.plate_marker_publisher = self.create_publisher(
+            MarkerArray,
+            str(self.get_parameter("interfaces.marker_topic").value),
+            marker_qos,
+        )
+        self._plate_marker_cache: MarkerArray | None = None
+        self.create_timer(1.0, self._republish_plate_marker)
+        self.plate_tf_broadcaster = TransformBroadcaster(self)
         self.detection_control_publisher = self.create_publisher(
             String, detection_control_topic, 10
         )
@@ -514,6 +558,9 @@ class ActiveCalibrationNode(Node):
         self.validity_client = self.create_client(
             GetStateValidity,
             str(self.get_parameter("interfaces.validity_service").value),
+        )
+        self.scene_client = self.create_client(
+            ApplyPlanningScene, "/apply_planning_scene"
         )
         self.noise_status_client = None
         if self.backend == "simulation":
@@ -1026,6 +1073,14 @@ class ActiveCalibrationNode(Node):
                 stability.as_dict()
             )
             self._write_result("INITIALIZED")
+            self._publish_plate_collision()
+            if bool(self.get_parameter("initialization_only").value):
+                self.get_logger().info(
+                    "initialization_only: plate collision published; "
+                    "inspect the plate pose in RViz (no NBV will run)"
+                )
+                self._finish()
+                return
             if not stability.accepted:
                 self._fail(
                     "seed initialization is not bootstrap-stable: "
@@ -1036,6 +1091,251 @@ class ActiveCalibrationNode(Node):
             self._rank_and_plan()
         except Exception as error:
             self._fail(f"initialization failed: {error}")
+
+    def _republish_plate_marker(self) -> None:
+        """Periodically re-send the cached plate marker so RViz sees it even
+        if the marker topic was loaded after the plate was published."""
+        if self._plate_marker_cache is None:
+            return
+        try:
+            self.plate_marker_publisher.publish(self._plate_marker_cache)
+        except Exception as error:
+            self.get_logger().warning(
+                f"plate RViz marker republish failed: {error}"
+            )
+
+    def _publish_plate_collision(self) -> None:
+        """Add a box collision object for the calibration plate to MoveIt.
+
+        The plate pose comes from the 12-DOF-V2 seed estimate (board.corner
+        and board.rotation in the base frame).  The box is 20 x 15 x thickness
+        cm with a configurable safety margin on every side, so MoveIt's
+        /check_state_validity and /plan_kinematic_path reject candidates that
+        would collide with the real plate.
+        """
+        if self.pipeline is None or self.pipeline.result is None:
+            self.get_logger().warning(
+                "cannot publish plate collision: no initialized estimate"
+            )
+            return
+        board = self.pipeline.result.estimate.board
+        u = np.asarray(board.rotation)[:, 0]
+        v = np.asarray(board.rotation)[:, 1]
+        n = np.asarray(board.rotation)[:, 2]
+        length_u = float(self.get_parameter("board.length_u_m").value)
+        length_v = float(self.get_parameter("board.length_v_m").value)
+        thickness = float(self.get_parameter("board.thickness_m").value)
+        margin = float(self.get_parameter("board.collision_margin_m").value)
+
+        # The solver maps endpoint_u -> board u and endpoint_v -> board v, so
+        # the solved u/v axes follow the laser-scan edge labels rather than the
+        # physical long/short edges.  On the real rig the physical long edge
+        # (length_u = 0.2 m) lies along base +Y while endpoint_u happens to
+        # point along +X, so swap the axes for the displayed collision box /
+        # marker to match the physical plate orientation.
+        physical_long_edge_axis = str(
+            self.get_parameter("board.physical_long_edge_axis").value
+        ).lower()
+        if physical_long_edge_axis in {"y", "-y"}:
+            # The solved u axis follows endpoint_u (base +X on the real rig),
+            # but the physical long edge (0.2 m) lies along base +Y.  Re-label
+            # the axes so that `u` points along the physical long edge while
+            # keeping length_u = 0.2 (the physical long-edge extent).
+            u, v = v, u
+            self.get_logger().info(
+                "plate display axes swapped for physical orientation: "
+                f"u(0.2m) along base {'Y' if physical_long_edge_axis == 'y' else '-Y'}"
+            )
+
+        # After any physical-axis swap, `u` points along the physical long
+        # edge and length_u is its extent, so the box's x dimension matches u.
+        size = np.array(
+            [length_u + 2.0 * margin, length_v + 2.0 * margin, thickness + 2.0 * margin]
+        )
+        self.get_logger().info(
+            f"plate box: u=({u[0]:.3f},{u[1]:.3f},{u[2]:.3f}) "
+            f"len_u={length_u:.3f} v=({v[0]:.3f},{v[1]:.3f},{v[2]:.3f}) "
+            f"len_v={length_v:.3f} size={size}"
+        )
+        # Box centre: half a size along each local axis from the corner.
+        # Box centre on the physical top surface: the board corner is the
+        # bottom-front corner, so move up by the thickness and centre the box
+        # in-plane (the +n half of the margin stays above the top surface).
+        centre = (
+            np.asarray(board.corner)
+            + thickness * n
+            + 0.5 * (size[0] * u + size[1] * v)
+            + margin * n
+        )
+        box = SolidPrimitive()
+        box.type = SolidPrimitive.BOX
+        box.dimensions = [float(size[0]), float(size[1]), float(size[2])]
+        obj = CollisionObject()
+        obj.id = "calibration_plate"
+        obj.header.frame_id = str(
+            self.get_parameter("interfaces.base_frame").value
+        )
+        obj.operation = CollisionObject.ADD
+        obj.primitives.append(box)
+        pose = Pose()
+        pose.position.x = float(centre[0])
+        pose.position.y = float(centre[1])
+        pose.position.z = float(centre[2])
+        # Rotation matrix -> quaternion (w, x, y, z) via Shepperd's method.
+        R = np.asarray(board.rotation, dtype=float)
+        trace = float(np.trace(R))
+        if trace > 0.0:
+            s_q = 2.0 * np.sqrt(trace + 1.0)
+            w = 0.25 * s_q
+            x = (R[2, 1] - R[1, 2]) / s_q
+            y = (R[0, 2] - R[2, 0]) / s_q
+            z = (R[1, 0] - R[0, 1]) / s_q
+        else:
+            i = int(np.argmax(np.diag(R)))
+            j = (i + 1) % 3
+            k = (j + 1) % 3
+            s_q = 2.0 * np.sqrt(1.0 + R[i, i] - R[j, j] - R[k, k])
+            values = np.zeros(4)
+            values[i + 1] = 0.25 * s_q
+            values[0] = (R[k, j] - R[j, k]) / s_q
+            values[j + 1] = (R[j, i] + R[i, j]) / s_q
+            values[k + 1] = (R[k, i] + R[i, k]) / s_q
+            w, x, y, z = float(values[0]), float(values[1]), float(values[2]), float(values[3])
+        pose.orientation.x = x
+        pose.orientation.y = y
+        pose.orientation.z = z
+        pose.orientation.w = w
+        obj.primitive_poses.append(pose)
+
+        # Also publish a plain RViz marker for the plate (world frame), so the
+        # estimated plate pose is visible in RViz regardless of the MoveIt
+        # planning-scene publication path.
+        try:
+            marker_array = MarkerArray()
+            cube = Marker()
+            cube.header.frame_id = "world"
+            cube.ns = "calibration_plate"
+            cube.id = 100
+            cube.type = Marker.CUBE
+            cube.action = Marker.ADD
+            cube.pose.position.x = float(centre[0])
+            cube.pose.position.y = float(centre[1])
+            cube.pose.position.z = float(centre[2])
+            cube.pose.orientation.x = x
+            cube.pose.orientation.y = y
+            cube.pose.orientation.z = z
+            cube.pose.orientation.w = w
+            cube.scale.x = float(size[0])
+            cube.scale.y = float(size[1])
+            cube.scale.z = float(size[2])
+            cube.color.r = 0.3
+            cube.color.g = 0.8
+            cube.color.b = 0.3
+            cube.color.a = 0.5
+            cube.header.stamp = self.get_clock().now().to_msg()
+            marker_array.markers.append(cube)
+            # Plate frame TF so RViz displays the u/v/n axes at the corner.
+            try:
+                from geometry_msgs.msg import TransformStamped
+                from std_msgs.msg import Header as StdHeader
+                tf_msg = TransformStamped()
+                tf_msg.header.stamp = self.get_clock().now().to_msg()
+                tf_msg.header.frame_id = "world"
+                tf_msg.child_frame_id = "plate"
+                axis_origin = np.asarray(board.corner) + thickness * n
+                tf_msg.transform.translation.x = float(axis_origin[0])
+                tf_msg.transform.translation.y = float(axis_origin[1])
+                tf_msg.transform.translation.z = float(axis_origin[2])
+                tf_msg.transform.rotation.x = x
+                tf_msg.transform.rotation.y = y
+                tf_msg.transform.rotation.z = z
+                tf_msg.transform.rotation.w = w
+                self.plate_tf_broadcaster.sendTransform(tf_msg)
+            except Exception as error:
+                self.get_logger().warning(f"plate TF publish failed: {error}")
+
+            # Axis arrows + text labels (u = long edge, v = short edge, n = normal).
+            axis_length = 0.15
+            try:
+                axis_marker = Marker()
+                axis_marker.header.frame_id = "plate"
+                axis_marker.ns = "plate_axes"
+                axis_marker.id = 101
+                axis_marker.type = Marker.LINE_LIST
+                axis_marker.action = Marker.ADD
+                axis_marker.scale.x = 0.004
+                axis_marker.color.r = 1.0
+                axis_marker.color.g = 1.0
+                axis_marker.color.b = 1.0
+                axis_marker.color.a = 1.0
+                # In the plate frame: u = +X, v = +Y, n = +Z.
+                for axis, rgba in [(0, (1.0, 0.2, 0.2)),
+                                   (1, (0.2, 1.0, 0.2)),
+                                   (2, (0.2, 0.2, 1.0))]:
+                    p0 = _pt(0.0, 0.0, 0.0)
+                    p1 = [0.0, 0.0, 0.0]
+                    p1[axis] = axis_length
+                    axis_marker.points.append(p0)
+                    axis_marker.points.append(_pt(p1[0], p1[1], p1[2]))
+                    lbl = Marker()
+                    lbl.header.frame_id = "plate"
+                    lbl.ns = "plate_labels"
+                    lbl.id = 200 + axis
+                    lbl.type = Marker.TEXT_VIEW_FACING
+                    lbl.action = Marker.ADD
+                    lbl.scale.z = 0.02
+                    lbl.color.r, lbl.color.g, lbl.color.b, lbl.color.a = (*rgba, 1.0)
+                    pos = [0.0, 0.0, 0.0]
+                    pos[axis] = axis_length + 0.015
+                    lbl.pose.position.x, lbl.pose.position.y, lbl.pose.position.z = pos
+                    lbl.pose.orientation.w = 1.0
+                    lbl.text = ("U" if axis == 0 else "V" if axis == 1 else "N")
+                    marker_array.markers.append(lbl)
+                marker_array.markers.append(axis_marker)
+            except Exception as error:
+                self.get_logger().warning(f"plate axis markers failed: {error}")
+            self._plate_marker_cache = marker_array
+            self.plate_marker_publisher.publish(marker_array)
+            self.get_logger().info(
+                "plate RViz marker published at "
+                f"({centre[0]:.3f}, {centre[1]:.3f}, {centre[2]:.3f}) m"
+            )
+        except Exception as error:
+            self.get_logger().warning(f"plate RViz marker publish failed: {error}")
+
+        scene = PlanningScene()
+        scene.is_diff = True
+        scene.world.collision_objects.append(obj)
+        request = ApplyPlanningScene.Request()
+        request.scene = scene
+        if not self.scene_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().warning(
+                "ApplyPlanningScene service unavailable; plate collision "
+                "not active (MoveIt self-collision still enforced)"
+            )
+            return
+        def _scene_result(future):
+            try:
+                response = future.result()
+            except Exception as error:
+                self.get_logger().warning(
+                    f"ApplyPlanningScene call failed: {error}"
+                )
+                return
+            if response is not None and response.success:
+                self.get_logger().info(
+                    "plate collision object published: "
+                    f"{size[0] * 1000:.1f} x {size[1] * 1000:.1f} x "
+                    f"{size[2] * 1000:.1f} mm at "
+                    f"({centre[0]:.3f}, {centre[1]:.3f}, {centre[2]:.3f}) m"
+                )
+            else:
+                self.get_logger().warning(
+                    "ApplyPlanningScene returned failure; plate collision "
+                    "may not be active"
+                )
+
+        self.scene_client.call_async(request).add_done_callback(_scene_result)
 
     def _rank_and_plan(self) -> None:
         assert self.pipeline is not None
@@ -1446,6 +1746,10 @@ class ActiveCalibrationNode(Node):
         self.committed_nbv_joints.append(self.latest_joints.copy())
         self._record_iteration("nbv", result, self.executing_score)
         self._write_result("RUNNING")
+        # The 12-DOF-V2 trial solve updated the board pose with the new
+        # observation; refresh the MoveIt collision box so the scene tracks
+        # the current plate estimate instead of going stale after NBV moves.
+        self._publish_plate_collision()
         if (
             self.maximum_nbv_poses > 0
             and self.pipeline.nbv_count >= self.maximum_nbv_poses

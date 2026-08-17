@@ -157,8 +157,8 @@ def test_adaptive_plan_adds_signed_and_reordered_fallback_branches():
     assert adaptive[: len(default)] == default
     assert len(adaptive) > len(default)
     stages = {target.stages for target in adaptive}
-    assert ((0, 1), (1, -1)) in stages
-    assert ((1, -1), (0, 1)) in stages
+    assert (((0, 1), (1, -1)),) in stages
+    assert (((1, -1), (0, 1)),) in stages
 
 
 def test_preflight_guided_plan_prioritizes_measured_safe_directions():
@@ -174,7 +174,7 @@ def test_preflight_guided_plan_prioritizes_measured_safe_directions():
     assert plan[1].angle_scale == 1.0
     assert plan[2].stages == ((0, -1),)
     assert plan[2].angle_scale == 0.5
-    assert plan[4].stages == ((0, -1), (1, 1))
+    assert plan[4].stages == (((0, -1), (1, 1)),)
     assert plan[4].angle_scale == 1.0
     assert ((0, 1),) in {target.stages for target in plan}
 

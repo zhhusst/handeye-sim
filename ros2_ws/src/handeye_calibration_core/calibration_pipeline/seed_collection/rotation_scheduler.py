@@ -8,7 +8,10 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class RotationTarget:
     name: str
-    stages: tuple[tuple[int, int], ...]
+    stages: tuple[tuple[tuple[int, int], ...], ...]
+    # Each stage is a SET of (axis, sign) pairs rotated TOGETHER in one
+    # micro step (single-axis stages are the common case; multi-axis
+    # stages rotate X and Y simultaneously with no intermediate pose).
     angle_scale: float = 1.0
 
 
@@ -27,7 +30,7 @@ def star_rotation_plan() -> tuple[RotationTarget, ...]:
         RotationTarget("ry_negative", ((1, -1),)),
         RotationTarget("rx_positive", ((0, 1),)),
         RotationTarget("rx_negative", ((0, -1),)),
-        RotationTarget("rx_ry_positive", ((0, 1), (1, 1))),
+        RotationTarget("rx_ry_positive", (((0, 1), (1, 1)),)),
     )
 
 
@@ -40,13 +43,13 @@ def adaptive_rotation_plan() -> tuple[RotationTarget, ...]:
     hand-eye estimate.
     """
     return star_rotation_plan() + (
-        RotationTarget("rx_ry_opposite", ((0, 1), (1, -1))),
-        RotationTarget("rx_negative_ry_positive", ((0, -1), (1, 1))),
-        RotationTarget("rx_ry_negative", ((0, -1), (1, -1))),
-        RotationTarget("ry_rx_positive", ((1, 1), (0, 1))),
-        RotationTarget("ry_positive_rx_negative", ((1, 1), (0, -1))),
-        RotationTarget("ry_negative_rx_positive", ((1, -1), (0, 1))),
-        RotationTarget("ry_rx_negative", ((1, -1), (0, -1))),
+        RotationTarget("rx_ry_opposite", (((0, 1), (1, -1)),)),
+        RotationTarget("rx_negative_ry_positive", (((0, -1), (1, 1)),)),
+        RotationTarget("rx_ry_negative", (((0, -1), (1, -1)),)),
+        RotationTarget("ry_rx_positive", (((1, 1), (0, 1)),)),
+        RotationTarget("ry_positive_rx_negative", (((1, 1), (0, -1)),)),
+        RotationTarget("ry_negative_rx_positive", (((1, -1), (0, 1)),)),
+        RotationTarget("ry_rx_negative", (((1, -1), (0, -1)),)),
     )
 
 
@@ -96,7 +99,7 @@ def preflight_guided_rotation_plan(
                 RotationTarget(
                     "preflight_combo_"
                     f"{first[0]}_{first[1]:+d}_{second[0]}_{second[1]:+d}",
-                    (first, second),
+                    ((first, second),),
                 )
             )
     for first in safe_directions:
@@ -107,7 +110,7 @@ def preflight_guided_rotation_plan(
                 RotationTarget(
                     "preflight_combo_half_"
                     f"{first[0]}_{first[1]:+d}_{second[0]}_{second[1]:+d}",
-                    (first, second),
+                    ((first, second),),
                     0.5,
                 )
             )

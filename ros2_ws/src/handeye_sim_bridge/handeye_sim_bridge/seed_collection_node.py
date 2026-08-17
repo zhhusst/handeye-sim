@@ -1412,13 +1412,20 @@ class SeedCollectionNode(Node):
             if self.collection_phase == "PREFLIGHT"
             else self.plan[self.target_index]
         )
-        axis, sign = target.stages[self.stage_index]
+        stage = target.stages[self.stage_index]
+        # A stage is either a single (axis, sign) pair or a SET of pairs
+        # rotated TOGETHER in one micro step (simultaneous X+Y rotation, no
+        # intermediate pose where the ROI chord can separate too far).
+        if stage and isinstance(stage[0], tuple):
+            axis_pairs = stage
+        else:
+            axis_pairs = (stage,)
         target_angle = self._current_target_angle()
         remaining = target_angle - self.accumulated_angle
         magnitude = min(self.rotation_step, remaining)
-        delta = sign * magnitude
         axis_vector = np.zeros(3)
-        axis_vector[axis] = delta
+        for axis, sign in axis_pairs:
+            axis_vector[axis] = sign * magnitude
         target = current.copy()
         target[:3, :3] = current[:3, :3] @ so3_exp(axis_vector)
         self.pending_rotation = magnitude
@@ -1605,6 +1612,20 @@ class SeedCollectionNode(Node):
         target = self.plan[self.target_index]
         return self.rotation_target * target.angle_scale
 
+    @staticmethod
+    def _stage_primary(stage) -> tuple[int, int]:
+        """Return the first (axis, sign) pair of a stage for diagnostics.
+
+        A stage is either a single (axis, sign) pair or a set of pairs
+        rotated together; only the first pair is used for the recorded
+        axis/sign diagnostic columns.
+        """
+        if stage and isinstance(stage[0], tuple):
+            first = stage[0]
+        else:
+            first = stage
+        return int(first[0]), int(first[1])
+
     def _continue_after_centered(self, feature) -> None:
         target_angle = self._current_target_angle()
         if self.accumulated_angle + 1e-10 < target_angle:
@@ -1612,7 +1633,7 @@ class SeedCollectionNode(Node):
             return
         if self.collection_phase == "PREFLIGHT":
             target = self.preflight_plan[self.preflight_index]
-            axis, sign = target.stages[0]
+            axis, sign = self._stage_primary(target.stages[0])
             accepted = seed_feature_is_acceptable(
                 feature,
                 maximum_abs_x_mid_m=self.preflight_maximum_abs_x_mid,
@@ -1651,7 +1672,7 @@ class SeedCollectionNode(Node):
     def _rollback(self, reason: str) -> None:
         if self.collection_phase == "PREFLIGHT":
             target = self.preflight_plan[self.preflight_index]
-            axis, sign = target.stages[0]
+            axis, sign = self._stage_primary(target.stages[0])
             self.preflight_results.append(
                 {
                     "name": target.name,

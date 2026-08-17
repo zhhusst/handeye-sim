@@ -37,6 +37,11 @@
       safe_trapezoid: [0.07, 0.48, -0.28, -0.28, 0.11, 0.11]
       min_range_m: 0.05
       max_range_m: 0.52
+    board:
+      length_u_m: 0.2
+      length_v_m: 0.15
+      thickness_m: 0.01
+      collision_margin_m: 0.005
     seed:
       # Real PC_TRACK_ALL executes a low-speed Cartesian L move.  The Gazebo
       # four-second action timeout is therefore invalid for hardware.

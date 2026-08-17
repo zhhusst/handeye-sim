@@ -673,10 +673,22 @@ class CalibrationConsole:
             return
         self._print_seed_summary(seed_file)
         if self.backend == "real":
+            # NBV 安全验收已通过：真机允许进入主动标定，但保留运动安全确认。
             print(
-                "真机observe_only阶段已完成种子数据采集；"
-                "自动运动与NBV执行仍被安全门禁禁用。"
+                "真机种子数据采集完成；NBV 执行已通过安全验收，"
+                "继续前请确认以下条件。"
             )
+            self._print_motion_safety()
+            if not ask_yes_no("真机自动运动仍处于解锁状态，确认开始主动标定？", default=False):
+                print(f"已保留种子文件：{seed_file}")
+                return
+            maximum_nbv = ask_integer(
+                "主动 NBV 可选预算（真机建议先用 1~3 个小预算验证）",
+                default=1,
+                minimum=0,
+                maximum=20,
+            )
+            self._run_active(seed_file, result_file, run_directory, maximum_nbv)
             return
         if not ask_yes_no("种子采集完成，确认开始主动标定？", default=True):
             print(f"已保留种子文件：{seed_file}")
@@ -1085,7 +1097,7 @@ class CalibrationConsole:
         except (OSError, ValueError, TypeError) as error:
             print(f"种子摘要读取失败：{error}")
 
-    def run_existing(self) -> None:
+    def run_existing(self, *, initialization_only: bool = False) -> None:
         default = self._latest_seed_file()
         prompt = f"种子文件 [{default}]："
         value = input(prompt).strip()
@@ -1110,7 +1122,13 @@ class CalibrationConsole:
         )
         run_directory = self.make_run_directory()
         result_file = run_directory / "calibration_result.json"
-        self._run_active(seed_file, result_file, run_directory, maximum_nbv)
+        self._run_active(
+            seed_file,
+            result_file,
+            run_directory,
+            maximum_nbv,
+            initialization_only=initialization_only,
+        )
 
     @staticmethod
     def _latest_seed_file() -> Path:
@@ -1129,6 +1147,8 @@ class CalibrationConsole:
         result_file: Path,
         run_directory: Path,
         maximum_nbv: int,
+        *,
+        initialization_only: bool = False,
     ) -> None:
         command = [
             "ros2",
@@ -1146,6 +1166,8 @@ class CalibrationConsole:
             "-p",
             f"maximum_nbv_poses:={maximum_nbv}",
         ]
+        if initialization_only:
+            command += ["-p", "initialization_only:=true"]
         print("\n[主动标定] 正在启动节点……")
         node = self._start_node(
             "主动标定节点", command, run_directory / "active_calibration.log"
@@ -1164,7 +1186,13 @@ class CalibrationConsole:
             )
             self._monitor_active(node, result_file)
         finally:
-            self._stop_node(node)
+            if not initialization_only:
+                self._stop_node(node)
+            else:
+                print(
+                    "[只初始化] 节点保持运行以持续发布平板位姿 marker；"
+                    "观察完毕后可在控制台按 Ctrl+C 或重启环境停止。"
+                )
 
     def _monitor_active(self, node: ManagedNode, result_file: Path) -> bool:
         displayed_iterations = 0
@@ -1310,22 +1338,26 @@ class CalibrationConsole:
                     )
                 else:
                     print("  │ 重采样稳定性：旧版单帧种子，不可评估")
-            print(
-                "  └─ 仿真真值误差："
-                f"旋转 {record.get('rotation_error_deg', 0.0):.4f}°，"
-                f"平移 {record.get('translation_error_mm', 0.0):.4f} mm"
-            )
-            if (
-                float(record.get("rotation_error_deg", float("inf")))
-                < SIM_ROTATION_ERROR_TARGET_DEG
-                and float(record.get("translation_error_mm", float("inf")))
-                < SIM_TRANSLATION_ERROR_TARGET_MM
-            ):
+            rotation_error = record.get("rotation_error_deg")
+            translation_error = record.get("translation_error_mm")
+            if rotation_error is None or translation_error is None:
+                print("  └─ 真值误差：真机模式无仿真真值（N/A）")
+            else:
                 print(
-                    "     ✓ 已同时达到仿真目标："
-                    f"<{SIM_ROTATION_ERROR_TARGET_DEG:.2f}° / "
-                    f"<{SIM_TRANSLATION_ERROR_TARGET_MM:.1f} mm"
+                    "  └─ 仿真真值误差："
+                    f"旋转 {float(rotation_error):.4f}°，"
+                    f"平移 {float(translation_error):.4f} mm"
                 )
+                if (
+                    float(rotation_error) < SIM_ROTATION_ERROR_TARGET_DEG
+                    and float(translation_error)
+                    < SIM_TRANSLATION_ERROR_TARGET_MM
+                ):
+                    print(
+                        "     ✓ 已同时达到仿真目标："
+                        f"<{SIM_ROTATION_ERROR_TARGET_DEG:.2f}° / "
+                        f"<{SIM_TRANSLATION_ERROR_TARGET_MM:.1f} mm"
+                    )
         return len(iterations)
 
     @staticmethod
@@ -1463,7 +1495,24 @@ class CalibrationConsole:
                 self.run_new("manual")
             elif choice == "3":
                 if self.backend == "real":
-                    print("真机NBV执行尚未通过安全验收，当前保持禁用。")
+                    inspection_only = ask_yes_no(
+                        "只初始化并显示平板位姿（不执行任何 NBV 运动）？", default=True
+                    )
+                    if not inspection_only:
+                        self._print_motion_safety()
+                        if not ask_yes_no(
+                            "将解锁真机自动运动并执行 NBV，确认开始？", default=False
+                        ):
+                            continue
+                        real_motion_armed = self._arm_real_motion()
+                        if not real_motion_armed:
+                            continue
+                        try:
+                            self.run_existing()
+                        finally:
+                            self._disarm_real_motion()
+                    else:
+                        self.run_existing(initialization_only=True)
                 else:
                     self.run_existing()
             elif choice == "4":
