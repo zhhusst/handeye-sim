@@ -141,11 +141,7 @@ Visualization Manager:
       Enabled: true
       Name: ProfileDetection
       Namespaces:
-        axes: true
-        detected_endpoints: true
-        detection_guide: true
-        profile: true
-        target_surface: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -290,7 +286,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.12350605428218842
+      Distance: 3.285086154937744
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1

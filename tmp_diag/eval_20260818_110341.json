@@ -1,0 +1,69 @@
+{
+  "result_file": "/workspace/data/calibration_runs/20260818_110341/calibration_result.json",
+  "npz": "/workspace/data/sphere_validation_runs/20260816_142845_sphere_20mm/sphere_acquisition.npz",
+  "radius_mm": 10.001,
+  "evaluations": {
+    "iter0_6seeds": {
+      "handeye_translation_mm": [
+        -22.899939118793935,
+        -17.322702322211267,
+        372.59599394344565
+      ],
+      "nbv_index": 0,
+      "phase": "initial",
+      "surface_rms_mm": 0.12276250493600736,
+      "fixed_radius_rmse_mm": 1.1372016465714005,
+      "fixed_radius_p95_mm": 2.4921773893265744,
+      "fixed_radius_max_mm": 3.105081425262767,
+      "fixed_radius_mean_mm": 0.3481012526723205,
+      "free_radius_mm": 11.37767357882654,
+      "free_diameter_error_mm": 2.7533471576530815,
+      "free_center_mm": [
+        1.1975868945123345,
+        0.017789709252476273,
+        0.1330938769051536
+      ],
+      "loo_rmse_mm": 1.0284941169074027,
+      "loo_center_rms_mm": 0.16204577892979433,
+      "pass": false,
+      "interpretation": {
+        "primary_metric_uses_all_selected_points": true,
+        "sphere_does_not_update_handeye": true,
+        "roundness_is_not_diameter_uncertainty": true
+      },
+      "n_points": 22771,
+      "n_groups": 10
+    },
+    "iter1_nbv": {
+      "handeye_translation_mm": [
+        -24.73672342172054,
+        -15.43190645422665,
+        373.13220145476225
+      ],
+      "nbv_index": 1,
+      "phase": "nbv",
+      "surface_rms_mm": 0.224012910761354,
+      "fixed_radius_rmse_mm": 0.6849649993091991,
+      "fixed_radius_p95_mm": 1.1723360223281232,
+      "fixed_radius_max_mm": 1.6752031557715243,
+      "fixed_radius_mean_mm": 0.007461825426294494,
+      "free_radius_mm": 10.711687440015979,
+      "free_diameter_error_mm": 1.42137488003196,
+      "free_center_mm": [
+        1.1964362304849303,
+        0.016938618876560486,
+        0.1319691600831332
+      ],
+      "loo_rmse_mm": 0.9499375133227985,
+      "loo_center_rms_mm": 0.5184849977206034,
+      "pass": false,
+      "interpretation": {
+        "primary_metric_uses_all_selected_points": true,
+        "sphere_does_not_update_handeye": true,
+        "roundness_is_not_diameter_uncertainty": true
+      },
+      "n_points": 22771,
+      "n_groups": 10
+    }
+  }
+}

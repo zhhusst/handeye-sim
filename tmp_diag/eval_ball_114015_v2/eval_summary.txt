@@ -1,0 +1,20 @@
+# 精密球独立验证汇总（评价方法2）
+
+- 球数据: data/sphere_validation_runs/20260818_083721_sphere_20mm/sphere_acquisition.npz
+- 标定结果: data/calibration_runs/20260818_114015/calibration_result.json
+- 参考半径: 10.001 mm, ROR 门限: 25.0 mm
+
+Pose1: center=(1196.440292, 18.289460, 132.105990) mm, r_fit=10.332973 mm, delta_r=+0.331973 mm, abs_delta_r=0.331973 mm, sigma_fit=0.127234 mm
+Pose2: center=(1196.282265, 18.269133, 132.208567) mm, r_fit=10.333267 mm, delta_r=+0.332267 mm, abs_delta_r=0.332267 mm, sigma_fit=0.112665 mm
+Pose3: center=(1195.929875, 18.480399, 132.055603) mm, r_fit=10.333289 mm, delta_r=+0.332289 mm, abs_delta_r=0.332289 mm, sigma_fit=0.111020 mm
+Pose4: center=(1196.334199, 18.471361, 132.395181) mm, r_fit=10.065072 mm, delta_r=+0.064072 mm, abs_delta_r=0.064072 mm, sigma_fit=0.062541 mm
+Pose5: center=(1196.331342, 18.359995, 132.087277) mm, r_fit=10.243171 mm, delta_r=+0.242171 mm, abs_delta_r=0.242171 mm, sigma_fit=0.069162 mm
+Pose6: center=(1196.564936, 18.427864, 132.052604) mm, r_fit=10.295969 mm, delta_r=+0.294969 mm, abs_delta_r=0.294969 mm, sigma_fit=0.088230 mm
+Pose7: center=(1196.250270, 18.192603, 131.924943) mm, r_fit=10.334042 mm, delta_r=+0.333042 mm, abs_delta_r=0.333042 mm, sigma_fit=0.125368 mm
+center=(1196.294161, 18.361954, 132.123158) mm
+r_fit=10.274729 mm
+delta_r_signed=+0.273729 mm
+delta_r_abs=0.273729 mm
+sigma_e=0.155675 mm
+  sigma_e = std(e_j)
+  RMSE_e = sqrt(mean(e_j^2))
