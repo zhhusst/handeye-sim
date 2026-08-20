@@ -3,6 +3,7 @@ import numpy as np
 from calibration_pipeline.models import SensorROI
 from calibration_pipeline.seed_collection import (
     BilateralFeature,
+    BroydenDualFeatureServo,
     EndpointTracker,
     adaptive_rotation_plan,
     assess_initial_pose,
@@ -39,6 +40,57 @@ def test_feature_and_translation_servo():
     servo = TranslationServo(gain=1.0, maximum_step=0.02)
     assert servo.choose_axis({0: 0.2, 1: -2.0, 2: 0.1}) == 1
     assert np.isclose(servo.correction(feature.x_mid), 0.005)
+
+
+def test_dual_feature_servo_reduces_both_errors_and_obeys_step_limits():
+    servo = BroydenDualFeatureServo(
+        gain=0.7,
+        damping=0.01,
+        maximum_axis_step=0.003,
+        maximum_norm_step=0.004,
+    )
+    # Local X predominantly controls x_mid; local Z predominantly controls
+    # endpoint separation.  A small cross term makes this a coupled problem.
+    servo.set_jacobian(np.array([[1.0, 0.1, 0.2], [0.1, -0.1, -1.5]]))
+    error = np.array([0.012, 0.030])
+    step = servo.correction(error)
+    assert step.shape == (3,)
+    assert np.max(np.abs(step)) <= 0.003 + 1e-12
+    assert np.linalg.norm(step) <= 0.004 + 1e-12
+    assert np.linalg.norm(error + servo.jacobian @ step) < np.linalg.norm(error)
+
+
+def test_dual_feature_broyden_uses_actual_motion_and_rejects_bad_rank():
+    true_jacobian = np.array([[1.2, 0.1, 0.3], [0.2, -0.2, -1.8]])
+    servo = BroydenDualFeatureServo(
+        minimum_singular_value=0.01,
+        maximum_condition=200.0,
+    )
+    initial = np.array([[1.0, 0.0, 0.1], [0.0, -0.1, -1.3]])
+    servo.set_jacobian(initial)
+    actual_motion = np.array([0.0007, -0.0002, 0.0008])
+    measured_delta = true_jacobian @ actual_motion
+    before = np.linalg.norm(measured_delta - initial @ actual_motion)
+    assert servo.update(actual_motion, measured_delta)
+    after = np.linalg.norm(measured_delta - servo.jacobian @ actual_motion)
+    assert after < before
+    assert servo.health()["healthy"]
+
+    unhealthy = BroydenDualFeatureServo()
+    unhealthy.set_jacobian(np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]))
+    assert not unhealthy.health()["healthy"]
+    with np.testing.assert_raises(RuntimeError):
+        unhealthy.correction(np.array([0.01, 0.01]))
+
+
+def test_dual_feature_tiny_motion_does_not_trigger_model_reprobe_counter():
+    servo = BroydenDualFeatureServo(minimum_update_step=0.0002)
+    servo.set_jacobian(np.array([[1.0, 0.0, 0.2], [0.1, 0.0, -1.5]]))
+    assert not servo.update(
+        np.array([0.00005, 0.0, 0.0]), np.array([0.00005, 0.00001])
+    )
+    assert servo.last_update_reason == "step_too_small"
+    assert servo.rejected_update_count == 0
 
 
 def test_star_plan_and_rotation_diversity():
@@ -151,14 +203,30 @@ def test_initial_pose_envelope_accepts_reference_and_rejects_observed_failures()
     assert "domain_margin" in low_reserve.reasons
 
 
-def test_adaptive_plan_adds_signed_and_reordered_fallback_branches():
+def _command_identity(target):
+    stages = []
+    for stage in target.stages:
+        if stage and isinstance(stage[0], tuple):
+            stages.append(tuple(sorted(stage)))
+        else:
+            stages.append((stage,))
+    return tuple(stages), target.angle_scale
+
+
+def test_adaptive_plan_adds_unique_signed_and_half_angle_fallback_branches():
     default = star_rotation_plan()
     adaptive = adaptive_rotation_plan()
     assert adaptive[: len(default)] == default
     assert len(adaptive) > len(default)
     stages = {target.stages for target in adaptive}
     assert (((0, 1), (1, -1)),) in stages
-    assert (((1, -1), (0, 1)),) in stages
+    assert (((1, -1), (0, 1)),) not in stages
+    assert any(
+        target.stages == ((1, 1),) and target.angle_scale == 0.5
+        for target in adaptive
+    )
+    identities = [_command_identity(target) for target in adaptive]
+    assert len(identities) == len(set(identities))
 
 
 def test_preflight_guided_plan_prioritizes_measured_safe_directions():
@@ -177,6 +245,8 @@ def test_preflight_guided_plan_prioritizes_measured_safe_directions():
     assert plan[4].stages == (((0, -1), (1, 1)),)
     assert plan[4].angle_scale == 1.0
     assert ((0, 1),) in {target.stages for target in plan}
+    identities = [_command_identity(target) for target in plan]
+    assert len(identities) == len(set(identities))
 
 
 def test_partial_seed_requires_centering_and_margin():

@@ -58,6 +58,50 @@ def test_twelve_dof_v2_recovers_noise_free_scene():
     assert np.median(np.asarray(endpoint_v_offsets) @ result.estimate.board.v) > 0.0
 
 
+def test_flat_multistart_rejects_tilted_basin_and_recovers_horizontal_board():
+    scene = default_scene()
+    poses, measurements = generate_seed_dataset(scene, count=8)
+    # Reproduce the real scanner-axis ambiguity: the configured mounting
+    # nominal is rotated 180 degrees around local Z.
+    ambiguous_nominal = scene.handeye_rotation @ np.diag([-1.0, -1.0, 1.0])
+    solver = TwelveDofV2Solver(
+        multistart_enabled=True,
+        multistart_maximum_board_tilt_deg=5.0,
+    )
+    result = solver.solve(
+        poses,
+        measurements,
+        ambiguous_nominal,
+        scene.handeye_translation,
+        board_dimensions=(scene.board.length_u, scene.board.length_v),
+    )
+
+    assert result.converged
+    assert result.diagnostics.initialization_method == "flat_multistart"
+    assert len(result.diagnostics.initialization_candidates) == 4
+    nominal = next(
+        item
+        for item in result.diagnostics.initialization_candidates
+        if item["name"] == "nominal"
+    )
+    assert not nominal["accepted"]
+    assert nominal["board_tilt_deg"] > 5.0
+    assert result.diagnostics.selected_initialization != "nominal"
+    assert result.diagnostics.selected_board_tilt_deg < 1e-6
+    assert rotation_distance_deg(
+        result.estimate.handeye_rotation, scene.handeye_rotation
+    ) < 1e-5
+
+
+def test_board_tilt_gate_allows_free_yaw_but_rejects_roll():
+    yaw = so3_exp(np.deg2rad(np.array([0.0, 0.0, 63.0])))
+    roll = so3_exp(np.deg2rad(np.array([12.0, 0.0, 0.0])))
+    assert TwelveDofV2Solver._board_tilt_deg(yaw) < 1e-9
+    assert np.isclose(
+        TwelveDofV2Solver._board_tilt_deg(roll), 12.0, atol=1e-9
+    )
+
+
 def test_solver_rejects_too_few_poses():
     scene = default_scene()
     poses, measurements = generate_seed_dataset(scene, count=3)

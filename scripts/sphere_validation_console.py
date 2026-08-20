@@ -334,6 +334,21 @@ def _yes_no(prompt: str, default: bool) -> bool:
         print("请输入 y 或 n。")
 
 
+def _choose_collection_mode(requested: str | None) -> str:
+    if requested is not None:
+        return requested
+    print("\n请选择精密球采集方式：")
+    print("  1. moving：7个方向，每个方向人工平移扫描7个位置（评价方法2，推荐）")
+    print("  2. stationary：每个独立位姿只采一个静止截面（评价方法1）")
+    while True:
+        value = input("选择 [1]：").strip() or "1"
+        if value in {"1", "moving"}:
+            return "moving"
+        if value in {"2", "stationary"}:
+            return "stationary"
+        print("请输入 1 或 2。")
+
+
 def _collect_pose(
     collector: ExactStampFrameCollector,
     artifact: SphereArtifact,
@@ -410,9 +425,364 @@ def _representative_flange(frames: list[AcceptedFrame]) -> tuple[np.ndarray, np.
     return reference, translation
 
 
+def _position_summary(frames: list[AcceptedFrame]) -> dict[str, float]:
+    """Summarize one stationary stop of a manually stepped sphere scan."""
+    rotations = [frame.synchronized.flange_rotation for frame in frames]
+    translations = np.asarray(
+        [frame.synchronized.flange_translation_m for frame in frames], dtype=float
+    )
+    reference_rotation = rotations[0]
+    return {
+        "median_chord_mm": float(
+            1000.0 * np.median([frame.chord_m for frame in frames])
+        ),
+        "minimum_chord_mm": float(
+            1000.0 * np.min([frame.chord_m for frame in frames])
+        ),
+        "median_circle_radius_mm": float(
+            1000.0 * np.median([frame.circle_radius_m for frame in frames])
+        ),
+        "median_circle_rms_mm": float(
+            1000.0 * np.median([frame.circle_rms_m for frame in frames])
+        ),
+        "maximum_circle_rms_mm": float(
+            1000.0 * np.max([frame.circle_rms_m for frame in frames])
+        ),
+        "stationary_translation_span_mm": float(
+            1000.0
+            * np.max(np.linalg.norm(translations - np.mean(translations, axis=0), axis=1))
+        ),
+        "stationary_rotation_span_deg": float(
+            max(rotation_distance_deg(reference_rotation, rotation) for rotation in rotations)
+        ),
+    }
+
+
+def _moving_direction_summary(
+    position_frames: list[list[AcceptedFrame]],
+) -> dict[str, object]:
+    """Measure straightness, monotonic progress, orientation hold and sphere coverage."""
+    representatives = [_representative_flange(frames) for frames in position_frames]
+    rotations = [item[0] for item in representatives]
+    translations = np.asarray([item[1] for item in representatives], dtype=float)
+    position_summaries = [_position_summary(frames) for frames in position_frames]
+
+    centered = translations - translations[0]
+    if len(translations) >= 2 and np.linalg.norm(centered[-1]) > 1e-12:
+        _, _, vh = np.linalg.svd(
+            translations - np.mean(translations, axis=0), full_matrices=False
+        )
+        direction = np.asarray(vh[0], dtype=float)
+        if float(direction @ centered[-1]) < 0.0:
+            direction *= -1.0
+        progress_m = centered @ direction
+        lateral_m = np.linalg.norm(centered - np.outer(progress_m, direction), axis=1)
+    else:
+        direction = np.zeros(3, dtype=float)
+        progress_m = np.zeros(len(translations), dtype=float)
+        lateral_m = np.zeros(len(translations), dtype=float)
+
+    chord_mm = np.asarray(
+        [summary["median_chord_mm"] for summary in position_summaries], dtype=float
+    )
+    peak_index = int(np.argmax(chord_mm)) if len(chord_mm) else 0
+    return {
+        "positions": len(position_frames),
+        "position_summaries": position_summaries,
+        "scan_direction_base": direction.tolist(),
+        "progress_mm": (1000.0 * progress_m).tolist(),
+        "step_mm": (1000.0 * np.diff(progress_m)).tolist(),
+        "total_travel_mm": float(1000.0 * (progress_m[-1] - progress_m[0])),
+        "maximum_line_deviation_mm": float(1000.0 * np.max(lateral_m)),
+        "maximum_orientation_drift_deg": float(
+            max(rotation_distance_deg(rotations[0], rotation) for rotation in rotations)
+        ),
+        "median_chords_mm": chord_mm.tolist(),
+        "peak_chord_position": peak_index + 1,
+        "start_chord_drop_mm": float(chord_mm[peak_index] - chord_mm[0]),
+        "end_chord_drop_mm": float(chord_mm[peak_index] - chord_mm[-1]),
+    }
+
+
+def _moving_position_issues(summary: dict[str, float], parameters: dict) -> list[str]:
+    issues = []
+    minimum_chord_mm = float(parameters.get("moving_minimum_median_chord_mm", 8.0))
+    maximum_rms_mm = float(parameters.get("moving_maximum_median_circle_rms_mm", 0.15))
+    if summary["median_chord_mm"] < minimum_chord_mm:
+        issues.append(
+            f"中位弦长 {summary['median_chord_mm']:.2f} mm < {minimum_chord_mm:.2f} mm"
+        )
+    if summary["median_circle_rms_mm"] > maximum_rms_mm:
+        issues.append(
+            f"中位圆拟合RMS {summary['median_circle_rms_mm']:.3f} mm > "
+            f"{maximum_rms_mm:.3f} mm"
+        )
+    return issues
+
+
+def _moving_direction_issues(summary: dict[str, object], parameters: dict) -> list[str]:
+    issues = []
+    minimum_step_mm = float(parameters.get("moving_minimum_position_step_mm", 1.0))
+    maximum_step_mm = float(parameters.get("moving_maximum_position_step_mm", 7.0))
+    minimum_travel_mm = float(parameters.get("moving_minimum_total_travel_mm", 12.0))
+    maximum_travel_mm = float(parameters.get("moving_maximum_total_travel_mm", 30.0))
+    maximum_line_mm = float(parameters.get("moving_maximum_line_deviation_mm", 2.0))
+    maximum_drift_deg = float(
+        parameters.get("moving_maximum_orientation_drift_deg", 0.25)
+    )
+    minimum_drop_mm = float(parameters.get("moving_minimum_endpoint_chord_drop_mm", 2.0))
+    steps = np.asarray(summary["step_mm"], dtype=float)
+    if np.any(steps < minimum_step_mm):
+        issues.append(f"存在平移步长 < {minimum_step_mm:.1f} mm 或扫描发生回头")
+    if np.any(steps > maximum_step_mm):
+        issues.append(f"存在平移步长 > {maximum_step_mm:.1f} mm，截面覆盖可能不连续")
+    travel = float(summary["total_travel_mm"])
+    if travel < minimum_travel_mm or travel > maximum_travel_mm:
+        issues.append(
+            f"总平移行程 {travel:.1f} mm 不在 {minimum_travel_mm:.1f}–"
+            f"{maximum_travel_mm:.1f} mm"
+        )
+    if float(summary["maximum_line_deviation_mm"]) > maximum_line_mm:
+        issues.append(
+            f"平移轨迹最大偏线 {summary['maximum_line_deviation_mm']:.2f} mm > "
+            f"{maximum_line_mm:.2f} mm"
+        )
+    if float(summary["maximum_orientation_drift_deg"]) > maximum_drift_deg:
+        issues.append(
+            f"方向内姿态漂移 {summary['maximum_orientation_drift_deg']:.3f}° > "
+            f"{maximum_drift_deg:.3f}°"
+        )
+    if (
+        float(summary["start_chord_drop_mm"]) < minimum_drop_mm
+        or float(summary["end_chord_drop_mm"]) < minimum_drop_mm
+    ):
+        issues.append(
+            "弦长没有形成清晰的“短→长→短”覆盖；扫描可能未跨过近球心截面"
+        )
+    return issues
+
+
+def _moving_increment_issues(
+    position_frames: list[list[AcceptedFrame]], parameters: dict
+) -> list[str]:
+    """Reject an obviously wrong manual step before the operator completes a group."""
+    if len(position_frames) < 2:
+        return []
+    summary = _moving_direction_summary(position_frames)
+    minimum_step_mm = float(parameters.get("moving_minimum_position_step_mm", 1.0))
+    maximum_step_mm = float(parameters.get("moving_maximum_position_step_mm", 7.0))
+    maximum_line_mm = float(parameters.get("moving_maximum_line_deviation_mm", 2.0))
+    maximum_drift_deg = float(
+        parameters.get("moving_maximum_orientation_drift_deg", 0.25)
+    )
+    issues = []
+    last_step_mm = float(summary["step_mm"][-1])
+    if last_step_mm < minimum_step_mm:
+        issues.append(
+            f"本步沿扫描方向仅前进 {last_step_mm:.2f} mm，可能没有移动或发生回头"
+        )
+    if last_step_mm > maximum_step_mm:
+        issues.append(
+            f"本步沿扫描方向前进 {last_step_mm:.2f} mm，超过 {maximum_step_mm:.1f} mm"
+        )
+    if (
+        len(position_frames) >= 3
+        and float(summary["maximum_line_deviation_mm"]) > maximum_line_mm
+    ):
+        issues.append(
+            f"累计轨迹偏离直线 {summary['maximum_line_deviation_mm']:.2f} mm，"
+            f"超过 {maximum_line_mm:.1f} mm"
+        )
+    if float(summary["maximum_orientation_drift_deg"]) > maximum_drift_deg:
+        issues.append(
+            f"姿态相对本方向起点变化 {summary['maximum_orientation_drift_deg']:.3f}°，"
+            f"超过 {maximum_drift_deg:.3f}°；方向内只能平移"
+        )
+    return issues
+
+
+def _collect_moving_scan(
+    collector: ExactStampFrameCollector,
+    artifact: SphereArtifact,
+    segmentation: SphereSegmentParameters,
+    parameters: dict,
+    direction_count: int,
+    position_count: int,
+    frames_per_position: int,
+    timeout_s: float,
+) -> tuple[
+    list[list[AcceptedFrame]],
+    list[list[int]],
+    list[tuple[np.ndarray, np.ndarray]],
+    list[dict[str, object]],
+    bool,
+]:
+    pose_frames: list[list[AcceptedFrame]] = []
+    position_indices_by_pose: list[list[int]] = []
+    representative_poses: list[tuple[np.ndarray, np.ndarray]] = []
+    direction_summaries: list[dict[str, object]] = []
+    minimum_direction_separation_deg = float(
+        parameters.get(
+            "moving_minimum_direction_rotation_separation_deg",
+            parameters["minimum_pose_rotation_separation_deg"],
+        )
+    )
+
+    direction_index = 1
+    while direction_index <= direction_count:
+        print(
+            f"\n{'=' * 68}\n"
+            f"[扫描方向 {direction_index}/{direction_count}] 请先设置新的机器人姿态。\n"
+            "随后保持该姿态不变，只做近似直线平移，让激光从球的一侧逐步扫到另一侧。\n"
+            "第1个位置应为较短但完整的球面弦，随后弦长增大，越过近球心截面后再缩短。"
+        )
+        positions: list[list[AcceptedFrame]] = []
+        cancelled = False
+
+        while len(positions) < position_count:
+            position_index = len(positions) + 1
+            if position_index == 1:
+                hint = "设置本方向的姿态和球面一侧起始截面"
+            else:
+                hint = "保持姿态不变，仅沿同一方向平移约2–4 mm"
+            print(
+                f"\n[方向 {direction_index}/{direction_count}，"
+                f"位置 {position_index}/{position_count}] {hint}；机器人停稳后回到这里。"
+            )
+            command = input(
+                "Enter=采集，u=撤销上一位置，d=重采本方向，r=重看提示，q=取消："
+            ).strip().lower()
+            if command == "q":
+                cancelled = True
+                break
+            if command == "r":
+                continue
+            if command == "d":
+                print("  已丢弃本方向已采位置，请回到球面一侧重新开始。")
+                positions.clear()
+                continue
+            if command == "u":
+                if positions:
+                    positions.pop()
+                    print("  已撤销上一位置；请将机器人移回对应截面后重新采集。")
+                else:
+                    print("  本方向还没有可撤销的位置。")
+                continue
+            if command:
+                print("  未识别的输入；请输入 Enter、u、d、r 或 q。")
+                continue
+
+            try:
+                frames = _collect_pose(
+                    collector,
+                    artifact,
+                    segmentation,
+                    frames_per_position,
+                    timeout_s,
+                )
+            except RuntimeError as error:
+                print(f"  本位置采集失败：{error}")
+                print("  请调整截面/曝光，保持姿态和扫描方向不变后重试。")
+                continue
+
+            position_summary = _position_summary(frames)
+            print(
+                "  位置质量："
+                f"中位弦长 {position_summary['median_chord_mm']:.2f} mm；"
+                f"截面半径 {position_summary['median_circle_radius_mm']:.3f} mm；"
+                f"圆拟合RMS {position_summary['median_circle_rms_mm']:.3f} mm；"
+                f"定点漂移 {position_summary['stationary_translation_span_mm']:.3f} mm/"
+                f"{position_summary['stationary_rotation_span_deg']:.4f}°"
+            )
+            issues = _moving_position_issues(position_summary, parameters)
+            trial_positions = positions + [frames]
+            issues.extend(_moving_increment_issues(trial_positions, parameters))
+            if issues:
+                print("  本位置存在以下质量问题：")
+                for issue in issues:
+                    print(f"    · {issue}")
+                if not _yes_no("仍保留这个位置？", False):
+                    print("  已丢弃本位置，请调整后重新采集。")
+                    continue
+            positions.append(frames)
+
+        if cancelled:
+            return (
+                pose_frames,
+                position_indices_by_pose,
+                representative_poses,
+                direction_summaries,
+                True,
+            )
+        summary = _moving_direction_summary(positions)
+        direction_issues = _moving_direction_issues(summary, parameters)
+        representative = _representative_flange(
+            [frame for position in positions for frame in position]
+        )
+        if representative_poses:
+            separation_deg = min(
+                rotation_distance_deg(previous[0], representative[0])
+                for previous in representative_poses
+            )
+            summary["minimum_direction_rotation_separation_deg"] = separation_deg
+            if separation_deg < minimum_direction_separation_deg:
+                direction_issues.append(
+                    f"与已有扫描方向最近仅相差 {separation_deg:.2f}° < "
+                    f"{minimum_direction_separation_deg:.2f}°"
+                )
+        else:
+            summary["minimum_direction_rotation_separation_deg"] = None
+
+        chord_text = " → ".join(
+            f"{value:.1f}" for value in summary["median_chords_mm"]
+        )
+        print(
+            f"\n  方向 {direction_index} 扫描摘要：\n"
+            f"    弦长序列：{chord_text} mm\n"
+            f"    总平移：{summary['total_travel_mm']:.2f} mm；"
+            f"最大偏线：{summary['maximum_line_deviation_mm']:.2f} mm；"
+            f"姿态漂移：{summary['maximum_orientation_drift_deg']:.4f}°"
+        )
+        if direction_issues:
+            print("  本方向存在以下覆盖/运动问题：")
+            for issue in direction_issues:
+                print(f"    · {issue}")
+            keep = _yes_no("仍保留整个方向？", False)
+        else:
+            keep = _yes_no("本方向检查通过，确认保留？", True)
+        if not keep:
+            print("  已丢弃整个方向；请回到球面一侧，并重新设置该方向。")
+            continue
+
+        flattened = [frame for position in positions for frame in position]
+        indices = [
+            position_index
+            for position_index, frames in enumerate(positions)
+            for _ in frames
+        ]
+        pose_frames.append(flattened)
+        position_indices_by_pose.append(indices)
+        representative_poses.append(representative)
+        direction_summaries.append(summary)
+        print(
+            f"  ✓ 已保留方向 {direction_index}/{direction_count}："
+            f"{position_count} 个截面，{len(flattened)} 帧。"
+        )
+        direction_index += 1
+
+    return (
+        pose_frames,
+        position_indices_by_pose,
+        representative_poses,
+        direction_summaries,
+        False,
+    )
+
+
 def _save_dataset(
     destination: Path,
     pose_frames: list[list[AcceptedFrame]],
+    position_indices_by_pose: list[list[int]] | None = None,
 ) -> None:
     frames = [frame for group in pose_frames for frame in group]
     raw_offsets = [0]
@@ -422,8 +792,15 @@ def _save_dataset(
     selected_points = []
     selected_indices = []
     pose_indices = []
+    position_indices = []
     for pose_index, group in enumerate(pose_frames):
-        for frame in group:
+        if position_indices_by_pose is None:
+            group_position_indices = [0] * len(group)
+        else:
+            group_position_indices = position_indices_by_pose[pose_index]
+            if len(group_position_indices) != len(group):
+                raise ValueError("position index count does not match captured frames")
+        for frame, position_index in zip(group, group_position_indices):
             raw_points.append(frame.synchronized.points_sensor_m)
             raw_indices.append(frame.synchronized.sample_indices)
             selected_points.append(frame.selected_points_sensor_m)
@@ -431,6 +808,7 @@ def _save_dataset(
             raw_offsets.append(raw_offsets[-1] + len(raw_points[-1]))
             selected_offsets.append(selected_offsets[-1] + len(selected_points[-1]))
             pose_indices.append(pose_index)
+            position_indices.append(position_index)
     np.savez_compressed(
         destination,
         raw_points_sensor_m=np.vstack(raw_points),
@@ -440,6 +818,7 @@ def _save_dataset(
         selected_sample_indices=np.concatenate(selected_indices),
         selected_frame_offsets=np.asarray(selected_offsets, dtype=np.int64),
         frame_pose_indices=np.asarray(pose_indices, dtype=np.int64),
+        frame_position_indices=np.asarray(position_indices, dtype=np.int64),
         frame_stamps_ns=np.asarray(
             [frame.synchronized.stamp_ns for frame in frames], dtype=np.int64
         ),
@@ -470,6 +849,7 @@ def _write_markdown(path: Path, report: dict, metadata: dict) -> None:
         f"刻字直径 {report['artifact']['engraved_diameter_mm']:.4f} mm，"
         f"刻字圆度 {report['artifact']['engraved_roundness_mm']:.4f} mm。",
         f"- 固定的手眼结果：`{metadata['handeye_result_file']}`。",
+        f"- 采集模式：`{metadata.get('collection_mode', 'stationary')}`。",
         f"- 独立验证位姿：{report['pose_count']}；有效球面点：{report['point_count']}。",
         "",
         "## 主要结果",
@@ -527,8 +907,19 @@ def _arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="精密球真机手眼标定精度验证")
     parser.add_argument("--result", help="calibration_result.json path")
     parser.add_argument("--sphere", help="configured sphere artifact id")
-    parser.add_argument("--poses", type=int, help="number of manually positioned views")
-    parser.add_argument("--frames", type=int, help="stationary frames per view")
+    parser.add_argument(
+        "--mode", choices=("moving", "stationary"),
+        help="moving=人工步进移动扫描（评价方法2）；stationary=单截面静止采集",
+    )
+    parser.add_argument("--poses", type=int, help="number of directions/views")
+    parser.add_argument(
+        "--positions", type=int,
+        help="manual translation stops per direction in moving mode",
+    )
+    parser.add_argument(
+        "--frames", type=int,
+        help="stationary frames per translation stop (moving) or per view (stationary)",
+    )
     return parser.parse_args()
 
 
@@ -537,6 +928,7 @@ def main() -> int:
     parameters = _load_parameters(REAL_CONFIG)
     artifacts = _artifacts(parameters)
     artifact = _choose_artifact(artifacts, arguments.sphere)
+    collection_mode = _choose_collection_mode(arguments.mode)
     result_file = _choose_result(arguments.result)
     handeye_rotation, handeye_translation, result_payload, result_sha256 = _load_handeye(
         result_file
@@ -549,13 +941,25 @@ def main() -> int:
         if not _yes_no("仍继续采集？", False):
             return 1
 
-    pose_count = arguments.poses or int(parameters["target_poses"])
-    frame_count = arguments.frames or int(parameters["frames_per_pose"])
+    if collection_mode == "moving":
+        pose_count = arguments.poses or int(parameters.get("moving_directions", 7))
+        position_count = arguments.positions or int(
+            parameters.get("moving_positions_per_direction", 7)
+        )
+        frame_count = arguments.frames or int(
+            parameters.get("moving_frames_per_position", 20)
+        )
+    else:
+        pose_count = arguments.poses or int(parameters["target_poses"])
+        position_count = 1
+        frame_count = arguments.frames or int(parameters["frames_per_pose"])
     minimum_poses = int(parameters["thresholds"]["minimum_poses"])
     if pose_count < minimum_poses:
         raise ValueError(f"pose count must be at least {minimum_poses}")
     if frame_count < 3:
-        raise ValueError("frames per pose must be at least three")
+        raise ValueError("frames per position must be at least three")
+    if collection_mode == "moving" and position_count < 3:
+        raise ValueError("moving mode requires at least three translation positions")
     segmentation = _segment_parameters(parameters)
     thresholds = _thresholds(parameters)
     profile_topic = str(parameters["profile_topic"])
@@ -568,10 +972,21 @@ def main() -> int:
     print("             精密球真机手眼标定精度验证（只观察）")
     print("=" * 68)
     print(f"标定结果：{result_file}")
-    print(
-        f"标定球：{artifact.artifact_id}，Ø{1000.0 * artifact.diameter_m:.4f} mm；"
-        f"计划 {pose_count} 个独立位姿 × {frame_count} 个静止同步帧"
-    )
+    if collection_mode == "moving":
+        print(
+            f"标定球：{artifact.artifact_id}，Ø{1000.0 * artifact.diameter_m:.4f} mm；"
+            f"移动扫描：{pose_count} 个方向 × {position_count} 个平移位置 × "
+            f"{frame_count} 个静止同步帧"
+        )
+        print(
+            "同一方向内必须保持姿态不变、只做近似直线的单向平移；"
+            "每个方向的所有位置会保存为同一评价组。"
+        )
+    else:
+        print(
+            f"标定球：{artifact.artifact_id}，Ø{1000.0 * artifact.diameter_m:.4f} mm；"
+            f"静止截面：{pose_count} 个独立位姿 × {frame_count} 个静止同步帧"
+        )
     print("本程序不会向机器人发送任何运动指令，也不会用球面数据修改手眼结果。")
     print("若直线断点节点在球面上显示 REJECTED，这是正常现象，与本验证无关。")
 
@@ -580,7 +995,9 @@ def main() -> int:
     executor_thread = threading.Thread(target=rclpy.spin, args=(collector,), daemon=True)
     executor_thread.start()
     pose_frames: list[list[AcceptedFrame]] = []
+    position_indices_by_pose: list[list[int]] = []
     representative_poses: list[tuple[np.ndarray, np.ndarray]] = []
+    direction_summaries: list[dict[str, object]] = []
     try:
         print("\n等待同步轮廓与法兰位姿……")
         deadline = time.monotonic() + float(parameters["initial_data_timeout_s"])
@@ -595,55 +1012,79 @@ def main() -> int:
         if not _yes_no("球已牢固安装并确认开始？", True):
             return 0
 
-        pose_index = 1
-        while pose_index <= pose_count:
-            print(
-                f"\n[{pose_index}/{pose_count}] 使用示教器低速移动机器人，"
-                "让激光切到球面不同区域；停稳后回到这里。"
+        if collection_mode == "moving":
+            (
+                pose_frames,
+                position_indices_by_pose,
+                representative_poses,
+                direction_summaries,
+                cancelled,
+            ) = _collect_moving_scan(
+                collector,
+                artifact,
+                segmentation,
+                parameters,
+                pose_count,
+                position_count,
+                frame_count,
+                float(parameters["capture_timeout_s"]),
             )
-            command = input("按 Enter 采集；输入 q 结束；输入 r 重看提示：").strip().lower()
-            if command == "q":
-                break
-            if command == "r":
-                continue
-            try:
-                frames = _collect_pose(
-                    collector,
-                    artifact,
-                    segmentation,
-                    frame_count,
-                    float(parameters["capture_timeout_s"]),
+            if cancelled:
+                print("\n已取消移动扫描；未完成的数据不会形成精度结论。")
+        else:
+            pose_index = 1
+            while pose_index <= pose_count:
+                print(
+                    f"\n[{pose_index}/{pose_count}] 使用示教器低速移动机器人，"
+                    "让激光切到球面不同区域；停稳后回到这里。"
                 )
-            except RuntimeError as error:
-                print(f"  本位姿采集失败：{error}")
-                print("  请调整曝光/入射角，使RViz中出现连续球面圆弧后重试。")
-                continue
-            representative = _representative_flange(frames)
-            if representative_poses:
-                rotation_separation = min(
-                    rotation_distance_deg(previous[0], representative[0])
-                    for previous in representative_poses
-                )
-                translation_separation_mm = 1000.0 * min(
-                    np.linalg.norm(previous[1] - representative[1])
-                    for previous in representative_poses
-                )
-                if (
-                    rotation_separation
-                    < float(parameters["minimum_pose_rotation_separation_deg"])
-                    and translation_separation_mm
-                    < float(parameters["minimum_pose_translation_separation_mm"])
-                ):
-                    print(
-                        f"  位姿多样性警告：距已有位姿最近仅 "
-                        f"{rotation_separation:.2f}° / {translation_separation_mm:.1f} mm。"
+                command = input(
+                    "按 Enter 采集；输入 q 结束；输入 r 重看提示："
+                ).strip().lower()
+                if command == "q":
+                    break
+                if command == "r":
+                    continue
+                try:
+                    frames = _collect_pose(
+                        collector,
+                        artifact,
+                        segmentation,
+                        frame_count,
+                        float(parameters["capture_timeout_s"]),
                     )
-                    if not _yes_no("仍保留这个位姿？", False):
-                        print("  已丢弃，请重新移动机器人。")
-                        continue
-            pose_frames.append(frames)
-            representative_poses.append(representative)
-            pose_index += 1
+                except RuntimeError as error:
+                    print(f"  本位姿采集失败：{error}")
+                    print("  请调整曝光/入射角，使RViz中出现连续球面圆弧后重试。")
+                    continue
+                representative = _representative_flange(frames)
+                if representative_poses:
+                    rotation_separation = min(
+                        rotation_distance_deg(previous[0], representative[0])
+                        for previous in representative_poses
+                    )
+                    translation_separation_mm = 1000.0 * min(
+                        np.linalg.norm(previous[1] - representative[1])
+                        for previous in representative_poses
+                    )
+                    if (
+                        rotation_separation
+                        < float(parameters["minimum_pose_rotation_separation_deg"])
+                        and translation_separation_mm
+                        < float(parameters["minimum_pose_translation_separation_mm"])
+                    ):
+                        print(
+                            f"  位姿多样性警告：距已有位姿最近仅 "
+                            f"{rotation_separation:.2f}° / "
+                            f"{translation_separation_mm:.1f} mm。"
+                        )
+                        if not _yes_no("仍保留这个位姿？", False):
+                            print("  已丢弃，请重新移动机器人。")
+                            continue
+                pose_frames.append(frames)
+                position_indices_by_pose.append([0] * len(frames))
+                representative_poses.append(representative)
+                pose_index += 1
 
         if len(pose_frames) < minimum_poses:
             raise RuntimeError(
@@ -651,7 +1092,11 @@ def main() -> int:
                 "不生成精度结论。"
             )
 
-        _save_dataset(run_directory / "sphere_acquisition.npz", pose_frames)
+        _save_dataset(
+            run_directory / "sphere_acquisition.npz",
+            pose_frames,
+            position_indices_by_pose,
+        )
         pose_points_base = []
         for group in pose_frames:
             transformed = [
@@ -686,7 +1131,11 @@ def main() -> int:
             "profile_topic": profile_topic,
             "flange_pose_topic": flange_topic,
             "pose_count": len(pose_frames),
-            "frames_per_pose": frame_count,
+            "collection_mode": collection_mode,
+            "positions_per_direction": position_count,
+            "frames_per_position": frame_count,
+            "frames_per_pose": position_count * frame_count,
+            "direction_summaries": direction_summaries,
             "raw_dataset": "sphere_acquisition.npz",
             "sphere_data_used_to_update_handeye": False,
         }

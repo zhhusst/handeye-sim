@@ -30,6 +30,7 @@ from calibration_pipeline.geometry import (
 )
 from calibration_pipeline.models import SensorROI, TrapezoidDomain
 from calibration_pipeline.seed_collection import (
+    BroydenDualFeatureServo,
     InitialPoseCriteria,
     RotationTarget,
     TranslationServo,
@@ -81,6 +82,39 @@ class SeedCollectionNode(Node):
         )
         self.declare_parameter("seed.maximum_translation_step_m", 0.008)
         self.declare_parameter("seed.maximum_servo_iterations", 8)
+        self.declare_parameter("seed.servo.controller", "legacy")
+        self.declare_parameter("seed.servo.length_lower_m", 0.070)
+        self.declare_parameter("seed.servo.length_upper_m", 0.090)
+        self.declare_parameter("seed.servo.length_target_m", 0.080)
+        self.declare_parameter("seed.servo.hard_minimum_length_m", 0.050)
+        self.declare_parameter("seed.servo.hard_maximum_length_m", 0.120)
+        self.declare_parameter("seed.servo.gain", 0.55)
+        self.declare_parameter("seed.servo.damping", 0.05)
+        self.declare_parameter("seed.servo.maximum_axis_step_m", 0.003)
+        self.declare_parameter("seed.servo.maximum_norm_step_m", 0.005)
+        self.declare_parameter("seed.servo.minimum_update_step_m", 0.0002)
+        self.declare_parameter("seed.servo.minimum_singular_value", 0.02)
+        self.declare_parameter("seed.servo.maximum_condition", 100.0)
+        self.declare_parameter("seed.servo.maximum_model_error_ratio", 3.0)
+        self.declare_parameter("seed.servo.maximum_rejected_updates", 2)
+        self.declare_parameter("seed.servo.convergence_tolerance_m", 0.00025)
+        self.declare_parameter("seed.rotation_feedforward.enabled", False)
+        self.declare_parameter("seed.rotation_feedforward.gain", 0.90)
+        self.declare_parameter(
+            "seed.rotation_feedforward.rate_smoothing", 0.50
+        )
+        self.declare_parameter(
+            "seed.rotation_feedforward.maximum_axis_step_m", 0.010
+        )
+        self.declare_parameter(
+            "seed.rotation_feedforward.maximum_norm_step_m", 0.014
+        )
+        self.declare_parameter(
+            "seed.rotation_feedforward.accelerated_step_deg", 2.0
+        )
+        self.declare_parameter(
+            "seed.rotation_feedforward.minimum_verified_steps", 2
+        )
         self.declare_parameter("seed.measurement_retry_timeout_s", 1.0)
         self.declare_parameter("seed.measurement_batch_size", 20)
         self.declare_parameter("seed.minimum_batch_inliers", 15)
@@ -91,6 +125,7 @@ class SeedCollectionNode(Node):
         self.declare_parameter("seed.minimum_profile_points", 5)
         self.declare_parameter("seed.minimum_rotation_separation_deg", 2.0)
         self.declare_parameter("seed.target_count", 6)
+        self.declare_parameter("seed.debug.single_target_name", "")
         self.declare_parameter("seed.minimum_seed_domain_margin_m", 0.002)
         self.declare_parameter("seed.initial.maximum_abs_x_mid_m", 0.03)
         self.declare_parameter("seed.initial.minimum_z_mid_m", 0.30)
@@ -120,11 +155,14 @@ class SeedCollectionNode(Node):
         )
         self.declare_parameter("seed.motion_duration_s", 0.65)
         self.declare_parameter("seed.motion_timeout_s", 4.0)
+        self.declare_parameter("seed.settling_time_s", 0.3)
         self.declare_parameter("settling_time_s", 0.3)
         self.declare_parameter("manual_max_joint_speed_rad_s", 0.02)
         self.declare_parameter("maximum_measurement_skew_s", 0.1)
         self.declare_parameter("maximum_measurement_age_s", 0.5)
         self.declare_parameter("measurement.pose_source", "topic")
+        self.declare_parameter("measurement.pending_observation_buffer_size", 64)
+        self.declare_parameter("measurement.pending_pose_buffer_size", 512)
         self.declare_parameter("interfaces.joint_state_topic", "/joint_states")
         self.declare_parameter("interfaces.profile_topic", "/gocator/profile")
         self.declare_parameter(
@@ -219,6 +257,111 @@ class SeedCollectionNode(Node):
         self.maximum_servo_iterations = int(
             self.get_parameter("seed.maximum_servo_iterations").value
         )
+        self.servo_controller = str(
+            self.get_parameter("seed.servo.controller").value
+        ).strip().lower()
+        if self.servo_controller not in {"legacy", "broyden_dual"}:
+            raise ValueError(
+                "seed.servo.controller must be legacy or broyden_dual"
+            )
+        self.servo_length_lower = float(
+            self.get_parameter("seed.servo.length_lower_m").value
+        )
+        self.servo_length_upper = float(
+            self.get_parameter("seed.servo.length_upper_m").value
+        )
+        self.servo_length_target = float(
+            self.get_parameter("seed.servo.length_target_m").value
+        )
+        self.servo_hard_minimum_length = float(
+            self.get_parameter("seed.servo.hard_minimum_length_m").value
+        )
+        self.servo_hard_maximum_length = float(
+            self.get_parameter("seed.servo.hard_maximum_length_m").value
+        )
+        if not (
+            0.0 < self.servo_hard_minimum_length
+            <= self.servo_length_lower
+            < self.servo_length_target
+            < self.servo_length_upper
+            <= self.servo_hard_maximum_length
+        ):
+            raise ValueError(
+                "seed.servo length limits must satisfy "
+                "0 < hard_min <= lower < target < upper <= hard_max"
+            )
+        self.dual_servo_options = {
+            "gain": float(self.get_parameter("seed.servo.gain").value),
+            "damping": float(self.get_parameter("seed.servo.damping").value),
+            "maximum_axis_step": float(
+                self.get_parameter("seed.servo.maximum_axis_step_m").value
+            ),
+            "maximum_norm_step": float(
+                self.get_parameter("seed.servo.maximum_norm_step_m").value
+            ),
+            "minimum_update_step": float(
+                self.get_parameter("seed.servo.minimum_update_step_m").value
+            ),
+            "minimum_singular_value": float(
+                self.get_parameter("seed.servo.minimum_singular_value").value
+            ),
+            "maximum_condition": float(
+                self.get_parameter("seed.servo.maximum_condition").value
+            ),
+            "maximum_model_error_ratio": float(
+                self.get_parameter(
+                    "seed.servo.maximum_model_error_ratio"
+                ).value
+            ),
+        }
+        self.maximum_rejected_servo_updates = int(
+            self.get_parameter("seed.servo.maximum_rejected_updates").value
+        )
+        self.servo_convergence_tolerance = float(
+            self.get_parameter("seed.servo.convergence_tolerance_m").value
+        )
+        self.rotation_feedforward_enabled = bool(
+            self.get_parameter("seed.rotation_feedforward.enabled").value
+        )
+        self.rotation_feedforward_gain = float(
+            self.get_parameter("seed.rotation_feedforward.gain").value
+        )
+        self.rotation_rate_smoothing = float(
+            self.get_parameter(
+                "seed.rotation_feedforward.rate_smoothing"
+            ).value
+        )
+        self.rotation_feedforward_maximum_axis_step = float(
+            self.get_parameter(
+                "seed.rotation_feedforward.maximum_axis_step_m"
+            ).value
+        )
+        self.rotation_feedforward_maximum_norm_step = float(
+            self.get_parameter(
+                "seed.rotation_feedforward.maximum_norm_step_m"
+            ).value
+        )
+        self.rotation_feedforward_accelerated_step = np.deg2rad(
+            float(
+                self.get_parameter(
+                    "seed.rotation_feedforward.accelerated_step_deg"
+                ).value
+            )
+        )
+        self.rotation_feedforward_minimum_verified_steps = int(
+            self.get_parameter(
+                "seed.rotation_feedforward.minimum_verified_steps"
+            ).value
+        )
+        if not (
+            0.0 < self.rotation_feedforward_gain <= 1.0
+            and 0.0 < self.rotation_rate_smoothing <= 1.0
+            and self.rotation_feedforward_maximum_axis_step > 0.0
+            and self.rotation_feedforward_maximum_norm_step > 0.0
+            and self.rotation_feedforward_accelerated_step > 0.0
+            and self.rotation_feedforward_minimum_verified_steps >= 1
+        ):
+            raise ValueError("invalid seed.rotation_feedforward configuration")
         self.measurement_retry_timeout_ns = int(
             float(
                 self.get_parameter(
@@ -270,6 +413,20 @@ class SeedCollectionNode(Node):
             self.get_parameter("seed.minimum_rotation_separation_deg").value
         )
         self.target_count = int(self.get_parameter("seed.target_count").value)
+        self.debug_single_target_name = str(
+            self.get_parameter("seed.debug.single_target_name").value
+        ).strip()
+        if self.debug_single_target_name:
+            available_targets = {
+                target.name for target in adaptive_rotation_plan()
+            }
+            if self.debug_single_target_name not in available_targets:
+                raise ValueError(
+                    "seed.debug.single_target_name is not a known adaptive "
+                    f"target: {self.debug_single_target_name}"
+                )
+            # One stationary reference plus one diagnostic branch.
+            self.target_count = 2
         self.minimum_seed_domain_margin = float(
             self.get_parameter("seed.minimum_seed_domain_margin_m").value
         )
@@ -363,7 +520,9 @@ class SeedCollectionNode(Node):
                 "seed.preflight.auto_skip_minimum_domain_margin_m"
             ).value
         )
-        self.settling_time = float(self.get_parameter("settling_time_s").value)
+        self.settling_time = float(
+            self.get_parameter("seed.settling_time_s").value
+        )
         self.manual_max_joint_speed = float(
             self.get_parameter("manual_max_joint_speed_rad_s").value
         )
@@ -378,6 +537,19 @@ class SeedCollectionNode(Node):
         ).strip().lower()
         if self.pose_source not in {"topic", "tf"}:
             raise ValueError("measurement.pose_source must be topic or tf")
+        self.pending_observation_buffer_size = int(
+            self.get_parameter(
+                "measurement.pending_observation_buffer_size"
+            ).value
+        )
+        self.pending_pose_buffer_size = int(
+            self.get_parameter("measurement.pending_pose_buffer_size").value
+        )
+        if (
+            self.pending_observation_buffer_size < 1
+            or self.pending_pose_buffer_size < 1
+        ):
+            raise ValueError("measurement pending buffer sizes must be positive")
         self.output_file = Path(str(self.get_parameter("output_file").value))
         self.collection_mode = str(
             self.get_parameter("collection_mode").value
@@ -514,6 +686,7 @@ class SeedCollectionNode(Node):
         self.seed_capture_last_filter_counts: dict[str, int] = {}
         self.pending_partial_label = ""
         self.plan = adaptive_rotation_plan()
+        self._apply_debug_target_filter()
         self.preflight_plan = (
             RotationTarget("preflight_rx_negative", ((0, -1),)),
             RotationTarget("preflight_rx_positive", ((0, 1),)),
@@ -545,17 +718,33 @@ class SeedCollectionNode(Node):
         self.motion_deadline_wall_ns = 0
         self.after_settle = ""
         self.pending_rotation = 0.0
+        self.pending_rotation_feedforward = np.zeros(3)
+        self.rotation_pre_feature_vector: np.ndarray | None = None
+        self.rotation_pre_measurement_transform: np.ndarray | None = None
+        self.rotation_feature_rate: np.ndarray | None = None
+        self.rotation_feedforward_samples = 0
+        self.rotation_feedforward_last_residual = np.zeros(2)
         self.probe_axis = 0
         self.probe_base_transform: np.ndarray | None = None
+        self.probe_base_measurement_transform: np.ndarray | None = None
         self.probe_base_feature = None
         self.probe_sensitivities: dict[int, float] = {}
+        self.probe_translations: dict[int, np.ndarray] = {}
+        self.probe_feature_deltas: dict[int, np.ndarray] = {}
+        self.probe_purpose = "BRANCH"
         self.learned_servo_axis: int | None = None
         self.learned_servo_sensitivity: float | None = None
         self.servo = TranslationServo(maximum_step=self.maximum_translation_step)
+        self.dual_servo = BroydenDualFeatureServo(**self.dual_servo_options)
+        self.reference_servo_jacobian: np.ndarray | None = None
         self.servo_from_cache = False
         self.servo_reprobe_attempted = False
         self.servo_previous_x = 0.0
         self.servo_previous_step = 0.0
+        self.servo_previous_feature_vector: np.ndarray | None = None
+        self.servo_previous_measurement_transform: np.ndarray | None = None
+        self.servo_previous_command = np.zeros(3)
+        self.servo_last_update_accepted: bool | None = None
         self.servo_iterations = 0
         self.get_logger().info(
             "waiting for one manually positioned, stable bilateral profile; "
@@ -700,10 +889,15 @@ class SeedCollectionNode(Node):
         for pending in (
             self.pending_profiles,
             self.pending_endpoint_frames,
-            self.pending_flange_poses,
         ):
-            while len(pending) > 20:
+            while len(pending) > self.pending_observation_buffer_size:
                 pending.pop(next(iter(pending)))
+        # The exact-stamp pose is published before endpoint detection.  ROI/
+        # CSRT processing can take longer than 20 high-rate pose messages, so
+        # retain a separate bounded history until the derived observations
+        # carrying that original stamp arrive.
+        while len(self.pending_flange_poses) > self.pending_pose_buffer_size:
+            self.pending_flange_poses.pop(next(iter(self.pending_flange_poses)))
 
     def _lookup_flange_transform(self, stamp) -> np.ndarray | None:
         try:
@@ -909,12 +1103,19 @@ class SeedCollectionNode(Node):
             f"target={target_name}; target_index={self.target_index}/{len(self.plan)}; "
             f"preflight={sum(item['accepted'] for item in self.preflight_results)}/"
             f"{len(self.preflight_plan)}; "
+            f"servo_controller={self.servo_controller}; "
+            f"servo_length_band_mm={1000.0 * self.servo_length_lower:.1f}-"
+            f"{1000.0 * self.servo_length_upper:.1f}; "
             f"target_failures={self.failure_count}/{self.maximum_target_failures}; "
             f"motion_stage={self.after_settle or '-'}; "
             f"seed_batch={len(self.seed_capture_frames)}/"
             f"{self.seed_measurement_batch_size}; "
             f"rotation_deg={np.rad2deg(self.accumulated_angle):.2f}/"
             f"{np.rad2deg(displayed_rotation_target):.2f}; "
+            f"rotation_step_deg={np.rad2deg(self.pending_rotation):.2f}; "
+            f"rotation_feedforward_samples={self.rotation_feedforward_samples}; "
+            f"rotation_feedforward_norm_mm="
+            f"{1000.0 * np.linalg.norm(self.pending_rotation_feedforward):.2f}; "
             f"observation={observation}; stable={str(stable).lower()}; "
             f"profile_points={0 if self.latest_profile is None else len(self.latest_profile)}; "
             f"{feature_details}; "
@@ -1020,6 +1221,20 @@ class SeedCollectionNode(Node):
             ),
         )
 
+    def _apply_debug_target_filter(self) -> None:
+        if not getattr(self, "debug_single_target_name", ""):
+            return
+        self.plan = tuple(
+            target
+            for target in self.plan
+            if target.name == self.debug_single_target_name
+        )
+        if len(self.plan) != 1:
+            raise ValueError(
+                "debug target was removed while reordering the seed plan: "
+                f"{self.debug_single_target_name}"
+            )
+
     def _command_transform(self, transform: np.ndarray, after_settle: str) -> bool:
         if self.latest_joints is None:
             return False
@@ -1032,14 +1247,175 @@ class SeedCollectionNode(Node):
     def _reset_servo(self) -> None:
         """Reuse the measured local sensitivity near the common reference pose."""
         self.servo = TranslationServo(maximum_step=self.maximum_translation_step)
+        self.dual_servo = BroydenDualFeatureServo(**self.dual_servo_options)
+        if self.reference_servo_jacobian is not None:
+            self.dual_servo.set_jacobian(self.reference_servo_jacobian)
         self.servo_from_cache = (
-            self.learned_servo_axis is not None
-            and self.learned_servo_sensitivity is not None
+            self.reference_servo_jacobian is not None
+            if self.servo_controller == "broyden_dual"
+            else (
+                self.learned_servo_axis is not None
+                and self.learned_servo_sensitivity is not None
+            )
         )
-        if self.servo_from_cache:
+        if self.servo_controller == "legacy" and self.servo_from_cache:
             self.servo.axis = self.learned_servo_axis
             self.servo.sensitivity = self.learned_servo_sensitivity
         self.servo_reprobe_attempted = False
+        self.servo_last_update_accepted = None
+
+    @staticmethod
+    def _deadband_error(value: float, lower: float, upper: float) -> float:
+        if value < lower:
+            return float(value - lower)
+        if value > upper:
+            return float(value - upper)
+        return 0.0
+
+    def _dual_feature_vector(self, feature) -> np.ndarray:
+        return np.array([feature.x_mid, feature.profile_length], dtype=float)
+
+    def _dual_feature_error(self, feature) -> np.ndarray:
+        tolerance = self._centering_tolerance()
+        x_error = (
+            float(feature.x_mid)
+            if abs(feature.x_mid) > tolerance
+            else 0.0
+        )
+        length_error = (
+            float(feature.profile_length - self.servo_length_target)
+            if not (
+                self.servo_length_lower
+                <= feature.profile_length
+                <= self.servo_length_upper
+            )
+            else 0.0
+        )
+        return np.array(
+            [x_error, length_error],
+            dtype=float,
+        )
+
+    def _reset_rotation_feedforward_model(self) -> None:
+        self.rotation_feature_rate = None
+        self.rotation_feedforward_samples = 0
+        self.pending_rotation_feedforward = np.zeros(3)
+        self.rotation_pre_feature_vector = None
+        self.rotation_pre_measurement_transform = None
+        self.rotation_feedforward_last_residual = np.zeros(2)
+
+    def _rotation_feedforward_is_active(self) -> bool:
+        return bool(
+            self.rotation_feedforward_enabled
+            and self.servo_controller == "broyden_dual"
+            and self.collection_phase != "PREFLIGHT"
+            and self.rotation_feature_rate is not None
+            and self.dual_servo.jacobian is not None
+        )
+
+    def _rotation_feedforward_command(
+        self, feature, rotation_magnitude: float
+    ) -> np.ndarray:
+        if not self._rotation_feedforward_is_active():
+            return np.zeros(3)
+        predicted_feature = (
+            self._dual_feature_vector(feature)
+            + self.rotation_feature_rate * rotation_magnitude
+        )
+        target_feature = np.array(
+            [0.0, self.servo_length_target], dtype=float
+        )
+        predicted_error = predicted_feature - target_feature
+        try:
+            return self.dual_servo.correction(
+                predicted_error,
+                gain=self.rotation_feedforward_gain,
+                maximum_axis_step=(
+                    self.rotation_feedforward_maximum_axis_step
+                ),
+                maximum_norm_step=(
+                    self.rotation_feedforward_maximum_norm_step
+                ),
+            )
+        except (RuntimeError, ValueError) as error:
+            self.get_logger().warning(
+                f"rotation feedforward disabled for this step: {error}"
+            )
+            return np.zeros(3)
+
+    def _update_rotation_feature_rate(self, feature) -> None:
+        if (
+            not self.rotation_feedforward_enabled
+            or self.servo_controller != "broyden_dual"
+            or self.collection_phase == "PREFLIGHT"
+            or self.pending_rotation <= 1e-12
+            or self.rotation_pre_feature_vector is None
+            or self.rotation_pre_measurement_transform is None
+            or self.dual_servo.jacobian is None
+        ):
+            return
+        measured_transform = self._measurement_transform()
+        if measured_transform is None:
+            measured_transform = self._current_transform()
+        if measured_transform is None:
+            return
+        before = self.rotation_pre_measurement_transform
+        actual_local_translation = before[:3, :3].T @ (
+            measured_transform[:3, 3] - before[:3, 3]
+        )
+        measured_delta = (
+            self._dual_feature_vector(feature)
+            - self.rotation_pre_feature_vector
+        )
+        rotation_only_delta = (
+            measured_delta
+            - self.dual_servo.jacobian @ actual_local_translation
+        )
+        measured_rate = rotation_only_delta / self.pending_rotation
+        if self.rotation_feature_rate is None:
+            self.rotation_feature_rate = measured_rate
+        else:
+            eta = self.rotation_rate_smoothing
+            self.rotation_feature_rate = (
+                (1.0 - eta) * self.rotation_feature_rate
+                + eta * measured_rate
+            )
+        predicted_delta = (
+            self.rotation_feature_rate * self.pending_rotation
+            + self.dual_servo.jacobian @ actual_local_translation
+        )
+        self.rotation_feedforward_last_residual = measured_delta - predicted_delta
+        self.rotation_feedforward_samples += 1
+        self.get_logger().info(
+            "rotation disturbance update: "
+            f"samples={self.rotation_feedforward_samples}, "
+            f"rate_per_deg_mm="
+            f"{(1000.0 * self.rotation_feature_rate * np.deg2rad(1.0)).round(3).tolist()}, "
+            f"feedforward_actual_mm="
+            f"{(1000.0 * actual_local_translation).round(3).tolist()}, "
+            f"residual_mm="
+            f"{(1000.0 * self.rotation_feedforward_last_residual).round(3).tolist()}"
+        )
+
+    def _feature_retains_physical_edges(self, feature) -> bool:
+        """Guard against loss/switching to another pair of plate edges."""
+        return bool(
+            feature is not None
+            and feature.safe
+            and self.servo_hard_minimum_length
+            <= feature.profile_length
+            <= self.servo_hard_maximum_length
+        )
+
+    def _feature_controlled(self, feature) -> bool:
+        if self.servo_controller == "legacy" or self.collection_phase == "PREFLIGHT":
+            return bool(abs(feature.x_mid) <= self._centering_tolerance())
+        return bool(
+            np.all(
+                np.abs(self._dual_feature_error(feature))
+                <= self.servo_convergence_tolerance
+            )
+        )
 
     def _command_joints(self, joints: np.ndarray, after_settle: str) -> bool:
         if not self._trajectory.wait_for_server(timeout_sec=0.5):
@@ -1089,10 +1465,15 @@ class SeedCollectionNode(Node):
             or wrapped_result.result.error_code
             != FollowJointTrajectory.Result.SUCCESSFUL
         ):
+            error_text = str(
+                getattr(wrapped_result.result, "error_string", "")
+            ).strip()
             self._fail(
                 "trajectory execution failed "
                 f"(status={wrapped_result.status}, "
-                f"error={wrapped_result.result.error_code})"
+                f"error={wrapped_result.result.error_code}"
+                + (f", reason={error_text}" if error_text else "")
+                + ")"
             )
             return
         self.settle_until_ns = (
@@ -1131,6 +1512,13 @@ class SeedCollectionNode(Node):
                     self.latest_endpoints[1] - self.latest_endpoints[0]
                 )
             )
+        feature = self._feature()
+        dual_error_mm = None
+        if feature is not None:
+            dual_error_mm = (
+                1000.0 * self._dual_feature_error(feature)
+            ).tolist()
+        dual_health = self.dual_servo.health()
         message = String()
         message.data = json.dumps(
             {
@@ -1161,6 +1549,61 @@ class SeedCollectionNode(Node):
                 ),
                 "endpoints_S": endpoints,
                 "endpoint_separation_mm": separation_mm,
+                "servo_controller": self.servo_controller,
+                "servo_iteration": self.servo_iterations,
+                "servo_length_band_mm": [
+                    1000.0 * self.servo_length_lower,
+                    1000.0 * self.servo_length_upper,
+                ],
+                "servo_length_target_mm": 1000.0 * self.servo_length_target,
+                "servo_hard_length_guard_mm": [
+                    1000.0 * self.servo_hard_minimum_length,
+                    1000.0 * self.servo_hard_maximum_length,
+                ],
+                "dual_feature_error_mm": dual_error_mm,
+                "dual_servo_command_mm": (
+                    1000.0 * self.servo_previous_command
+                ).tolist(),
+                "dual_servo_jacobian": (
+                    None
+                    if self.dual_servo.jacobian is None
+                    else self.dual_servo.jacobian.tolist()
+                ),
+                "dual_servo_rank": dual_health["rank"],
+                "dual_servo_condition": (
+                    None
+                    if not np.isfinite(dual_health["condition"])
+                    else dual_health["condition"]
+                ),
+                "dual_servo_singular_values": dual_health["singular_values"],
+                "dual_servo_update_accepted": self.servo_last_update_accepted,
+                "dual_servo_update_reason": self.dual_servo.last_update_reason,
+                "dual_servo_model_error_ratio": (
+                    None
+                    if not np.isfinite(self.dual_servo.last_model_error_ratio)
+                    else self.dual_servo.last_model_error_ratio
+                ),
+                "rotation_feedforward_enabled": (
+                    self.rotation_feedforward_enabled
+                ),
+                "rotation_feedforward_samples": (
+                    self.rotation_feedforward_samples
+                ),
+                "rotation_feedforward_command_mm": (
+                    1000.0 * self.pending_rotation_feedforward
+                ).tolist(),
+                "rotation_feature_rate_per_deg_mm": (
+                    None
+                    if self.rotation_feature_rate is None
+                    else (
+                        1000.0
+                        * self.rotation_feature_rate
+                        * np.deg2rad(1.0)
+                    ).tolist()
+                ),
+                "rotation_feedforward_residual_mm": (
+                    1000.0 * self.rotation_feedforward_last_residual
+                ).tolist(),
                 "failure_reason": self.failure_reason,
             },
             ensure_ascii=False,
@@ -1248,6 +1691,7 @@ class SeedCollectionNode(Node):
         ) = self._dynamic_preflight_decision(assessment)
         self.collection_phase = "REFERENCE"
         self.plan = adaptive_rotation_plan()
+        self._apply_debug_target_filter()
         if self.preflight_was_required:
             self.get_logger().info(
                 "static initial envelope accepted; collecting the stationary "
@@ -1336,6 +1780,16 @@ class SeedCollectionNode(Node):
                 "detector reacquisition could not be started"
             )
             return
+        if (
+            self.collection_phase != "PREFLIGHT"
+            and self.servo_controller == "broyden_dual"
+            and not self._feature_retains_physical_edges(feature_at_reference)
+        ):
+            self._fail(
+                "verified reference no longer satisfies the intended-edge "
+                "length guard"
+            )
+            return
         self._publish_detection_control("PREDICTION_COMMIT")
         if self.collection_phase == "PREFLIGHT":
             if self.preflight_index >= len(self.preflight_plan):
@@ -1359,6 +1813,7 @@ class SeedCollectionNode(Node):
                 self.plan = preflight_guided_rotation_plan(
                     self.preflight_results
                 )
+                self._apply_debug_target_filter()
                 self.collection_phase = "COLLECT"
                 self.get_logger().info(
                     f"dynamic preflight accepted "
@@ -1372,6 +1827,7 @@ class SeedCollectionNode(Node):
                 if feature is not None and feature.safe:
                     self._remember_last_valid(feature)
                 self._reset_servo()
+                self._reset_rotation_feedforward_model()
                 target = self.preflight_plan[self.preflight_index]
                 self.get_logger().info(f"preflight target {target.name}")
                 self._issue_micro_rotation()
@@ -1386,7 +1842,18 @@ class SeedCollectionNode(Node):
         if feature is not None and feature.safe:
             self._remember_last_valid(feature)
         self._reset_servo()
+        self._reset_rotation_feedforward_model()
         self.get_logger().info(f"target {self.plan[self.target_index].name}")
+        if (
+            getattr(self, "servo_controller", "legacy") == "broyden_dual"
+            and getattr(self, "reference_servo_jacobian", None) is None
+        ):
+            self.get_logger().info(
+                "initializing the 2x3 dual-feature Jacobian once at the "
+                "verified reference pose"
+            )
+            self._begin_probing(feature, purpose="REFERENCE")
+            return
         self._issue_micro_rotation()
 
     def _after_return_reference_reacquire(self) -> None:
@@ -1422,13 +1889,46 @@ class SeedCollectionNode(Node):
             axis_pairs = (stage,)
         target_angle = self._current_target_angle()
         remaining = target_angle - self.accumulated_angle
-        magnitude = min(self.rotation_step, remaining)
+        effective_step = self.rotation_step
+        if (
+            self._rotation_feedforward_is_active()
+            and self.rotation_feedforward_samples
+            >= self.rotation_feedforward_minimum_verified_steps
+            and self.failure_count == 0
+        ):
+            effective_step = max(
+                effective_step,
+                self.rotation_feedforward_accelerated_step,
+            )
+        magnitude = min(effective_step, remaining)
         axis_vector = np.zeros(3)
         for axis, sign in axis_pairs:
             axis_vector[axis] = sign * magnitude
         target = current.copy()
         target[:3, :3] = current[:3, :3] @ so3_exp(axis_vector)
+        feature = self._feature()
+        self.rotation_pre_feature_vector = (
+            None if feature is None else self._dual_feature_vector(feature)
+        )
+        self.rotation_pre_measurement_transform = self._measurement_transform()
+        if self.rotation_pre_measurement_transform is None:
+            self.rotation_pre_measurement_transform = current.copy()
+        self.pending_rotation_feedforward = (
+            np.zeros(3)
+            if feature is None
+            else self._rotation_feedforward_command(feature, magnitude)
+        )
+        target[:3, 3] += (
+            current[:3, :3] @ self.pending_rotation_feedforward
+        )
         self.pending_rotation = magnitude
+        self.get_logger().info(
+            "rotation command: "
+            f"step={np.rad2deg(magnitude):.2f} deg, "
+            f"feedforward_mm="
+            f"{(1000.0 * self.pending_rotation_feedforward).round(3).tolist()}, "
+            f"model_samples={self.rotation_feedforward_samples}"
+        )
         if not self._command_transform(target, "MICRO_ROTATION"):
             self._rollback("rotation IK failure")
 
@@ -1437,34 +1937,66 @@ class SeedCollectionNode(Node):
         if feature is None or not feature.safe:
             self._rollback("bilateral feature became unsafe")
             return
+        if (
+            self.servo_controller == "broyden_dual"
+            and not self._feature_retains_physical_edges(feature)
+        ):
+            self._rollback(
+                "endpoint separation crossed the intended-edge hard guard"
+            )
+            return
+        self._update_rotation_feature_rate(feature)
         self.accumulated_angle += self.pending_rotation
         self.last_valid_joints = self.latest_joints.copy()
         self._remember_last_valid(feature)
         target_angle = self._current_target_angle()
+        length_can_continue = (
+            self.servo_controller == "legacy"
+            or self.collection_phase == "PREFLIGHT"
+            or self.servo_length_lower
+            <= feature.profile_length
+            <= self.servo_length_upper
+        )
         if (
             self.accumulated_angle + 1e-10 < target_angle
             and abs(feature.x_mid)
             <= self.rotation_continue_max_abs_x_mid
             and feature.domain_margin
             >= self.rotation_continue_minimum_domain_margin
+            and length_can_continue
         ):
             self._issue_micro_rotation()
             return
-        if abs(feature.x_mid) <= self._centering_tolerance():
+        if self._feature_controlled(feature):
             self._continue_after_centered(feature)
             return
-        if self.servo.axis is not None and self.servo.sensitivity is not None:
+        if self.servo_controller == "broyden_dual":
+            if self.dual_servo.jacobian is not None:
+                self.servo_iterations = 0
+                self._issue_servo()
+            else:
+                self._begin_probing(feature)
+        elif self.servo.axis is not None and self.servo.sensitivity is not None:
             self.servo_iterations = 0
             self._issue_servo()
         else:
             self._begin_probing(feature)
 
-    def _begin_probing(self, feature) -> None:
+    def _begin_probing(self, feature, *, purpose: str = "BRANCH") -> None:
         self.servo_iterations = 0
         self.probe_axis = 0
         self.probe_sensitivities = {}
+        self.probe_translations = {}
+        self.probe_feature_deltas = {}
+        self.probe_purpose = purpose
         self.probe_base_transform = self._current_transform()
+        self.probe_base_measurement_transform = self._measurement_transform()
+        if self.probe_base_measurement_transform is None:
+            self.probe_base_measurement_transform = self.probe_base_transform
         self.probe_base_feature = feature
+        if self.probe_base_transform is None:
+            self._rollback("robot pose missing before translation probe")
+            return
         self._issue_probe()
 
     def _issue_probe(self) -> None:
@@ -1478,17 +2010,42 @@ class SeedCollectionNode(Node):
 
     def _after_probe_out(self) -> None:
         feature = self._feature()
-        if feature is None or not feature.safe:
+        dual_probe = (
+            self.servo_controller == "broyden_dual"
+            and self.collection_phase != "PREFLIGHT"
+        )
+        observation_valid = bool(feature is not None and feature.safe)
+        if dual_probe:
+            observation_valid = self._feature_retains_physical_edges(feature)
+        if not observation_valid:
             self.probe_sensitivities[self.probe_axis] = 0.0
             self.get_logger().warning(
-                f"probe axis {self.probe_axis} excluded: unsafe feature response"
+                f"probe axis {self.probe_axis} excluded: unsafe or wrong-edge "
+                "feature response"
             )
             if not self._command_transform(self.probe_base_transform, "PROBE_BACK"):
                 self._rollback("unsafe probe return IK failure")
             return
-        self.probe_sensitivities[self.probe_axis] = (
-            feature.x_mid - self.probe_base_feature.x_mid
-        ) / self.probe_step
+        if dual_probe:
+            measured_transform = self._measurement_transform()
+            if measured_transform is None:
+                measured_transform = self._current_transform()
+            if measured_transform is None:
+                self._rollback("measured robot pose missing after probe")
+                return
+            base_transform = self.probe_base_measurement_transform
+            actual_local = base_transform[:3, :3].T @ (
+                measured_transform[:3, 3] - base_transform[:3, 3]
+            )
+            self.probe_translations[self.probe_axis] = actual_local
+            self.probe_feature_deltas[self.probe_axis] = (
+                self._dual_feature_vector(feature)
+                - self._dual_feature_vector(self.probe_base_feature)
+            )
+        else:
+            self.probe_sensitivities[self.probe_axis] = (
+                feature.x_mid - self.probe_base_feature.x_mid
+            ) / self.probe_step
         if not self._command_transform(self.probe_base_transform, "PROBE_BACK"):
             self._rollback("probe return IK failure")
 
@@ -1496,12 +2053,71 @@ class SeedCollectionNode(Node):
         self.probe_axis += 1
         if self.probe_axis < 3:
             self.probe_base_transform = self._current_transform()
+            self.probe_base_measurement_transform = self._measurement_transform()
+            if self.probe_base_measurement_transform is None:
+                self.probe_base_measurement_transform = self.probe_base_transform
             feature = self._feature()
-            if feature is None:
+            if feature is None or (
+                self.servo_controller == "broyden_dual"
+                and self.collection_phase != "PREFLIGHT"
+                and not self._feature_retains_physical_edges(feature)
+            ):
                 self._rollback("feature missing after probe")
                 return
             self.probe_base_feature = feature
             self._issue_probe()
+            return
+        if (
+            self.servo_controller == "broyden_dual"
+            and self.collection_phase != "PREFLIGHT"
+        ):
+            if len(self.probe_translations) != 3:
+                self._rollback("dual-feature probing did not obtain three valid axes")
+                return
+            delta_q = np.column_stack(
+                [self.probe_translations[axis] for axis in range(3)]
+            )
+            delta_s = np.column_stack(
+                [self.probe_feature_deltas[axis] for axis in range(3)]
+            )
+            try:
+                jacobian = delta_s @ np.linalg.pinv(delta_q)
+                self.dual_servo.set_jacobian(jacobian)
+            except (ValueError, np.linalg.LinAlgError) as error:
+                self._rollback(f"dual-feature probe solve failed: {error}")
+                return
+            health = self.dual_servo.health()
+            if not health["healthy"]:
+                self._rollback(
+                    "dual-feature probe Jacobian is rank deficient or "
+                    f"ill-conditioned (rank={health['rank']}, "
+                    f"condition={health['condition']:.2f})"
+                )
+                return
+            if self.probe_purpose == "REFERENCE":
+                self.reference_servo_jacobian = self.dual_servo.jacobian.copy()
+            self.servo_from_cache = self.probe_purpose != "REFERENCE"
+            self.get_logger().info(
+                "dual-feature probe accepted: "
+                f"purpose={self.probe_purpose}, "
+                f"singular_values={health['singular_values']}, "
+                f"condition={health['condition']:.2f}, "
+                f"J={self.dual_servo.jacobian.tolist()}"
+            )
+            feature = self._feature()
+            if feature is None or not self._feature_retains_physical_edges(feature):
+                self._rollback("feature invalid after dual-feature probing")
+                return
+            if self.probe_purpose == "REFERENCE":
+                if not self._feature_controlled(feature):
+                    self._fail(
+                        "reference probe finished outside the configured "
+                        "x/length operating band; realign the initial pose"
+                    )
+                    return
+                self._issue_micro_rotation()
+            else:
+                self._issue_servo()
             return
         try:
             self.servo.choose_axis(self.probe_sensitivities)
@@ -1534,33 +2150,70 @@ class SeedCollectionNode(Node):
         if feature is None or current is None:
             self._rollback("servo input unavailable")
             return
-        if abs(feature.x_mid) <= self._centering_tolerance():
+        if (
+            self.servo_controller == "broyden_dual"
+            and not self._feature_retains_physical_edges(feature)
+        ):
+            self._rollback("dual-feature servo input failed the edge-identity guard")
+            return
+        if self._feature_controlled(feature):
             self._continue_after_centered(feature)
             return
-        step = self.servo.correction(feature.x_mid)
-        self.get_logger().info(
-            "translation servo: "
-            f"x_mid={1000.0 * feature.x_mid:.2f} mm, "
-            f"axis={self.servo.axis}, "
-            f"sensitivity={self.servo.sensitivity:.4f}, "
-            f"step={1000.0 * step:.2f} mm, "
-            f"iteration={self.servo_iterations + 1}/"
-            f"{self.maximum_servo_iterations}"
-        )
-        local = np.zeros(3)
-        local[self.servo.axis] = step
+        if self.servo_controller == "broyden_dual":
+            error = self._dual_feature_error(feature)
+            try:
+                local = self.dual_servo.correction(error)
+            except RuntimeError as exception:
+                self._rollback(str(exception))
+                return
+            health = self.dual_servo.health()
+            self.get_logger().info(
+                "dual-feature servo: "
+                f"x_mid={1000.0 * feature.x_mid:.2f} mm, "
+                f"length={1000.0 * feature.profile_length:.2f} mm, "
+                f"error=[{1000.0 * error[0]:.2f},"
+                f"{1000.0 * error[1]:.2f}] mm, "
+                f"local_step_mm={(1000.0 * local).round(3).tolist()}, "
+                f"condition={health['condition']:.2f}, "
+                f"iteration={self.servo_iterations + 1}/"
+                f"{self.maximum_servo_iterations}"
+            )
+            measurement_transform = self._measurement_transform()
+            if measurement_transform is None:
+                measurement_transform = current
+            self.servo_previous_feature_vector = self._dual_feature_vector(feature)
+            self.servo_previous_measurement_transform = measurement_transform.copy()
+            self.servo_previous_command = local.copy()
+        else:
+            step = self.servo.correction(feature.x_mid)
+            self.get_logger().info(
+                "translation servo: "
+                f"x_mid={1000.0 * feature.x_mid:.2f} mm, "
+                f"axis={self.servo.axis}, "
+                f"sensitivity={self.servo.sensitivity:.4f}, "
+                f"step={1000.0 * step:.2f} mm, "
+                f"iteration={self.servo_iterations + 1}/"
+                f"{self.maximum_servo_iterations}"
+            )
+            local = np.zeros(3)
+            local[self.servo.axis] = step
+            self.servo_previous_x = feature.x_mid
+            self.servo_previous_step = step
         target = current.copy()
         target[:3, 3] += current[:3, :3] @ local
-        self.servo_previous_x = feature.x_mid
-        self.servo_previous_step = step
         self.servo_iterations += 1
         if not self._command_transform(target, "SERVO"):
             self._rollback("servo IK failure")
 
     def _after_servo(self) -> None:
         feature = self._feature()
-        if feature is None or not feature.safe:
+        observation_valid = bool(feature is not None and feature.safe)
+        if self.servo_controller == "broyden_dual":
+            observation_valid = self._feature_retains_physical_edges(feature)
+        if not observation_valid:
             if (
+                self.servo_controller == "legacy"
+                and
                 self.servo_from_cache
                 and not self.servo_reprobe_attempted
                 and self.last_valid_joints is not None
@@ -1580,6 +2233,60 @@ class SeedCollectionNode(Node):
                 return
             self._rollback("servo left the safe bilateral region")
             return
+        if self.servo_controller == "broyden_dual":
+            measured_transform = self._measurement_transform()
+            if measured_transform is None:
+                measured_transform = self._current_transform()
+            if (
+                measured_transform is None
+                or self.servo_previous_measurement_transform is None
+                or self.servo_previous_feature_vector is None
+            ):
+                self._rollback("measured motion unavailable for Broyden update")
+                return
+            previous = self.servo_previous_measurement_transform
+            actual_local = previous[:3, :3].T @ (
+                measured_transform[:3, 3] - previous[:3, 3]
+            )
+            measured_delta = (
+                self._dual_feature_vector(feature)
+                - self.servo_previous_feature_vector
+            )
+            self.servo_last_update_accepted = self.dual_servo.update(
+                actual_local, measured_delta
+            )
+            self.get_logger().info(
+                "dual-feature model update: "
+                f"accepted={self.servo_last_update_accepted}, "
+                f"reason={self.dual_servo.last_update_reason}, "
+                f"actual_step_mm={(1000.0 * actual_local).round(3).tolist()}, "
+                "model_error_ratio="
+                + (
+                    f"{self.dual_servo.last_model_error_ratio:.3f}"
+                    if np.isfinite(self.dual_servo.last_model_error_ratio)
+                    else "n/a"
+                )
+            )
+            self.last_valid_joints = self.latest_joints.copy()
+            self._remember_last_valid(feature)
+            if (
+                not self.servo_last_update_accepted
+                and self.dual_servo.rejected_update_count
+                >= self.maximum_rejected_servo_updates
+                and not self.servo_reprobe_attempted
+            ):
+                self.get_logger().warning(
+                    "dual-feature model rejected repeated measured updates; "
+                    "re-probing locally"
+                )
+                self.servo_reprobe_attempted = True
+                self._begin_probing(feature, purpose="BRANCH")
+                return
+            if self._feature_controlled(feature):
+                self._continue_after_centered(feature)
+            else:
+                self._issue_servo()
+            return
         self.servo.update(
             feature.x_mid - self.servo_previous_x, self.servo_previous_step
         )
@@ -1587,7 +2294,7 @@ class SeedCollectionNode(Node):
         self.learned_servo_sensitivity = self.servo.sensitivity
         self.last_valid_joints = self.latest_joints.copy()
         self._remember_last_valid(feature)
-        if abs(feature.x_mid) <= self._centering_tolerance():
+        if self._feature_controlled(feature):
             self._continue_after_centered(feature)
         else:
             self._issue_servo()
@@ -1639,6 +2346,10 @@ class SeedCollectionNode(Node):
                 maximum_abs_x_mid_m=self.preflight_maximum_abs_x_mid,
                 minimum_domain_margin_m=self.preflight_minimum_margin,
             )
+            if self.servo_controller == "broyden_dual":
+                accepted = bool(
+                    accepted and self._feature_retains_physical_edges(feature)
+                )
             self.preflight_results.append(
                 {
                     "name": target.name,
@@ -1660,6 +2371,7 @@ class SeedCollectionNode(Node):
         if self.stage_index + 1 < len(target.stages):
             self.stage_index += 1
             self.accumulated_angle = 0.0
+            self._reset_rotation_feedforward_model()
             self._issue_micro_rotation()
             return
         if not self._begin_seed_capture(target.name, "TARGET"):
@@ -1689,12 +2401,19 @@ class SeedCollectionNode(Node):
             self.preflight_index += 1
             self._return_reference()
             return
+        if np.linalg.norm(self.pending_rotation_feedforward) > 1e-9:
+            self.get_logger().warning(
+                "measured guard rejected a feedforward-assisted step; "
+                "discarding the rotation disturbance model before retry"
+            )
+            self._reset_rotation_feedforward_model()
         self.failure_count += 1
         self.rotation_step = max(self.rotation_step / 2.0, self.rotation_step_minimum)
-        self.get_logger().warning(
-            f"{reason}; rollback, rotation step={np.rad2deg(self.rotation_step):.2f} deg"
-        )
         if self.failure_count >= self.maximum_target_failures:
+            self.get_logger().warning(
+                f"{reason}; target failure limit reached "
+                f"({self.failure_count}/{self.maximum_target_failures})"
+            )
             partial_angle = self._last_valid_relative_rotation()
             if partial_angle >= self.minimum_partial_rotation:
                 self.pending_partial_label = (
@@ -1724,6 +2443,10 @@ class SeedCollectionNode(Node):
             self.target_index += 1
             self._return_reference()
             return
+        self.get_logger().warning(
+            f"{reason}; rollback, next rotation step="
+            f"{np.rad2deg(self.rotation_step):.2f} deg"
+        )
         if self.last_valid_joints is None:
             self._fail("no valid rollback pose")
             return
@@ -1736,7 +2459,13 @@ class SeedCollectionNode(Node):
 
     def _after_rollback(self) -> None:
         feature = self._feature()
-        if feature is None or not feature.safe:
+        observation_valid = bool(feature is not None and feature.safe)
+        if (
+            self.collection_phase != "PREFLIGHT"
+            and self.servo_controller == "broyden_dual"
+        ):
+            observation_valid = self._feature_retains_physical_edges(feature)
+        if not observation_valid:
             if (
                 self.collection_phase != "PREFLIGHT"
                 and self.reference_joints is not None
@@ -1753,6 +2482,17 @@ class SeedCollectionNode(Node):
             self._fail("rollback did not restore bilateral visibility")
             return
         self._publish_detection_control("PREDICTION_COMMIT")
+        if (
+            self.collection_phase != "PREFLIGHT"
+            and self.servo_controller == "broyden_dual"
+            and not self._feature_controlled(feature)
+        ):
+            self.get_logger().warning(
+                "rollback restored the intended edges outside the soft "
+                "x/length band; re-probing before another correction"
+            )
+            self._begin_probing(feature, purpose="BRANCH")
+            return
         self._issue_micro_rotation()
 
     def _after_rollback_reference_recovery(self) -> None:
@@ -1802,6 +2542,10 @@ class SeedCollectionNode(Node):
                 feature,
                 maximum_abs_x_mid_m=self.x_tolerance,
                 minimum_domain_margin_m=self.minimum_seed_domain_margin,
+            )
+            or (
+                self.servo_controller == "broyden_dual"
+                and not self._feature_controlled(feature)
             )
         ):
             self.get_logger().warning(
@@ -1877,6 +2621,16 @@ class SeedCollectionNode(Node):
         if not feature.safe:
             self._count_seed_capture_event("unsafe_feature_frames")
             return
+        if (
+            self.collection_mode == "automatic"
+            and self.servo_controller == "broyden_dual"
+        ):
+            if not self._feature_retains_physical_edges(feature):
+                self._count_seed_capture_event("wrong_edge_feature_frames")
+                return
+            if not self._feature_controlled(feature):
+                self._count_seed_capture_event("uncontrolled_feature_frames")
+                return
         self.seed_capture_frames.append(
             {
                 "R_BF": self.latest_measurement_transform[:3, :3].copy(),
@@ -1906,6 +2660,8 @@ class SeedCollectionNode(Node):
             "short_surface_frames": 0,
             "invalid_feature_frames": 0,
             "unsafe_feature_frames": 0,
+            "wrong_edge_feature_frames": 0,
+            "uncontrolled_feature_frames": 0,
             "accepted_frames": 0,
         }
 
@@ -1929,6 +2685,8 @@ class SeedCollectionNode(Node):
             f"surface_short={counts.get('short_surface_frames', 0)},"
             f"feature_invalid={counts.get('invalid_feature_frames', 0)},"
             f"feature_unsafe={counts.get('unsafe_feature_frames', 0)},"
+            f"feature_wrong_edge={counts.get('wrong_edge_feature_frames', 0)},"
+            f"feature_uncontrolled={counts.get('uncontrolled_feature_frames', 0)},"
             f"accepted={counts.get('accepted_frames', 0)}"
         )
 

@@ -262,13 +262,13 @@ def plot_fig15(pose_points: Sequence[np.ndarray], r_ref: float, out_path: Path):
     """
     Comprehensive single-scanner validation figure.
 
-    (a) Seven independent validation poses:
+    (a) Independent validation poses:
         reconstructed sphere scans + fitted radius/center.
 
     (b) Pose-wise quantitative comparison:
         absolute radius error |Δr_k| with ±σ_k radial-dispersion error bars.
 
-    (c) All seven poses merged:
+    (c) All poses merged:
         each reconstructed point is colored by its radial error relative to
         the REFERENCE sphere radius,
 
@@ -283,8 +283,8 @@ def plot_fig15(pose_points: Sequence[np.ndarray], r_ref: float, out_path: Path):
         RMSE_e = sqrt(mean(e_j^2))
     """
     n = len(pose_points)
-    if n != 7:
-        raise ValueError(f"Expected exactly 7 validation poses, got {n}.")
+    if n < 4:
+        raise ValueError(f"Expected at least 4 validation poses, got {n}.")
 
     fits = [fit_sphere(p) for p in pose_points]
 
@@ -309,7 +309,7 @@ def plot_fig15(pose_points: Sequence[np.ndarray], r_ref: float, out_path: Path):
     )
 
     # ------------------------------------------------------------------
-    # (a) Seven independent validation poses
+    # (a) Independent validation poses
     # ------------------------------------------------------------------
     for i, (pts, fit) in enumerate(zip(pose_points, fits)):
         ax = fig.add_subplot(gs[0, i])
@@ -336,7 +336,7 @@ def plot_fig15(pose_points: Sequence[np.ndarray], r_ref: float, out_path: Path):
     # Label for panel (a)
     fig.text(
         0.015, 0.965,
-        "(a) Reconstructed sphere under seven independent validation poses",
+        f"(a) Reconstructed sphere under {n} independent validation poses",
         fontsize=11, weight="bold", va="top"
     )
 
@@ -345,7 +345,7 @@ def plot_fig15(pose_points: Sequence[np.ndarray], r_ref: float, out_path: Path):
     # ------------------------------------------------------------------
     axb = fig.add_subplot(gs[1, :])
 
-    x = np.arange(1, 8)
+    x = np.arange(1, n + 1)
     radius_error_abs = np.array([abs(f.radius - r_ref) for f in fits])
     sigma_pose = np.array([f.sigma for f in fits])
 
@@ -556,7 +556,7 @@ def plot_fig16(scanner_pose_points: Dict[str, Sequence[np.ndarray]],
 
 def find_pose_files(scanner_dir: Path) -> List[Path]:
     files = []
-    for i in range(1, 8):
+    for i in range(1, 1000):
         candidates = []
         for ext in (".csv", ".txt", ".npy"):
             candidates += [
@@ -567,11 +567,13 @@ def find_pose_files(scanner_dir: Path) -> List[Path]:
             ]
         found = [p for p in candidates if p.exists()]
         if not found:
-            raise FileNotFoundError(
-                f"Cannot find pose {i} under {scanner_dir}. "
-                "Expected pose1.csv ... pose7.csv (or txt/npy)."
-            )
+            break
         files.append(found[0])
+    if len(files) < 4:
+        raise FileNotFoundError(
+            f"Found only {len(files)} contiguous pose files under {scanner_dir}; "
+            "at least pose1 ... pose4 are required."
+        )
     return files
 
 
@@ -595,7 +597,7 @@ def load_dataset(root: Path) -> Dict[str, List[np.ndarray]]:
     if not data:
         raise RuntimeError(
             f"No scanner datasets found under {root}. "
-            "Expected scanner1/pose1.csv ... pose7.csv."
+            "Expected at least scanner1/pose1.csv ... pose4.csv."
         )
     return data
 
@@ -645,7 +647,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--root", type=Path, default=Path("validation"),
-        help="Validation data root. For a single scanner, provide pose1..pose7 under this directory or under one scanner subfolder."
+        help="Validation data root. Provide at least four contiguous pose files under this directory or one scanner subfolder."
     )
     ap.add_argument(
         "--out", type=Path, default=Path("validation_figures"),
@@ -695,7 +697,7 @@ def main():
             f"sigma_fit={fit.sigma:.6f} mm\n"
         )
 
-    report_lines.append("\n[All 7 poses combined]\n")
+    report_lines.append(f"\n[All {len(pose_points)} poses combined]\n")
     report_lines.append(
         f"center=({fit_all.center[0]:.6f}, {fit_all.center[1]:.6f}, {fit_all.center[2]:.6f}) mm\n"
     )

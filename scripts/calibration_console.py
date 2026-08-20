@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -44,6 +44,46 @@ VALIDATED_NOISE_BASELINE = {
 }
 SHARED_SHAPE_VALIDATED_FLATNESS_RMS_M = 0.0005
 
+# One continuous MCAP spans manual alignment, all seed micro-motions,
+# stationary batches, NBV planning/execution, rollback and final convergence.
+# Raw and metric profiles are both retained deliberately: the former audits
+# the hardware adapter and the latter can be replayed directly through the
+# deployed endpoint detector.  Zstd keeps this complete record tractable.
+FULL_RUN_RECORD_TOPICS = (
+    "/gocator/profile_raw_mm",
+    "/gocator/profile",
+    "/fanuc/joint_states_raw",
+    "/joint_states",
+    "/calibration/flange_pose",
+    "/calibration/endpoints",
+    "/calibration/target_surface_points",
+    "/calibration/detection_guide",
+    "/calibration/detection_control",
+    "/calibration/detection_prior",
+    "/calibration/detection_measured_prior",
+    "/calibration/seed_motion_state",
+    "/profile_endpoint_detector/diagnostics",
+    "/joint_trajectory_controller/follow_joint_trajectory/_action/feedback",
+    "/joint_trajectory_controller/follow_joint_trajectory/_action/status",
+    "/joint_trajectory_controller/controller_state",
+    "/move_group/display_planned_path",
+    "/planning_scene",
+    "/rosout",
+    "/parameter_events",
+    "/tf",
+    "/tf_static",
+    "/clock",
+)
+
+RUN_STATUS_SERVICES = (
+    "/fanuc_motion_bridge/status",
+    "/fanuc_joint_state/status",
+    "/gocator_metric_adapter/status",
+    "/measurement_sync/status",
+    "/profile_endpoint_detector/status",
+    "/scene_publisher/noise_status",
+)
+
 STATE_NAMES = {
     "WAIT_MANUAL_INIT": "等待人工设置初始位姿",
     "MOVING": "机器人运动中",
@@ -68,18 +108,14 @@ TARGET_NAMES = {
     "rx_negative": "绕局部 X 轴负向",
     "ry_positive": "绕局部 Y 轴正向",
     "ry_negative": "绕局部 Y 轴负向",
-    "rx_positive_half": "绕局部 X 轴正向 2.5°",
-    "rx_negative_half": "绕局部 X 轴负向 2.5°",
-    "ry_positive_half": "绕局部 Y 轴正向 2.5°",
-    "ry_negative_half": "绕局部 Y 轴负向 2.5°",
+    "rx_positive_half": "绕局部 X 轴正向半幅",
+    "rx_negative_half": "绕局部 X 轴负向半幅",
+    "ry_positive_half": "绕局部 Y 轴正向半幅",
+    "ry_negative_half": "绕局部 Y 轴负向半幅",
     "rx_ry_positive": "绕局部 X/Y 轴组合",
     "rx_ry_opposite": "绕局部 X 正向/Y 负向补采",
     "rx_negative_ry_positive": "绕局部 X 负向/Y 正向补采",
     "rx_ry_negative": "绕局部 X/Y 负向补采",
-    "ry_rx_positive": "绕局部 Y/X 正向补采",
-    "ry_positive_rx_negative": "绕局部 Y 正向/X 负向补采",
-    "ry_negative_rx_positive": "绕局部 Y 负向/X 正向补采",
-    "ry_rx_negative": "绕局部 Y/X 负向补采",
     "preflight_rx_negative": "预检：局部 X 轴负向 2°",
     "preflight_rx_positive": "预检：局部 X 轴正向 2°",
     "preflight_ry_negative": "预检：局部 Y 轴负向 2°",
@@ -94,7 +130,7 @@ INITIAL_REASON_NAMES = {
     "x_mid": "|x_mid| 超过 30 mm",
     "z_mid": "工作深度应在 300–550 mm",
     "domain_margin": "安全余量不足 20 mm",
-    "profile_length": "轮廓长度应在 50–250 mm",
+    "profile_length": "轮廓长度未进入当前配置的初始安全范围",
     "absolute_endpoint_depth_delta": "应满足 |z(e2)-z(e1)| ≥ 15 mm",
     "joint_margin": "关节限位余量不足 5%",
     "local_ik": "局部 ±X/±Y 的 2° IK 覆盖不足",
@@ -233,13 +269,23 @@ def wait_for_service(service: str, process: "ManagedNode", timeout: float = 20.0
 class ManagedNode:
     """Own one ROS child process and continuously drain its output to a log."""
 
-    def __init__(self, name: str, arguments: list[str], log_file: Path) -> None:
+    def __init__(
+        self,
+        name: str,
+        arguments: list[str],
+        log_file: Path,
+        *,
+        interrupt_timeout_s: float = 5.0,
+        terminate_timeout_s: float = 3.0,
+    ) -> None:
         self.name = name
         self.arguments = arguments
         self.log_file = log_file
         self.process: subprocess.Popen | None = None
         self.recent_lines: deque[str] = deque(maxlen=30)
         self._thread: threading.Thread | None = None
+        self.interrupt_timeout_s = float(interrupt_timeout_s)
+        self.terminate_timeout_s = float(terminate_timeout_s)
 
     def start(self) -> None:
         self.log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -276,12 +322,12 @@ class ManagedNode:
             return
         try:
             os.killpg(self.process.pid, signal.SIGINT)
-            self.process.wait(timeout=5.0)
+            self.process.wait(timeout=self.interrupt_timeout_s)
         except (ProcessLookupError, subprocess.TimeoutExpired):
             if self.process.poll() is None:
                 try:
                     os.killpg(self.process.pid, signal.SIGTERM)
-                    self.process.wait(timeout=3.0)
+                    self.process.wait(timeout=self.terminate_timeout_s)
                 except (ProcessLookupError, subprocess.TimeoutExpired):
                     if self.process.poll() is None:
                         os.killpg(self.process.pid, signal.SIGKILL)
@@ -324,6 +370,163 @@ class CalibrationConsole:
         child.stop()
         if child in self.children:
             self.children.remove(child)
+
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _runtime_status_snapshot() -> dict[str, object]:
+        available = ros_list("service")
+        snapshot: dict[str, object] = {}
+        for service in RUN_STATUS_SERVICES:
+            if service not in available:
+                continue
+            success, message = call_trigger(service, timeout=3.0)
+            try:
+                payload: object = json.loads(message)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = message
+            snapshot[service] = {"success": success, "payload": payload}
+        return snapshot
+
+    def _start_run_recorder(
+        self, run_directory: Path, *, workflow: str
+    ) -> ManagedNode | None:
+        """Start one lossless timeline before either calibration phase.
+
+        Recording is fail-closed for a new experiment: moving real hardware
+        without the requested evidence would recreate the diagnosis gap this
+        recorder is intended to remove.
+        """
+        bag_directory = run_directory / "full_run_bag"
+        manifest_file = run_directory / "recording_manifest.json"
+        manifest = {
+            "schema_version": 1,
+            "backend": self.backend,
+            "workflow": workflow,
+            "started_utc": self._utc_timestamp(),
+            "bag_directory": bag_directory.name,
+            "storage_id": "mcap",
+            "storage_preset": "zstd_fast",
+            "topics": list(FULL_RUN_RECORD_TOPICS),
+            "status": "starting",
+        }
+        manifest_file.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        for source, destination_name in (
+            (PARAM_FILE, "calibration_parameters.yaml"),
+            (REAL_PARAM_FILE, "real_calibration_parameters.yaml"),
+        ):
+            if source.exists() and (self.backend == "real" or source == PARAM_FILE):
+                (run_directory / destination_name).write_text(
+                    source.read_text(encoding="utf-8"), encoding="utf-8"
+                )
+
+        command = [
+            "ros2",
+            "bag",
+            "record",
+            "--output",
+            str(bag_directory),
+            "--storage",
+            "mcap",
+            "--storage-preset-profile",
+            "zstd_fast",
+            "--disable-keyboard-controls",
+            "--max-cache-size",
+            "33554432",
+            "--custom-data",
+            f"backend={self.backend}",
+            f"workflow={workflow}",
+            "--topics",
+            *FULL_RUN_RECORD_TOPICS,
+        ]
+        recorder = ManagedNode(
+            "全过程数据记录器",
+            command,
+            run_directory / "full_run_recording.log",
+            interrupt_timeout_s=60.0,
+            terminate_timeout_s=10.0,
+        )
+        recorder.start()
+        self.children.append(recorder)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if recorder.poll() is not None:
+                break
+            if bag_directory.exists() or any(
+                "Recording..." in line for line in recorder.recent_lines
+            ):
+                manifest["status"] = "recording"
+                manifest["runtime_status_start"] = self._runtime_status_snapshot()
+                manifest_file.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                print(f"全过程数据记录已启动：{bag_directory}")
+                return recorder
+            time.sleep(0.1)
+
+        print("全过程数据记录器启动失败；为避免无记录运行，本次流程未开始。")
+        tail = recorder.tail()
+        if tail:
+            print(tail)
+        self._stop_node(recorder)
+        manifest["status"] = "start_failed"
+        manifest["ended_utc"] = self._utc_timestamp()
+        manifest_file.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return None
+
+    def _stop_run_recorder(
+        self, recorder: ManagedNode, run_directory: Path
+    ) -> None:
+        """Flush MCAP, validate its index, and leave a machine-readable manifest."""
+        bag_directory = run_directory / "full_run_bag"
+        manifest_file = run_directory / "recording_manifest.json"
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+        manifest["runtime_status_end"] = self._runtime_status_snapshot()
+        self._stop_node(recorder)
+        manifest["ended_utc"] = self._utc_timestamp()
+        manifest["recorder_exit_code"] = recorder.poll()
+        metadata_file = bag_directory / "metadata.yaml"
+        manifest["metadata_present"] = metadata_file.exists()
+        bag_info_file = run_directory / "full_run_bag_info.txt"
+        bag_valid = False
+        if metadata_file.exists():
+            try:
+                result = run_command(
+                    ["ros2", "bag", "info", str(bag_directory)],
+                    timeout=30.0,
+                )
+                bag_info_file.write_text(result.stdout, encoding="utf-8")
+                bag_valid = result.returncode == 0
+            except subprocess.TimeoutExpired:
+                bag_info_file.write_text(
+                    "ros2 bag info timed out after 30 seconds\n", encoding="utf-8"
+                )
+        manifest["bag_valid"] = bag_valid
+        if bag_valid:
+            manifest["status"] = "finalized"
+            print(f"全过程数据记录已保存并通过索引检查：{bag_directory}")
+        else:
+            manifest["status"] = "finalization_failed"
+            print(
+                "警告：全过程数据记录未通过完整性检查，请查看："
+                f"{recorder.log_file}"
+            )
+        manifest_file.write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
     def verify_simulation(self) -> bool:
         print("\n[环境检查] 正在检查 Gazebo、MoveIt 和轮廓仿真……")
@@ -606,16 +809,57 @@ class CalibrationConsole:
         destination.mkdir(parents=True)
         return destination
 
-    def run_new(self, mode: str) -> None:
+    def run_new(self, mode: str, *, diagnostic_target: str = "") -> None:
         run_directory = self.make_run_directory()
         seed_file = run_directory / "seeds.json"
         result_file = run_directory / "calibration_result.json"
         print(f"\n本次运行目录：{run_directory}")
         preflight_mode = (
-            ask_preflight_mode() if mode == "automatic" else "off"
+            "off"
+            if diagnostic_target
+            else (ask_preflight_mode() if mode == "automatic" else "off")
         )
-        seed_node = self._start_seed_node(
-            mode, seed_file, run_directory, preflight_mode
+        if diagnostic_target:
+            print("单分支诊断固定跳过独立动态预检，以隔离双特征伺服效果。")
+        recorder = self._start_run_recorder(
+            run_directory,
+            workflow=(
+                f"seed_servo_diagnostic_{diagnostic_target}"
+                if diagnostic_target
+                else f"new_{mode}"
+            ),
+        )
+        if recorder is None:
+            return
+        try:
+            self._run_new_pipeline(
+                mode,
+                seed_file,
+                result_file,
+                run_directory,
+                preflight_mode,
+                diagnostic_target=diagnostic_target,
+            )
+        finally:
+            self._stop_run_recorder(recorder, run_directory)
+
+    def _run_new_pipeline(
+        self,
+        mode: str,
+        seed_file: Path,
+        result_file: Path,
+        run_directory: Path,
+        preflight_mode: str,
+        *,
+        diagnostic_target: str = "",
+    ) -> None:
+        seed_arguments = (mode, seed_file, run_directory, preflight_mode)
+        seed_node = (
+            self._start_seed_node(
+                *seed_arguments, diagnostic_target=diagnostic_target
+            )
+            if diagnostic_target
+            else self._start_seed_node(*seed_arguments)
         )
         real_motion_armed = False
         try:
@@ -636,7 +880,12 @@ class CalibrationConsole:
             if mode == "automatic":
                 if self.backend == "real":
                     self._print_motion_safety()
-                if not ask_yes_no("确认开始自动采集 6 个种子位姿？", default=True):
+                prompt = (
+                    "确认开始参考位姿 + Ry 正向单分支伺服验证？"
+                    if diagnostic_target
+                    else "确认开始自动采集 6 个种子位姿？"
+                )
+                if not ask_yes_no(prompt, default=True):
                     print("已取消种子采集。")
                     return
                 if self.backend == "real":
@@ -672,14 +921,19 @@ class CalibrationConsole:
             print("没有生成种子文件，流程结束。")
             return
         self._print_seed_summary(seed_file)
-        if self.backend == "real":
-            # NBV 安全验收已通过：真机允许进入主动标定，但保留运动安全确认。
+        if diagnostic_target:
             print(
-                "真机种子数据采集完成；NBV 执行已通过安全验收，"
-                "继续前请确认以下条件。"
+                "双特征伺服单分支验证完成；本次只生成参考位姿和 "
+                f"{diagnostic_target}，不会启动标定解算或 NBV。"
+            )
+            return
+        if self.backend == "real":
+            print(
+                "真机种子数据采集完成，运动桥已自动撤防。"
+                "进入 NBV 前将重新执行安全确认和解锁。"
             )
             self._print_motion_safety()
-            if not ask_yes_no("真机自动运动仍处于解锁状态，确认开始主动标定？", default=False):
+            if not ask_yes_no("确认重新解锁并开始主动标定？", default=False):
                 print(f"已保留种子文件：{seed_file}")
                 return
             maximum_nbv = ask_integer(
@@ -688,7 +942,14 @@ class CalibrationConsole:
                 minimum=0,
                 maximum=20,
             )
-            self._run_active(seed_file, result_file, run_directory, maximum_nbv)
+            if not self._arm_real_motion():
+                return
+            try:
+                self._run_active(
+                    seed_file, result_file, run_directory, maximum_nbv
+                )
+            finally:
+                self._disarm_real_motion()
             return
         if not ask_yes_no("种子采集完成，确认开始主动标定？", default=True):
             print(f"已保留种子文件：{seed_file}")
@@ -707,6 +968,8 @@ class CalibrationConsole:
         seed_file: Path,
         run_directory: Path,
         preflight_mode: str,
+        *,
+        diagnostic_target: str = "",
     ) -> ManagedNode:
         command = [
             "ros2",
@@ -722,6 +985,11 @@ class CalibrationConsole:
             "-p",
             f"seed.preflight.mode:='{preflight_mode}'",
         ]
+        if diagnostic_target:
+            command += [
+                "-p",
+                f"seed.debug.single_target_name:='{diagnostic_target}'",
+            ]
         print(
             "\n[种子节点] "
             + ("自动采集模式" if mode == "automatic" else "人工采集模式")
@@ -846,6 +1114,11 @@ class CalibrationConsole:
         )
         if fields.get("initial_ready") == "true":
             print("  初始工作包络：通过")
+            if fields.get("servo_controller") == "broyden_dual":
+                print(
+                    "  双特征伺服：初始断点间距目标带 "
+                    f"{fields.get('servo_length_band_mm', '70.0-90.0')} mm"
+                )
             return
         reason_codes = fields.get("initial_reasons", "").split(",")
         reason_names = dict(INITIAL_REASON_NAMES)
@@ -863,9 +1136,14 @@ class CalibrationConsole:
                 if self.backend == "real"
                 else "让 z_mid 接近 400–450 mm"
             )
+            chord_advice = (
+                "、断点间距对齐到紫色 80 mm 期望线"
+                if self.backend == "real"
+                else ""
+            )
             print(
                 "  调整建议：一次只做小幅移动并刷新，优先让双边进入安全域，"
-                f"再{depth_advice}、x_mid 接近 0；"
+                f"再{depth_advice}、x_mid 接近 0{chord_advice}；"
                 "|Δz| 太小时只需增大腕部倾斜，方向正负均可。"
             )
 
@@ -927,9 +1205,12 @@ class CalibrationConsole:
             last_status_at = time.monotonic()
             count_text = fields.get("seeds", "0/6")
             try:
-                count = int(count_text.split("/", 1)[0])
+                count_part, total_part = count_text.split("/", 1)
+                count = int(count_part)
+                total = int(total_part)
             except ValueError:
                 count = 0
+                total = 6
             target = fields.get("target", "?")
             target_cn = TARGET_NAMES.get(target.replace("_partial", ""), target)
             if target.endswith("_partial"):
@@ -937,6 +1218,13 @@ class CalibrationConsole:
             state = fields.get("state", "?")
             state_cn = STATE_NAMES.get(state, state)
             rotation = fields.get("rotation_deg", "?")
+            rotation_step = fields.get("rotation_step_deg", "?")
+            feedforward_samples = fields.get(
+                "rotation_feedforward_samples", "0"
+            )
+            feedforward_norm = fields.get(
+                "rotation_feedforward_norm_mm", "0"
+            )
             target_failures = fields.get("target_failures", "0/3")
             preflight = fields.get("preflight", "0/4")
             preflight_mode = fields.get("preflight_mode", "?")
@@ -949,8 +1237,10 @@ class CalibrationConsole:
             seed_batch = fields.get("seed_batch", "0/?")
             elapsed = time.monotonic() - started_at
             line = (
-                f"[自动种子] {progress_bar(count, 6)} {count_text} | "
-                f"{target_cn} | {state_cn} | 旋转 {rotation}° | "
+                f"[自动种子] {progress_bar(count, total)} {count_text} | "
+                f"{target_cn} | {state_cn} | 旋转 {rotation}° "
+                f"(步长{rotation_step}°，前馈{feedforward_samples}次/"
+                f"{feedforward_norm}mm) | "
                 f"定点帧 {seed_batch} | "
                 f"预检 {preflight_text} | 本目标失败 {target_failures} | "
                 f"已用 {elapsed:.0f}s"
@@ -958,7 +1248,9 @@ class CalibrationConsole:
             print("\r" + line.ljust(150), end="", flush=True)
             if count != previous_count and count > 0:
                 print()
-                print(f"  ✓ 第 {count}/6 个种子已通过双边与旋转多样性检查")
+                print(
+                    f"  ✓ 第 {count}/{total} 个种子已通过双边与旋转多样性检查"
+                )
             elif target != previous_target and previous_target:
                 print()
             previous_count = count
@@ -1122,13 +1414,27 @@ class CalibrationConsole:
         )
         run_directory = self.make_run_directory()
         result_file = run_directory / "calibration_result.json"
-        self._run_active(
-            seed_file,
-            result_file,
+        print(f"\n本次运行目录：{run_directory}")
+        recorder = self._start_run_recorder(
             run_directory,
-            maximum_nbv,
-            initialization_only=initialization_only,
+            workflow=(
+                "existing_seed_initialization"
+                if initialization_only
+                else "existing_seed_nbv"
+            ),
         )
+        if recorder is None:
+            return
+        try:
+            self._run_active(
+                seed_file,
+                result_file,
+                run_directory,
+                maximum_nbv,
+                initialization_only=initialization_only,
+            )
+        finally:
+            self._stop_run_recorder(recorder, run_directory)
 
     @staticmethod
     def _latest_seed_file() -> Path:
@@ -1309,6 +1615,21 @@ class CalibrationConsole:
                     f"RMS {float(record.get('surface_rms_mm', 0.0)):.4f} mm；"
                     f"最大绝对高度 "
                     f"{float(record.get('surface_maximum_mm', 0.0)):.4f} mm"
+                )
+            if record.get("initialization_method") == "flat_multistart":
+                candidates = record.get("initialization_candidates", [])
+                accepted = sum(
+                    1 for item in candidates if item.get("accepted", False)
+                )
+                print(
+                    "  │ 多初值平面预求解："
+                    f"{accepted}/{len(candidates)} 个满足平放约束；"
+                    f"选择 {record.get('selected_initialization')}；"
+                    f"平面cost={float(record.get('selected_flat_cost', 0.0)):.6g}；"
+                    "预解倾角="
+                    f"{float(record.get('selected_board_tilt_deg', 0.0)):.3f}°；"
+                    "联合解倾角="
+                    f"{float(record.get('board_tilt_deg', 0.0)):.3f}°"
                 )
             if "maximum_rotation_std_deg" in record:
                 print(
@@ -1491,6 +1812,7 @@ class CalibrationConsole:
             print("  4. 查看最近一次标定结果")
             if self.backend == "real":
                 print("  5. 使用精密球独立验证真机标定精度")
+                print("  6. 双特征伺服单分支验证（参考位姿 + Ry正向，不解算）")
             print("  0. 退出")
             choice = input("选择 [1]：").strip() or "1"
             if choice == "1":
@@ -1523,10 +1845,12 @@ class CalibrationConsole:
                 self.show_latest_result()
             elif choice == "5" and self.backend == "real":
                 self.run_sphere_validation()
+            elif choice == "6" and self.backend == "real":
+                self.run_new("automatic", diagnostic_target="ry_positive")
             elif choice == "0":
                 return 0
             else:
-                maximum = 5 if self.backend == "real" else 4
+                maximum = 6 if self.backend == "real" else 4
                 print(f"无效选择，请输入 0～{maximum}。")
                 continue
             if not ask_yes_no("返回主菜单？", default=False):

@@ -19,10 +19,11 @@ from .rotation_scheduler import (
     star_rotation_plan,
 )
 from .seed_observability import rotation_diversity
-from .translation_servo import TranslationServo
+from .translation_servo import BroydenDualFeatureServo, TranslationServo
 
 __all__ = [
     "BilateralFeature",
+    "BroydenDualFeatureServo",
     "EndpointTracker",
     "InitialPoseAssessment",
     "InitialPoseCriteria",

@@ -184,6 +184,8 @@ class ActiveCalibrationNode(Node):
         self.declare_parameter("settling_time_s", 0.75)
         self.declare_parameter("measurement_timeout_s", 5.0)
         self.declare_parameter("measurement.pose_source", "topic")
+        self.declare_parameter("measurement.pending_observation_buffer_size", 64)
+        self.declare_parameter("measurement.pending_pose_buffer_size", 512)
         self.declare_parameter("interfaces.joint_state_topic", "/joint_states")
         self.declare_parameter("interfaces.profile_topic", "/gocator/profile")
         self.declare_parameter(
@@ -247,6 +249,13 @@ class ActiveCalibrationNode(Node):
         self.declare_parameter("solver.surface_degree", 4)
         self.declare_parameter("solver.shape_scale_m", 0.0005)
         self.declare_parameter("solver.shape_regularization", 0.01)
+        self.declare_parameter("solver.multistart.enabled", False)
+        self.declare_parameter(
+            "solver.multistart.maximum_board_tilt_deg", 20.0
+        )
+        self.declare_parameter(
+            "solver.multistart.require_plausible", True
+        )
         self.declare_parameter("initial_validation.bootstrap_trials", 4)
         self.declare_parameter("initial_validation.held_out_frames_per_pose", 4)
         self.declare_parameter("initial_validation.random_seed", 20260728)
@@ -417,6 +426,19 @@ class ActiveCalibrationNode(Node):
         ).strip().lower()
         if self.pose_source not in {"topic", "tf"}:
             raise ValueError("measurement.pose_source must be topic or tf")
+        self.pending_observation_buffer_size = int(
+            self.get_parameter(
+                "measurement.pending_observation_buffer_size"
+            ).value
+        )
+        self.pending_pose_buffer_size = int(
+            self.get_parameter("measurement.pending_pose_buffer_size").value
+        )
+        if (
+            self.pending_observation_buffer_size < 1
+            or self.pending_pose_buffer_size < 1
+        ):
+            raise ValueError("measurement pending buffer sizes must be positive")
         self.roi = SensorROI(
             hard_domain=TrapezoidDomain(
                 *map(float, self.get_parameter("sensor.hard_trapezoid").value)
@@ -464,6 +486,19 @@ class ActiveCalibrationNode(Node):
             ),
             shape_regularization=float(
                 self.get_parameter("solver.shape_regularization").value
+            ),
+            multistart_enabled=bool(
+                self.get_parameter("solver.multistart.enabled").value
+            ),
+            multistart_maximum_board_tilt_deg=float(
+                self.get_parameter(
+                    "solver.multistart.maximum_board_tilt_deg"
+                ).value
+            ),
+            multistart_require_plausible=bool(
+                self.get_parameter(
+                    "solver.multistart.require_plausible"
+                ).value
             ),
         )
 
@@ -770,10 +805,11 @@ class ActiveCalibrationNode(Node):
         for pending in (
             self.pending_profiles,
             self.pending_endpoint_frames,
-            self.pending_flange_poses,
         ):
-            while len(pending) > 20:
+            while len(pending) > self.pending_observation_buffer_size:
                 pending.pop(next(iter(pending)))
+        while len(self.pending_flange_poses) > self.pending_pose_buffer_size:
+            self.pending_flange_poses.pop(next(iter(self.pending_flange_poses)))
 
     def _lookup_flange_transform(self, stamp) -> np.ndarray | None:
         try:
@@ -1058,6 +1094,28 @@ class ActiveCalibrationNode(Node):
                 f"surface_rms={1000.0 * result.diagnostics.surface_rms_m:.4f} mm, "
                 f"{truth_text}"
             )
+            diagnostics = result.diagnostics
+            if diagnostics.initialization_method == "flat_multistart":
+                final_board_tilt = self.solver._board_tilt_deg(
+                    result.estimate.board.rotation
+                )
+                candidate_text = ", ".join(
+                    (
+                        f"{item['name']}:cost={item['cost']},"
+                        f"tilt={item['board_tilt_deg']},"
+                        f"accepted={item['accepted']}"
+                    )
+                    for item in diagnostics.initialization_candidates
+                )
+                self.get_logger().info(
+                    "flat multi-start initialization: "
+                    f"selected={diagnostics.selected_initialization}, "
+                    f"flat_cost={diagnostics.selected_flat_cost:.6g}, "
+                    "board_tilt="
+                    f"{diagnostics.selected_board_tilt_deg:.3f} deg, "
+                    f"shared_board_tilt={final_board_tilt:.3f} deg; "
+                    f"candidates=[{candidate_text}]"
+                )
             stability = self.initial_stability_report
             if stability.available:
                 self.get_logger().info(
@@ -1631,9 +1689,11 @@ class ActiveCalibrationNode(Node):
             or wrapped.result.error_code != FollowJointTrajectory.Result.SUCCESSFUL
         ):
             self._publish_detection_control("PREDICTION_CANCEL")
+            error_text = str(getattr(wrapped.result, "error_string", "")).strip()
             self._fail(
                 f"trajectory execution failed: status={wrapped.status}, "
                 f"error={wrapped.result.error_code}"
+                + (f", reason={error_text}" if error_text else "")
             )
             return
         now = self.get_clock().now().nanoseconds
@@ -1939,10 +1999,26 @@ class ActiveCalibrationNode(Node):
             "handeye_rotation": result.estimate.handeye_rotation.tolist(),
             "handeye_translation_m": result.estimate.handeye_translation.tolist(),
             "board_corner_m": result.estimate.board.corner.tolist(),
+            "board_tilt_deg": self.solver._board_tilt_deg(
+                result.estimate.board.rotation
+            ),
             "surface_model": result.diagnostics.surface_model,
             "surface_rms_mm": 1000.0 * result.diagnostics.surface_rms_m,
             "surface_maximum_mm": 1000.0
             * result.diagnostics.surface_maximum_m,
+            "initialization_method": (
+                result.diagnostics.initialization_method
+            ),
+            "initialization_candidates": list(
+                result.diagnostics.initialization_candidates
+            ),
+            "selected_initialization": (
+                result.diagnostics.selected_initialization
+            ),
+            "selected_flat_cost": result.diagnostics.selected_flat_cost,
+            "selected_board_tilt_deg": (
+                result.diagnostics.selected_board_tilt_deg
+            ),
             "held_out_validation_score_mm": (
                 None
                 if self.pipeline is None
@@ -1993,6 +2069,13 @@ class ActiveCalibrationNode(Node):
                         "surface_degree": self.solver.surface_degree,
                         "shape_scale_m": self.solver.shape_scale_m,
                         "shape_regularization": self.solver.shape_regularization,
+                        "multistart_enabled": self.solver.multistart_enabled,
+                        "multistart_maximum_board_tilt_deg": (
+                            self.solver.multistart_maximum_board_tilt_deg
+                        ),
+                        "multistart_require_plausible": (
+                            self.solver.multistart_require_plausible
+                        ),
                     },
                     "seed_file": str(self.seed_file),
                     "nbv_measurement_batch_size": self.measurement_batch_size,
@@ -2120,9 +2203,12 @@ class ActiveCalibrationNode(Node):
             or wrapped.result.error_code
             != FollowJointTrajectory.Result.SUCCESSFUL
         ):
+            error_text = str(getattr(wrapped.result, "error_string", "")).strip()
             self._fail(
                 f"{self.pending_failure_reason}; rollback failed "
-                f"(status={wrapped.status}, error={wrapped.result.error_code})"
+                f"(status={wrapped.status}, error={wrapped.result.error_code}"
+                + (f", reason={error_text}" if error_text else "")
+                + ")"
             )
             return
         now = self.get_clock().now().nanoseconds

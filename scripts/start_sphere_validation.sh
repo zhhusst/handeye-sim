@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Run the independent precision-sphere experiment in the second terminal.
+# The default interactive choice is the manually stepped moving scan required
+# by evaluation method 2; pass --mode stationary for the legacy single-section
+# repeatability experiment.
 set -eo pipefail
 
 cd /workspace

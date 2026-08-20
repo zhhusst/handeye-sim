@@ -283,6 +283,14 @@ class SolverDiagnostics:
     prior_augmented_condition_number: float | None = None
     prior_augmented_effective_handeye_information: np.ndarray | None = None
     state_information: np.ndarray | None = None
+    # Optional diagnostics for the initial flat multi-start stage.  Rolling
+    # NBV updates provide an explicit previous estimate and therefore leave
+    # these fields at their defaults.
+    initialization_method: str = "single"
+    initialization_candidates: tuple[dict[str, object], ...] = ()
+    selected_initialization: str | None = None
+    selected_flat_cost: float | None = None
+    selected_board_tilt_deg: float | None = None
 
 
 @dataclass(frozen=True)

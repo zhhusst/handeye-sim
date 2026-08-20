@@ -261,6 +261,19 @@ def result_payload(result, *, extra: dict | None = None) -> dict:
                     else result.diagnostics.singular_values.tolist()
                 ),
             },
+            "initialization": {
+                "method": result.diagnostics.initialization_method,
+                "candidates": list(
+                    result.diagnostics.initialization_candidates
+                ),
+                "selected": result.diagnostics.selected_initialization,
+                "selected_flat_cost": (
+                    result.diagnostics.selected_flat_cost
+                ),
+                "selected_board_tilt_deg": (
+                    result.diagnostics.selected_board_tilt_deg
+                ),
+            },
         },
     }
     if extra:

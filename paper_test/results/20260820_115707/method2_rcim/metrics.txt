@@ -1,0 +1,24 @@
+Scanner: scanner1
+Reference radius: 10.001000 mm
+
+[Per-pose validation]
+Pose1: center=(1196.709096, 18.289801, 132.112226) mm, r_fit=10.335003 mm, delta_r=+0.334003 mm, abs_delta_r=0.334003 mm, sigma_fit=0.127389 mm
+Pose2: center=(1196.551729, 18.183450, 132.115413) mm, r_fit=10.339774 mm, delta_r=+0.338774 mm, abs_delta_r=0.338774 mm, sigma_fit=0.113062 mm
+Pose3: center=(1196.147207, 18.269769, 132.013269) mm, r_fit=10.328255 mm, delta_r=+0.327255 mm, abs_delta_r=0.327255 mm, sigma_fit=0.110319 mm
+Pose4: center=(1196.355184, 18.231505, 132.351970) mm, r_fit=10.064587 mm, delta_r=+0.063587 mm, abs_delta_r=0.063587 mm, sigma_fit=0.062888 mm
+Pose5: center=(1196.251894, 18.134088, 132.005777) mm, r_fit=10.245658 mm, delta_r=+0.244658 mm, abs_delta_r=0.244658 mm, sigma_fit=0.070012 mm
+Pose6: center=(1196.389350, 18.295306, 131.978519) mm, r_fit=10.288243 mm, delta_r=+0.287243 mm, abs_delta_r=0.287243 mm, sigma_fit=0.087104 mm
+Pose7: center=(1196.026044, 18.127872, 131.852984) mm, r_fit=10.332914 mm, delta_r=+0.331914 mm, abs_delta_r=0.331914 mm, sigma_fit=0.124984 mm
+
+[All 7 poses combined]
+center=(1196.343136, 18.224738, 132.115995) mm
+r_fit=10.229765 mm
+delta_r_signed=+0.228765 mm
+delta_r_abs=0.228765 mm
+sigma_e=0.168017 mm
+rmse_e=0.283836 mm
+
+Definitions:
+  radial error e_j = ||p_j - c_all|| - r_ref
+  sigma_e = std(e_j)
+  RMSE_e = sqrt(mean(e_j^2))

@@ -95,6 +95,35 @@ def test_production_v2_shared_mode_preserves_noise_free_solution_and_state():
         payload["diagnostics"]["data_only"]["condition_number"]
         > payload["diagnostics"]["prior_augmented"]["condition_number"]
     )
+    assert payload["diagnostics"]["initialization"]["method"] == "single"
+
+
+def test_shared_solver_propagates_flat_multistart_diagnostics():
+    scene = default_scene()
+    poses, measurements = generate_seed_dataset(scene, count=8, seed=29)
+    solver = TwelveDofV2Solver(
+        surface_model="shared",
+        surface_degree=3,
+        multistart_enabled=True,
+        multistart_maximum_board_tilt_deg=5.0,
+    )
+    result = solver.solve(
+        poses,
+        measurements,
+        scene.handeye_rotation @ np.diag([-1.0, -1.0, 1.0]),
+        scene.handeye_translation,
+        board_dimensions=(scene.board.length_u, scene.board.length_v),
+    )
+
+    assert result.converged
+    assert result.diagnostics.initialization_method == "flat_multistart"
+    assert len(result.diagnostics.initialization_candidates) == 4
+    assert result.diagnostics.selected_initialization is not None
+    assert result.diagnostics.selected_flat_cost is not None
+    assert result.diagnostics.selected_board_tilt_deg < 5.0
+    payload = result_payload(result)
+    assert payload["diagnostics"]["initialization"]["method"] == "flat_multistart"
+    assert len(payload["diagnostics"]["initialization"]["candidates"]) == 4
 
 
 def test_shared_shape_is_used_by_future_profile_and_information_score():

@@ -25,6 +25,15 @@
       translation_m: [-0.011579, -0.004621, 0.359284]
     handeye_init_rotation_error_deg: 0.0
     handeye_init_translation_error_mm: 0.0
+    solver:
+      # The initial six-seed solve first evaluates the mounting nominal and
+      # its three proper local 180-degree axis flips with the flat model. Only
+      # solutions whose plate normal is close to base Z may initialize the
+      # shared-shape refinement. Plate yaw on the workbench remains free.
+      multistart:
+        enabled: true
+        maximum_board_tilt_deg: 20.0
+        require_plausible: true
     measurement:
       pose_source: topic
     interfaces:
@@ -58,6 +67,16 @@
       # four-second action timeout is therefore invalid for hardware.
       motion_timeout_s: 100.0
       motion_duration_s: 5.0
+      # Seed actions already finish at a FANUC FINE target; wait only for a
+      # fresh synchronized detector frame after controller completion.
+      settling_time_s: 0.35
+      # Five-degree seed rays proved too weak to give a repeatably conditioned
+      # real-data initialization.  Aim for ten degrees while retaining the
+      # measured micro-step validation below.  A branch may only be saved as
+      # a partial seed after it has accumulated at least five degrees.
+      rotation_target_deg: 10.0
+      minimum_partial_rotation_deg: 5.0
+      minimum_rotation_separation_deg: 5.0
       # Start real target exploration with 1 degree increments.  A 2.5 degree
       # first step moved the selected chord outside the local tracking basin
       # before measured feedback could intervene.
@@ -68,6 +87,43 @@
       # bilateral feature was lost.  8 mm leaves enough margin for the next
       # step to stay on the plate.
       rotation_continue_max_abs_x_mid_m: 0.008
+      # Real seed exploration controls both the chord centre and the distance
+      # between the two locked physical breakpoints. A one-time 3-axis probe
+      # at the verified reference initializes a 2x3 image Jacobian; accepted
+      # motions update it online with measured (not commanded) flange motion.
+      servo:
+        controller: "broyden_dual"
+        # The 80 mm purple guide is a centre target, not a metrology gate.
+        # A +/-10 mm operating band is practical under T1 jogging and remains
+        # far from the 50/120 mm wrong-edge hard guards.
+        length_lower_m: 0.070
+        length_upper_m: 0.090
+        length_target_m: 0.080
+        hard_minimum_length_m: 0.050
+        hard_maximum_length_m: 0.120
+        # Once the guard is crossed, regulate toward the 80 mm interior
+        # target rather than converging asymptotically to the 90 mm boundary.
+        gain: 0.80
+        damping: 0.05
+        maximum_axis_step_m: 0.006
+        maximum_norm_step_m: 0.009
+        minimum_update_step_m: 0.0002
+        minimum_singular_value: 0.02
+        maximum_condition: 100.0
+        maximum_model_error_ratio: 3.0
+        maximum_rejected_updates: 2
+        convergence_tolerance_m: 0.00050
+      rotation_feedforward:
+        # The first safe 1 deg step identifies the rotation-induced feature
+        # drift. Later targets combine rotation and learned local translation;
+        # after two verified steps the angular increment may rise to 2 deg.
+        enabled: true
+        gain: 0.90
+        rate_smoothing: 0.50
+        maximum_axis_step_m: 0.010
+        maximum_norm_step_m: 0.014
+        accelerated_step_deg: 2.0
+        minimum_verified_steps: 2
       # Measurement retry starts after the post-motion settling interval.
       # Keep three full seconds for measurement_sync and the detector's
       # consecutive-frame reacquisition on real hardware.
@@ -78,9 +134,15 @@
         # for such off-centre real starts so an unsafe sign can be reordered.
         auto_skip_maximum_abs_x_mid_m: 0.010
       initial:
-        maximum_abs_x_mid_m: 0.03
+        # The reference itself is the linearization point, so require it to
+        # lie in the same soft operating band shown by the 80 mm RViz guide.
+        maximum_abs_x_mid_m: 0.01
         minimum_z_mid_m: 0.08
         maximum_z_mid_m: 0.45
+        minimum_profile_length_m: 0.070
+        maximum_profile_length_m: 0.090
+    # Retain the independently validated NBV settling interval. Seed motion
+    # uses seed.settling_time_s above and no longer changes this value.
     settling_time_s: 0.8
     maximum_measurement_skew_s: 0.20
 
@@ -188,6 +250,25 @@
       # without turning one repeated view into twelve independent poses.
       target_poses: 10
       frames_per_pose: 12
+      # RCIM-style independent validation (method 2): the operator chooses
+      # seven different flange orientations.  At each orientation the flange
+      # orientation is held fixed while seven stationary stops sweep parallel
+      # laser sections across the sphere.  All stops from one direction form
+      # one evaluation group; repeated frames at only one section are not a
+      # moving scan.
+      moving_directions: 7
+      moving_positions_per_direction: 7
+      moving_frames_per_position: 20
+      moving_minimum_direction_rotation_separation_deg: 15.0
+      moving_maximum_orientation_drift_deg: 0.25
+      moving_minimum_position_step_mm: 1.0
+      moving_maximum_position_step_mm: 7.0
+      moving_minimum_total_travel_mm: 12.0
+      moving_maximum_total_travel_mm: 30.0
+      moving_maximum_line_deviation_mm: 2.0
+      moving_minimum_median_chord_mm: 8.0
+      moving_maximum_median_circle_rms_mm: 0.15
+      moving_minimum_endpoint_chord_drop_mm: 2.0
       initial_data_timeout_s: 8.0
       capture_timeout_s: 12.0
       minimum_pose_rotation_separation_deg: 5.0

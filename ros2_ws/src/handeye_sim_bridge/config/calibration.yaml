@@ -96,6 +96,11 @@
     # that the robot TF buffer is hardware-time synchronized.
     measurement:
       pose_source: topic
+      # The exact-stamp pose is emitted before the detector's derived surface
+      # and endpoints. Keep enough high-rate pose history for slower ROI/CSRT
+      # processing while bounding the larger observation payloads separately.
+      pending_observation_buffer_size: 64
+      pending_pose_buffer_size: 512
 
     # One detector is shared by synthetic PointCloud2 profiles and a future
     # real Gocator PointCloud2 driver. It never subscribes to simulation truth.
@@ -239,6 +244,43 @@
       # of low-value servo moves from difficult initial views.
       x_mid_tolerance_m: 0.010
       maximum_translation_step_m: 0.012
+      # Translation servo policy. Simulation keeps the validated legacy
+      # controller by default; the real backend overrides this with the new
+      # two-feature Broyden controller.
+      servo:
+        controller: "legacy"
+        # Soft operating band: rotate again only when both x_mid and the
+        # measured physical-breakpoint chord satisfy their deadbands.
+        length_lower_m: 0.070
+        length_upper_m: 0.090
+        length_target_m: 0.080
+        # Hard edge-identity guard. Measurements outside it are never used to
+        # update the online Jacobian and trigger transactional rollback.
+        hard_minimum_length_m: 0.050
+        hard_maximum_length_m: 0.120
+        gain: 0.55
+        damping: 0.05
+        maximum_axis_step_m: 0.003
+        maximum_norm_step_m: 0.005
+        minimum_update_step_m: 0.0002
+        minimum_singular_value: 0.02
+        maximum_condition: 100.0
+        maximum_model_error_ratio: 3.0
+        maximum_rejected_updates: 2
+        # Below the real endpoint noise scale, further sub-step correction is
+        # more likely to chatter than to improve the physical observation.
+        convergence_tolerance_m: 0.00025
+      # Optional learned rotation disturbance model. When enabled, the next
+      # flange target combines rotation and a DLS translation so the chord
+      # remains near the target instead of requiring many reactive moves.
+      rotation_feedforward:
+        enabled: false
+        gain: 0.90
+        rate_smoothing: 0.50
+        maximum_axis_step_m: 0.010
+        maximum_norm_step_m: 0.014
+        accelerated_step_deg: 2.0
+        minimum_verified_steps: 2
       # Between 2-degree micro-rotations, continue directly while the
       # observation retains this conservative envelope; center only when the
       # envelope becomes tight or the target orientation is reached.
@@ -257,9 +299,9 @@
       maximum_batch_frames: 30
       measurement_batch_timeout_s: 6.0
       endpoint_mad_multiplier: 3.5
-      # The measured preflight now reorders the real plan. Two failures are
-      # enough to retain a safe partial pose or skip that branch.
-      maximum_target_failures: 2
+      # Try the configured 1.0, 0.5 and 0.25 degree real-hardware steps before
+      # retaining a safe partial pose or skipping that branch.
+      maximum_target_failures: 3
       minimum_profile_points: 5
       minimum_rotation_separation_deg: 2.0
       minimum_seed_domain_margin_m: 0.002
@@ -305,6 +347,7 @@
       # velocity/acceleration limits.
       motion_duration_s: 0.45
       motion_timeout_s: 4.0
+      settling_time_s: 0.15
 
     settling_time_s: 0.15
     maximum_measurement_age_s: 0.5
@@ -323,6 +366,13 @@
       surface_degree: 3
       shape_scale_m: 0.0005
       shape_regularization: 0.01
+      # Disabled in the legacy simulation benchmark. The real overlay enables
+      # discrete flat pre-solves because a 2-D scanner mounting nominal may
+      # contain a 180-degree sensor-axis convention ambiguity.
+      multistart:
+        enabled: false
+        maximum_board_tilt_deg: 20.0
+        require_plausible: true
       plane_weight: 1.0
       # The raw-profile detector reports about 0.108 mm single-frame endpoint
       # sigma at the reference pose. Residual whitening against 0.055 mm

@@ -8,6 +8,8 @@ computed.  ``flat`` is retained as an ablation and compatibility mode.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 from scipy.optimize import least_squares
 
@@ -89,6 +91,9 @@ class TwelveDofV2Solver:
         surface_degree: int = 4,
         shape_scale_m: float = 5e-4,
         shape_regularization: float = 1e-2,
+        multistart_enabled: bool = False,
+        multistart_maximum_board_tilt_deg: float = 20.0,
+        multistart_require_plausible: bool = True,
     ) -> None:
         if surface_model not in {"flat", "shared"}:
             raise ValueError("surface_model must be 'flat' or 'shared'")
@@ -96,6 +101,10 @@ class TwelveDofV2Solver:
             raise ValueError("shape_scale_m must be positive")
         if shape_regularization < 0.0:
             raise ValueError("shape_regularization must be non-negative")
+        if not 0.0 < multistart_maximum_board_tilt_deg <= 90.0:
+            raise ValueError(
+                "multistart_maximum_board_tilt_deg must lie in (0, 90]"
+            )
         self.weights = {
             "plane_weight": float(plane_weight),
             "edge_weight": float(edge_weight),
@@ -109,6 +118,13 @@ class TwelveDofV2Solver:
         self.surface_degree = int(surface_degree)
         self.shape_scale_m = float(shape_scale_m)
         self.shape_regularization = float(shape_regularization)
+        self.multistart_enabled = bool(multistart_enabled)
+        self.multistart_maximum_board_tilt_deg = float(
+            multistart_maximum_board_tilt_deg
+        )
+        self.multistart_require_plausible = bool(
+            multistart_require_plausible
+        )
         self.surface_basis: SurfaceBasis | None = (
             None
             if self.surface_model == "flat"
@@ -186,6 +202,59 @@ class TwelveDofV2Solver:
         initial_board_rotation: np.ndarray | None = None,
         initial_estimate: CalibrationEstimate | None = None,
     ) -> CalibrationResult:
+        # Only the first six-seed solve needs global basin discovery.  Rolling
+        # NBV updates carry the last accepted estimate and deliberately remain
+        # local so that a later observation cannot jump between discrete
+        # hand-eye/board hypotheses.
+        if self.multistart_enabled and initial_estimate is None:
+            flat, attempts, selected_name, selected_tilt = (
+                self._solve_flat_multistart(
+                    poses,
+                    measurements,
+                    nominal_handeye_rotation,
+                    nominal_handeye_translation,
+                    board_dimensions=board_dimensions,
+                    initial_board_rotation=initial_board_rotation,
+                )
+            )
+            if self.surface_basis is None:
+                return self._attach_initialization_diagnostics(
+                    flat,
+                    attempts,
+                    selected_name,
+                    selected_tilt,
+                    flat.cost,
+                )
+            result = self._solve_shared(
+                poses,
+                measurements,
+                nominal_handeye_rotation,
+                nominal_handeye_translation,
+                board_dimensions=board_dimensions,
+                initial_board_rotation=initial_board_rotation,
+                initial_estimate=flat.estimate,
+            )
+            final_tilt = self._board_tilt_deg(
+                result.estimate.board.rotation
+            )
+            if final_tilt > self.multistart_maximum_board_tilt_deg:
+                result = replace(
+                    result,
+                    converged=False,
+                    message=(
+                        f"{result.message}; shared refinement violated the "
+                        "flat-board geometry gate: "
+                        f"tilt={final_tilt:.3f} deg > "
+                        f"{self.multistart_maximum_board_tilt_deg:.3f} deg"
+                    ),
+                )
+            return self._attach_initialization_diagnostics(
+                result,
+                attempts,
+                selected_name,
+                selected_tilt,
+                flat.cost,
+            )
         if self.surface_basis is None:
             return self._solve_flat(
                 poses,
@@ -204,6 +273,135 @@ class TwelveDofV2Solver:
             initial_board_rotation=initial_board_rotation,
             initial_estimate=initial_estimate,
         )
+
+    @staticmethod
+    def _board_tilt_deg(board_rotation: np.ndarray) -> float:
+        """Return plane-normal tilt from the base vertical axis.
+
+        A plate may be freely yawed on the workbench.  Therefore the gate uses
+        only ``|n_B dot z_base|`` and accepts either normal sign; constraining
+        the full SO(3) distance would incorrectly require the plate edges to
+        be aligned with the base X/Y axes.
+        """
+        normal = np.asarray(board_rotation, dtype=float)[:, 2]
+        cosine = float(np.clip(abs(normal[2]), 0.0, 1.0))
+        return float(np.rad2deg(np.arccos(cosine)))
+
+    @staticmethod
+    def _flat_rotation_hypotheses() -> tuple[tuple[str, np.ndarray], ...]:
+        """Discrete proper rotations covering line-scanner axis flips."""
+        return (
+            ("nominal", np.eye(3)),
+            ("local_x_180", np.diag([1.0, -1.0, -1.0])),
+            ("local_y_180", np.diag([-1.0, 1.0, -1.0])),
+            ("local_z_180", np.diag([-1.0, -1.0, 1.0])),
+        )
+
+    def _solve_flat_multistart(
+        self,
+        poses: list[FlangePose],
+        measurements: list[Measurement],
+        nominal_handeye_rotation: np.ndarray,
+        nominal_handeye_translation: np.ndarray,
+        *,
+        board_dimensions: tuple[float, float],
+        initial_board_rotation: np.ndarray | None,
+    ) -> tuple[
+        CalibrationResult,
+        tuple[dict[str, object], ...],
+        str,
+        float,
+    ]:
+        """Run flat pre-solves and retain the cheapest horizontal board.
+
+        The four rotations do not assume a previous calibration.  They cover
+        the proper 180-degree sensor-axis conventions that are especially
+        ambiguous for a scanner whose measurements all satisfy ``y_S=0``.
+        """
+        base_rotation = np.asarray(nominal_handeye_rotation, dtype=float)
+        translation = np.asarray(nominal_handeye_translation, dtype=float)
+        attempts: list[dict[str, object]] = []
+        plausible: list[tuple[float, str, float, CalibrationResult]] = []
+        converged: list[tuple[float, str, float, CalibrationResult]] = []
+        for name, offset in self._flat_rotation_hypotheses():
+            try:
+                result = self._solve_flat(
+                    poses,
+                    measurements,
+                    base_rotation @ offset,
+                    translation,
+                    board_dimensions=board_dimensions,
+                    initial_board_rotation=initial_board_rotation,
+                )
+                tilt = self._board_tilt_deg(result.estimate.board.rotation)
+                accepted = bool(
+                    result.converged
+                    and tilt <= self.multistart_maximum_board_tilt_deg
+                )
+                attempts.append(
+                    {
+                        "name": name,
+                        "converged": bool(result.converged),
+                        "cost": float(result.cost),
+                        "board_tilt_deg": float(tilt),
+                        "accepted": accepted,
+                        "message": str(result.message),
+                    }
+                )
+                if result.converged:
+                    item = (float(result.cost), name, float(tilt), result)
+                    converged.append(item)
+                    if accepted:
+                        plausible.append(item)
+            except Exception as error:
+                attempts.append(
+                    {
+                        "name": name,
+                        "converged": False,
+                        "cost": None,
+                        "board_tilt_deg": None,
+                        "accepted": False,
+                        "message": str(error),
+                    }
+                )
+
+        pool = plausible
+        if not pool and not self.multistart_require_plausible:
+            pool = converged
+        if not pool:
+            summary = ", ".join(
+                (
+                    f"{item['name']}:cost={item['cost']},"
+                    f"tilt={item['board_tilt_deg']}"
+                )
+                for item in attempts
+            )
+            raise RuntimeError(
+                "flat multi-start found no converged horizontal-board "
+                f"candidate (maximum tilt "
+                f"{self.multistart_maximum_board_tilt_deg:.1f} deg): "
+                f"{summary}"
+            )
+        cost, name, tilt, selected = min(pool, key=lambda item: item[0])
+        return selected, tuple(attempts), name, tilt
+
+    @staticmethod
+    def _attach_initialization_diagnostics(
+        result: CalibrationResult,
+        attempts: tuple[dict[str, object], ...],
+        selected_name: str,
+        selected_tilt: float,
+        selected_flat_cost: float,
+    ) -> CalibrationResult:
+        diagnostics = replace(
+            result.diagnostics,
+            initialization_method="flat_multistart",
+            initialization_candidates=attempts,
+            selected_initialization=selected_name,
+            selected_flat_cost=float(selected_flat_cost),
+            selected_board_tilt_deg=float(selected_tilt),
+        )
+        return replace(result, diagnostics=diagnostics)
 
     def _solve_flat(
         self,

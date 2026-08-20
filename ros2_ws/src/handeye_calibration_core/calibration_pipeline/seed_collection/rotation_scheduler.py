@@ -37,20 +37,36 @@ def star_rotation_plan() -> tuple[RotationTarget, ...]:
 def adaptive_rotation_plan() -> tuple[RotationTarget, ...]:
     """Return the default star followed by non-parallel fallback branches.
 
-    The fallback set changes signs and stage order.  It is used only when a
-    default branch is unobservable or rejected by the rotation-diversity test.
-    All commands remain local-flange rotations and therefore do not require a
+    Simultaneous X/Y stages are unordered: ``(+X, -Y)`` and ``(-Y, +X)``
+    produce the same rotation vector.  The fallback set therefore contains
+    each signed diagonal once, followed by lower-amplitude axial poses that
+    are genuinely distinct under the rotation-diversity threshold.  All
+    commands remain local-flange rotations and therefore do not require a
     hand-eye estimate.
     """
     return star_rotation_plan() + (
         RotationTarget("rx_ry_opposite", (((0, 1), (1, -1)),)),
         RotationTarget("rx_negative_ry_positive", (((0, -1), (1, 1)),)),
         RotationTarget("rx_ry_negative", (((0, -1), (1, -1)),)),
-        RotationTarget("ry_rx_positive", (((1, 1), (0, 1)),)),
-        RotationTarget("ry_positive_rx_negative", (((1, 1), (0, -1)),)),
-        RotationTarget("ry_negative_rx_positive", (((1, -1), (0, 1)),)),
-        RotationTarget("ry_rx_negative", (((1, -1), (0, -1)),)),
+        RotationTarget("ry_positive_half", ((1, 1),), 0.5),
+        RotationTarget("ry_negative_half", ((1, -1),), 0.5),
+        RotationTarget("rx_positive_half", ((0, 1),), 0.5),
+        RotationTarget("rx_negative_half", ((0, -1),), 0.5),
     )
+
+
+def _rotation_target_key(
+    target: RotationTarget,
+) -> tuple[tuple[tuple[tuple[int, int], ...], ...], float]:
+    """Return the commanded-motion identity of a rotation target."""
+    canonical_stages: list[tuple[tuple[int, int], ...]] = []
+    for stage in target.stages:
+        if stage and isinstance(stage[0], tuple):
+            # Axis components in one simultaneous rotation form a set.
+            canonical_stages.append(tuple(sorted(stage)))
+        else:
+            canonical_stages.append((stage,))
+    return tuple(canonical_stages), float(target.angle_scale)
 
 
 def preflight_guided_rotation_plan(
@@ -115,9 +131,9 @@ def preflight_guided_rotation_plan(
                 )
             )
     unique: list[RotationTarget] = []
-    seen: set[tuple[tuple[tuple[int, int], ...], float]] = set()
+    seen: set[tuple[tuple[tuple[tuple[int, int], ...], ...], float]] = set()
     for target in tuple(guided) + adaptive_rotation_plan():
-        key = (target.stages, float(target.angle_scale))
+        key = _rotation_target_key(target)
         if key in seen:
             continue
         unique.append(target)

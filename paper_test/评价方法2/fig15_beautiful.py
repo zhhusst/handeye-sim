@@ -2,7 +2,7 @@
 """美化版 Fig15 排版：复用 sphere_validation_rcim_v2 的算法，重新设计布局。
 
 布局改进：
-  (a) 7 个 pose 的 Y-Z 重建视图：统一坐标范围、参考半径圆、拟合中心标记
+  (a) 多个 pose 的 Y-Z 重建视图：统一坐标范围、参考半径圆、拟合中心标记
   (b) pose-wise |Δr| + σ 误差条：均值带、参考线、数值标注
   (c) 合并 3D 点云：径向误差着色 + 拟合球面网格 + 右侧 metrics 卡片
 """
@@ -89,8 +89,8 @@ def _set_3d_equal(ax, pts):
 
 def plot_fig15_beautiful(pose_points, r_ref, out_path):
     n = len(pose_points)
-    if n != 7:
-        raise ValueError(f"Expected exactly 7 validation poses, got {n}.")
+    if n < 4:
+        raise ValueError(f"Expected at least 4 validation poses, got {n}.")
     fits = [fit_sphere(p) for p in pose_points]
     combined = np.vstack(pose_points)
     fit_all = fit_sphere(combined)
@@ -118,7 +118,7 @@ def plot_fig15_beautiful(pose_points, r_ref, out_path):
         left=0.05, right=0.97, top=0.93, bottom=0.09,
     )
 
-    # ================= (a) 七个独立位姿 =================
+    # ================= (a) 独立位姿 =================
     for i, (pts, fit) in enumerate(zip(pose_points, fits)):
         ax = fig.add_subplot(gs[0, i])
         stride = max(1, len(pts) // 1400)
@@ -149,12 +149,19 @@ def plot_fig15_beautiful(pose_points, r_ref, out_path):
         )
 
     # (a) 面板标签
-    fig.text(0.012, 0.965, "(a)  Reconstructed sphere under seven independent validation poses",
-             fontsize=12, fontweight="bold", va="top", color="#222222")
+    fig.text(
+        0.012,
+        0.965,
+        f"(a)  Reconstructed sphere under {n} independent validation poses",
+        fontsize=12,
+        fontweight="bold",
+        va="top",
+        color="#222222",
+    )
 
     # ================= (b) pose-wise 半径误差 =================
     axb = fig.add_subplot(gs[1, :])
-    x = np.arange(1, 8)
+    x = np.arange(1, n + 1)
     radius_error_abs = np.array([abs(f.radius - r_ref) for f in fits])
     sigma_pose = np.array([f.sigma for f in fits])
 
@@ -166,7 +173,7 @@ def plot_fig15_beautiful(pose_points, r_ref, out_path):
 
     mean_d = float(np.mean(radius_error_abs))
     std_d = float(np.std(radius_error_abs))
-    axb.fill_between([0.6, 7.4], mean_d - std_d, mean_d + std_d,
+    axb.fill_between([0.6, n + 0.4], mean_d - std_d, mean_d + std_d,
                      color=PALETTE[0], alpha=0.10, zorder=1,
                      label=f"Mean ± 1σ  ({mean_d:.4f} ± {std_d:.4f} mm)")
     axb.axhline(mean_d, color=PALETTE[0], linestyle="--", linewidth=1.2,
@@ -178,7 +185,7 @@ def plot_fig15_beautiful(pose_points, r_ref, out_path):
                      ha="center", fontsize=8.5, color="#333333")
 
     axb.set_xticks(x)
-    axb.set_xlim(0.5, 7.5)
+    axb.set_xlim(0.5, n + 0.5)
     axb.set_xlabel("Validation pose", fontsize=11)
     axb.set_ylabel("Absolute radius error |Δr| (mm)", fontsize=11)
     axb.set_title("(b)  Pose-wise radius error; error bars indicate radial dispersion σ",
@@ -211,7 +218,7 @@ def plot_fig15_beautiful(pose_points, r_ref, out_path):
     axc.set_xlabel("X (mm)", fontsize=10)
     axc.set_ylabel("Y (mm)", fontsize=10)
     axc.set_zlabel("Z (mm)", fontsize=10)
-    axc.set_title("(c)  Combined reconstruction from all seven poses\n"
+    axc.set_title(f"(c)  Combined reconstruction from all {n} poses\n"
                   "Point color = radial error relative to the reference sphere",
                   fontsize=11.5, fontweight="bold", pad=10, loc="left")
     axc.grid(True, alpha=0.2)
