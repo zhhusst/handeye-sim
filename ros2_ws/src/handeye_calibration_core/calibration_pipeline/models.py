@@ -291,6 +291,13 @@ class SolverDiagnostics:
     selected_initialization: str | None = None
     selected_flat_cost: float | None = None
     selected_board_tilt_deg: float | None = None
+    # SciPy 1.11 does not expose a literal TRF iteration counter.  ``nfev``
+    # is already carried by ``CalibrationResult.evaluations``; ``njev`` is
+    # retained here as the closest reproducible proxy for accepted major
+    # iterations in solver ablations.
+    optimizer_jacobian_evaluations: int | None = None
+    optimizer_success: bool | None = None
+    optimizer_status: int | None = None
 
 
 @dataclass(frozen=True)

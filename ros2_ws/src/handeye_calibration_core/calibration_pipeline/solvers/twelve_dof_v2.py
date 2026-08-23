@@ -343,6 +343,15 @@ class TwelveDofV2Solver:
                         "name": name,
                         "converged": bool(result.converged),
                         "cost": float(result.cost),
+                        "function_evaluations": int(result.evaluations),
+                        "jacobian_evaluations": (
+                            None
+                            if result.diagnostics.optimizer_jacobian_evaluations
+                            is None
+                            else int(
+                                result.diagnostics.optimizer_jacobian_evaluations
+                            )
+                        ),
                         "board_tilt_deg": float(tilt),
                         "accepted": accepted,
                         "message": str(result.message),
@@ -528,6 +537,11 @@ class TwelveDofV2Solver:
                 prior_augmented_condition_number=condition,
                 prior_augmented_effective_handeye_information=effective,
                 state_information=state_information,
+                optimizer_jacobian_evaluations=(
+                    None if optimized.njev is None else int(optimized.njev)
+                ),
+                optimizer_success=bool(optimized.success),
+                optimizer_status=int(optimized.status),
             ),
         )
 
@@ -696,5 +710,10 @@ class TwelveDofV2Solver:
                 prior_augmented_condition_number=prior_condition,
                 prior_augmented_effective_handeye_information=prior_effective,
                 state_information=state_information,
+                optimizer_jacobian_evaluations=(
+                    None if optimized.njev is None else int(optimized.njev)
+                ),
+                optimizer_success=bool(optimized.success),
+                optimizer_status=int(optimized.status),
             ),
         )
