@@ -1,0 +1,83 @@
+digraph star_seed_acquisition {
+graph [rankdir=TB, splines=polyline, overlap=false, nodesep=0.20, ranksep=0.34, pad=0.18, margin=0.04, bgcolor="white", fontname="Noto Sans CJK SC", fontsize=17, labelloc="t", label="基于双边轮廓反馈的六种子星型自动采集流程\n1 个参考位姿 + 5 个自适应旋转分支（NBV 之前）", compound=true, newrank=true];
+node [shape=box, style="rounded,filled", fillcolor="#F7FAFC", color="#4A6075", penwidth=1.25, fontname="Noto Sans CJK SC", fontsize=10, margin="0.12,0.07"] ;
+edge [color="#43576A", penwidth=1.25, arrowsize=0.72, fontname="Noto Sans CJK SC", fontsize=9, fontcolor="#334E68"] ;
+subgraph cluster_init {
+label="I  引导初始化"; color="#90B8D8"; penwidth=1.5; style="rounded"; bgcolor="#F5FAFE"; fontname="Noto Sans CJK SC"; fontsize=13;
+start [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>开始</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">人工介入仅发生在初始对准</FONT></TD></TR></TABLE>>, shape="oval", fillcolor="#DCEEFF", color="#2F6F9F"];
+manual [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>人工设置参考观察</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">将目标板面轮廓移入紫色 ROI</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">并靠近期望 80 mm 参考线</FONT></TD></TR></TABLE>>, shape="parallelogram", fillcolor="#FFF4D6", color="#B88214"];
+align [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>初始双边观测稳定？</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">双断点可见、机器人静止</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">且初始工作包络通过</FONT></TD></TR></TABLE>>, shape="diamond", fillcolor="#FFF9E8", color="#B88214", margin="0.08,0.04"];
+detect [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>锁定同一物理角的双断点</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">ROI 内断点检测与有序身份分配</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">初始化两个 CSRT 局部跟踪器</FONT></TD></TR></TABLE>>, fillcolor="#E8F3FB", color="#3976A8"];
+refcap [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>定点采集参考种子</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">目标 18 帧；MAD 剔除端点离群帧</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">至少保留 14 个同步内点</FONT></TD></TR></TABLE>>, fillcolor="#E9F7EF", color="#2E7D57"];
+refok [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>参考批次有效？</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">安全双边 + 同步位姿 + 足够内点</FONT></TD></TR></TABLE>>, shape="diamond", fillcolor="#F0F8F4", color="#2E7D57", margin="0.08,0.04"];
+track [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>进入种子跟踪模式</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">保持 endpoint_u / endpoint_v 身份</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">记录最后一个已验证安全位姿</FONT></TD></TR></TABLE>>, fillcolor="#E8F3FB", color="#3976A8"];
+probe [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>一次性三轴局部平移探测</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">ΔS=[Δs_x  Δs_y  Δs_z]</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">ΔQ=[Δq_x  Δq_y  Δq_z]</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">J⁰=ΔS·ΔQ⁺ ∈ ℝ²ˣ³</FONT></TD></TR></TABLE>>, fillcolor="#EDE9FA", color="#6554A3"];
+preflight_note [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#7A5A00"><B>可选动态预检</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">动态 ±X/±Y 预检为可选工程模块；本次 mode=off，未执行。</FONT></TD></TR></TABLE>>, shape="note", style="filled,dashed", fillcolor="#FFFBEA", color="#C49A2C"];
+}
+subgraph cluster_loop {
+label="II  自适应星型分支循环"; color="#A7C9A8"; penwidth=1.5; style="rounded"; bgcolor="#F8FCF8"; fontname="Noto Sans CJK SC"; fontsize=13;
+branches [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>建立星型分支队列</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">名义顺序：R_y(+), R_y(-), R_x(+),</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">R_x(-), R_xR_y(+)</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">必要时使用非平行备用分支</FONT></TD></TR></TABLE>>, fillcolor="#EDF6ED", color="#4D8A50"];
+return [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>返回已验证参考位姿</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">分段关节回程 + 有界模板重捕获</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">重置本分支角度、步长和前馈模型</FONT></TD></TR></TABLE>>, fillcolor="#F1F6F9", color="#607D8B"];
+select [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>选择下一旋转分支</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">局部法兰轴；目标角 10°</FONT></TD></TR></TABLE>>, fillcolor="#EDF6ED", color="#4D8A50"];
+rotate [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>执行一个姿态微步</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">初始 Δθ=1°；验证后可加速到 2°</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">叠加已学习的局部平移前馈</FONT></TD></TR></TABLE>>, fillcolor="#EDE9FA", color="#6554A3"];
+measure [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>停稳并读取同步观测</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">CSRT 跟踪双断点；提取 s=[x_mid,L]ᵀ</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">L 为两个指定物理断点的间距</FONT></TD></TR></TABLE>>, fillcolor="#E8F3FB", color="#3976A8"];
+hard [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>仍为目标双边且处于硬安全域？</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">观测安全、身份连续</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">50 mm ≤ L ≤ 120 mm</FONT></TD></TR></TABLE>>, shape="diamond", fillcolor="#FFF4ED", color="#B85C32", margin="0.08,0.04"];
+rollback [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>保护性恢复</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">退回最后有效位姿；减小 Δθ</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">丢弃不可信前馈并重新跟踪</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">重复失败：回参考位姿/换备用分支</FONT></TD></TR></TABLE>>, fillcolor="#FDEDEC", color="#B5483B", style="rounded,filled,dashed"];
+update [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>更新实测局部模型</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">更新旋转引起的特征漂移率</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">累计已完成旋转角</FONT></TD></TR></TABLE>>, fillcolor="#EDE9FA", color="#6554A3"];
+soft [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>双特征进入伺服目标带？</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">|x_mid| ≤ 10 mm</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">70 mm ≤ L ≤ 90 mm</FONT></TD></TR></TABLE>>, shape="diamond", fillcolor="#FFF9E8", color="#B88214", margin="0.08,0.04"];
+servo [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>闭环局部平移修正</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">e=[e_x,e_L]ᵀ</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">Δq_F=−kJᵀ(JJᵀ+λ²I)⁻¹e</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">有效实测运动用于 Broyden 更新 J</FONT></TD></TR></TABLE>>, fillcolor="#FFF4D6", color="#B88214"];
+angle [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>达到该分支目标姿态？</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">累计旋转角 ≥ 10°</FONT></TD></TR></TABLE>>, shape="diamond", fillcolor="#F0F8F4", color="#2E7D57", margin="0.08,0.04"];
+capture [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>定点采集该分支种子</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">18 帧同步观测；端点 MAD 筛选</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">同时检查旋转多样性</FONT></TD></TR></TABLE>>, fillcolor="#E9F7EF", color="#2E7D57"];
+capok [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>≥14 个内点且姿态多样？</B></FONT></TD></TR></TABLE>>, shape="diamond", fillcolor="#F0F8F4", color="#2E7D57", margin="0.08,0.04"];
+reject [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>拒绝本分支数据</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">返回参考位姿并尝试备用分支</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">必要时以安全的部分姿态作为备选</FONT></TD></TR></TABLE>>, fillcolor="#FDEDEC", color="#B5483B", style="rounded,filled,dashed"];
+accept [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>接受一个物理种子位姿</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">保存每个内点帧的 T_BF、轮廓和双端点</FONT></TD></TR></TABLE>>, fillcolor="#DFF3E8", color="#2E7D57"];
+all [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>已获得 6 个物理种子？</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">reference + 5 个有效分支</FONT></TD></TR></TABLE>>, shape="diamond", fillcolor="#EAF4F8", color="#3976A8", margin="0.08,0.04"];
+formula [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#4D3C86"><B>双特征与死区误差</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">s=[x<SUB>mid</SUB>, L]<SUP>T</SUP>, &nbsp; s<SUP>*</SUP>=[0,80 mm]<SUP>T</SUP></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">e<SUB>x</SUB>=0 if |x<SUB>mid</SUB>|≤10 mm; otherwise e<SUB>x</SUB>=x<SUB>mid</SUB></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">e<SUB>L</SUB>=0 if 70≤L≤90 mm; otherwise e<SUB>L</SUB>=L−80 mm</FONT></TD></TR></TABLE>>, shape="note", fillcolor="#F5F2FD", color="#7B68B3"];
+}
+subgraph cluster_out {
+label="III  数据输出与后续接口"; color="#A9B7C4"; penwidth=1.5; style="rounded"; bgcolor="#FAFBFC"; fontname="Noto Sans CJK SC"; fontsize=13;
+save [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>写入 seeds.json</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">本次：6 个物理位姿，98 个同步内点帧</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">停止种子阶段的双断点跟踪</FONT></TD></TR></TABLE>>, shape="cylinder", fillcolor="#E8F3FB", color="#3976A8"];
+handoff [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>六种子联合初解</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">共享模型 12-DOF-V2 初始化</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">随后才进入 NBV（本图范围之外）</FONT></TD></TR></TABLE>>, shape="oval", fillcolor="#EDE9FA", color="#6554A3"];
+evidence [label=<<TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1" CELLPADDING="1"><TR><TD ALIGN="CENTER"><FONT COLOR="#17365D"><B>本次真机运行证据</B></FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">实际顺序：reference → R_y(+)  → R_y(-) → R_x(+) → R_x(-) → R_xR_y(+)</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">各位姿内点帧：[18, 16, 14, 14, 18, 18]；合计 98</FONT></TD></TR><TR><TD ALIGN="CENTER"><FONT POINT-SIZE="10">发生回退的分支：R_y(-), R_xR_y(+)</FONT></TD></TR></TABLE>>, shape="note", fillcolor="#F7FAFC", color="#7890A4"];
+}
+start -> manual;
+manual -> align;
+align -> detect [label="是", color="#2E7D57", fontcolor="#2E7D57"];
+align -> manual [label="否：继续调整", color="#B5483B", fontcolor="#B5483B"];
+detect -> refcap;
+refcap -> refok;
+refok -> track [label="是", color="#2E7D57", fontcolor="#2E7D57"];
+refok -> manual [label="否：重新对准/采集", color="#B5483B", fontcolor="#B5483B"];
+refok -> preflight_note [style="dashed", arrowhead="none", color="#C49A2C"];
+track -> probe;
+probe -> branches;
+branches -> return;
+return -> select;
+select -> rotate;
+rotate -> measure;
+measure -> hard;
+hard -> update [label="是", color="#2E7D57", fontcolor="#2E7D57"];
+hard -> rollback [label="否", color="#B5483B", fontcolor="#B5483B"];
+rollback -> rotate [label="恢复成功", color="#B5483B", fontcolor="#B5483B"];
+rollback -> reject [label="重复失败", style="dashed", color="#B5483B", fontcolor="#B5483B"];
+update -> soft;
+soft -> angle [label="是", color="#2E7D57", fontcolor="#2E7D57"];
+soft -> servo [label="否", color="#B88214", fontcolor="#9B6E0B"];
+servo -> measure [label="停稳并复测", color="#B88214", fontcolor="#9B6E0B"];
+soft -> formula [style="dashed", arrowhead="none", color="#7B68B3"];
+angle -> rotate [label="否", color="#3976A8", fontcolor="#3976A8"];
+angle -> capture [label="是", color="#2E7D57", fontcolor="#2E7D57"];
+capture -> capok;
+capok -> accept [label="是", color="#2E7D57", fontcolor="#2E7D57"];
+capok -> reject [label="否", color="#B5483B", fontcolor="#B5483B"];
+reject -> return [color="#B5483B"];
+accept -> all;
+all -> return [label="否：下一分支", color="#3976A8", fontcolor="#3976A8"];
+all -> save [label="是", color="#2E7D57", fontcolor="#2E7D57"];
+save -> handoff;
+save -> evidence [style="dashed", arrowhead="none", color="#7890A4"];
+{rank=same; refok; preflight_note;}
+{rank=same; hard; rollback;}
+{rank=same; soft; formula;}
+{rank=same; save; evidence;}
+}
