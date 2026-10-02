@@ -1,7 +1,13 @@
 import numpy as np
 import pytest
+import yaml
+from pathlib import Path
 
 from calibration_pipeline.geometry import make_transform
+from calibration_pipeline.perception.endpoint_detector import (
+    EndpointDetectionConfig,
+    ProfileEndpointDetector,
+)
 from calibration_pipeline.simulation.noise import (
     JointSnapshotBuffer,
     SimulationNoiseConfig,
@@ -83,6 +89,70 @@ def test_seeded_noise_is_reproducible():
     second_endpoint = second.corrupt_endpoint(points[0])
     assert first_endpoint[1] == second_endpoint[1]
     assert np.array_equal(first_endpoint[0], second_endpoint[0])
+
+
+def test_absolute_position_error_is_repeatable_but_pose_dependent():
+    config = ideal_noise_config(robot_absolute_translation_rms_m=0.001)
+    model = SimulationNoiseModel(config)
+    pose = make_transform(np.eye(3), np.array([0.7, 0.0, 0.8]))
+    same_pose_first = model.perturb_flange(pose)
+    same_pose_second = model.perturb_flange(pose)
+    np.testing.assert_array_equal(same_pose_first, same_pose_second)
+    assert not np.array_equal(same_pose_first[:3, 3], pose[:3, 3])
+
+    shifted_pose = make_transform(np.eye(3), np.array([0.9, 0.1, 0.8]))
+    shifted_error = model.perturb_flange(shifted_pose)[:3, 3] - shifted_pose[:3, 3]
+    reference_error = same_pose_first[:3, 3] - pose[:3, 3]
+    assert not np.array_equal(shifted_error, reference_error)
+
+
+def test_repeatability_error_changes_between_arrivals_not_stationary_frames():
+    pose = make_transform(np.eye(3), np.array([0.7, 0.0, 0.8]))
+    absolute = SimulationNoiseModel(
+        ideal_noise_config(robot_absolute_translation_rms_m=0.001)
+    ).perturb_flange(pose)
+    model = SimulationNoiseModel(
+        ideal_noise_config(
+            robot_absolute_translation_rms_m=0.001,
+            robot_repeatability_translation_rms_m=0.00002,
+        )
+    )
+    first = model.perturb_flange(pose)
+    second = model.perturb_flange(pose)
+    np.testing.assert_array_equal(first, second)
+    np.testing.assert_allclose(first[:3, :3], pose[:3, :3], atol=0.0)
+    assert np.linalg.norm(first[:3, 3] - absolute[:3, 3]) < 0.0001
+    moved_pose = make_transform(np.eye(3), np.array([0.72, 0.0, 0.8]))
+    model.perturb_flange(moved_pose)
+    returned = model.perturb_flange(pose)
+    assert not np.array_equal(returned[:3, 3], first[:3, 3])
+
+
+def test_half_millimetre_profile_noise_preserves_simulated_plate_segment():
+    config_path = (
+        Path(__file__).resolve().parents[1]
+        / "ros2_ws/src/handeye_sim_bridge/config/calibration.yaml"
+    )
+    params = yaml.safe_load(config_path.read_text(encoding="utf-8"))["/**"]["ros__parameters"]
+    noise = SimulationNoiseModel(SimulationNoiseConfig(**params["simulation_noise"]))
+    detector_settings = {
+        key: value
+        for key, value in params["endpoint_detection"].items()
+        if key in EndpointDetectionConfig.__dataclass_fields__
+    }
+    detector = ProfileEndpointDetector(EndpointDetectionConfig(**detector_settings))
+    clean_line = np.column_stack(
+        (
+            np.linspace(-0.04, 0.04, 320),
+            np.zeros(320),
+            np.linspace(0.27, 0.30, 320),
+        )
+    )
+    valid = 0
+    for _ in range(30):
+        detection = detector.detect(noise.corrupt_profile(clean_line))
+        valid += detection is not None and 0.07 < detection.segment_length_m < 0.09
+    assert valid >= 27
 
 
 def test_complete_dropout_invalidates_profile_and_endpoints_together():

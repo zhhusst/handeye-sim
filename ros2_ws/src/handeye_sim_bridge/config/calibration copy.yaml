@@ -13,30 +13,17 @@
                  0.0, 1.0, 0.0,
                  0.0, 0.0, 1.0] # ^F R_S，按行展开。
       translation_m: [0, 0, 0]  # ^F t_S，m。
-    # 仿真场景真值 ^F T_S：启动时据此生成临时机器人 URDF 的传感器固定关节，
-    # 同一真值也进入轮廓生成节点和精度评价。不要与上面的求解初值混淆。
-    # 修改后重新启动仿真；真机配置不读取这一段作为真实安装值。
+    # 只在仿真进行手眼真值误差评价；真机不能把名义安装值当真值。
     evaluation:
       truth_available: true  # true 才计算与下列仿真真值的旋转/平移误差。
       handeye_rotation: [0.0604898732, 0.8875159337, -0.4567892759,
                          -0.9852687180, -0.0202462665, -0.1698106065,
                          -0.1599578964, 0.4603320063, 0.8732169921] # 仿真真值 ^F R_S。
       handeye_translation_m: [-0.011579, -0.004621, 0.359284]  # 真值 ^F t_S，m。
-    # 仅用于仿真场景准备：根据板/手眼真值与引导线自动计算参考关节位姿。
-    # 不向标定算法泄漏真值；真机仍需人工初始对齐。不可达或碰撞时启动报告不可行。
-    simulation_auto_reference:
-      enabled: true  # false 保留原有固定参考关节位姿，供人工调整或对照实验。
-      minimum_outward_sensor_y_cosine: 0.30 # +Y_S 在水平面内背离机器人基座的最小方向余弦；<0 表示朝向基座。
-      # 自动候选的“舒展姿态”偏好，仅用于仿真初始摆位，不进入标定求解。
-      # 角度对应 J1..J6；前三轴优先保持自然的基座/大臂/小臂姿态，
-      # J6 允许较大旋转（主要改变工具自身朝向，对整臂外观影响较小）。
-      preferred_joints_deg: [-13.56, -2.81, -36.48, -23.04, -61.37, 50.31]
-      posture_weights: [1.5, 2.5, 2.0, 0.8, 0.8, 0.15]
     maximum_scored_candidates: 8    # 每轮实际计算信息分数的候选数量上限。
     maximum_planning_candidates: 32 # 为得到可执行候选而送入运动规划的数量上限。
     collection_mode: automatic      # 种子采集模式；automatic 自动运动，manual 人工摆位。
     manual_max_joint_speed_rad_s: 0.02  # 人工采集时判定机器人已停稳的关节速度阈值。
-    simulation_publish_rate_hz: 60.0 # 仿真原始轮廓/同步法兰位姿的目标发布率；ROI 每 4 帧处理 1 帧，端点目标约 5 Hz。
 
     # 后端接口约定：仿真/真机启动文件可重映射话题，标定节点不依赖后端。
     interfaces:
@@ -58,17 +45,13 @@
 
     board:
       # 保持板角位置不变，使现有脚本初始位姿仍能看到指定两条边。
-      # 本组参数是仿真板的唯一物理几何来源：启动时生成 Gazebo 可视/碰撞盒，
-      # 场景节点据此生成轮廓及初始 MoveIt 碰撞盒；C 位于板的上表面角点。
-      # 开启 simulation_auto_reference 后会重新计算初始关节位姿；不保证任意几何配置都可行。
+      # Gazebo 实体板的盒体中心和尺寸须与此处同步。
       corner: [0.7, 0.0, 0.25]  # 目标共享角点 C 在基坐标系的位置，m。
-      rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]  # 局部 u/v/n 到基座的行优先正交旋转矩阵。
-      length_u_m: 0.15  # 从 C 沿局部 u 方向的边长，m。
-      length_v_m: 0.20  # 从 C 沿局部 v 方向的边长，m。
-      thickness_m: 0.01 # 板从上表面沿 -n 方向延伸的实体厚度，m。
-      collision_margin_m: 0.005 # MoveIt 碰撞盒额外安全余量；Gazebo 实体盒不扩张，m。
+      rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]  # 板局部 u/v/n 轴到基座的行优先旋转矩阵。
+      length_u_m: 0.15  # 从 C 沿局部 u 方向的实体板边长，m。
+      length_v_m: 0.20  # 从 C 沿局部 v 方向的实体板边长，m。
 
-    # 简化仿真误差：轮廓点 0.5 mm，断点仅由该含噪轮廓实测提取；
+    # 简化仿真误差：轮廓点 0.5 mm、检测输出断点额外 0.5 mm、
     # 机器人绝对定位 3D RMS 1 mm、重复定位 3D RMS 0.02 mm；其余噪声为零。
     # 距离字段单位为米；修改后须重启仿真。--stress-noise 会另行覆盖板面形貌。
     simulation_noise:
@@ -101,9 +84,13 @@
 
     # 仿真与真机共用检测节点；该节点只接收轮廓，不读取仿真真值。
     endpoint_detection:
-      # ── 1. 检测后端 ──
-      # 与真机一样，轮廓进入 ROI/CSRT 检测及重捕获状态机；不再对检测结果二次加噪。
-      backend: roi                     # 可选 classic 或 roi；当前仿真与真机均使用 roi。
+      # ── 1. 检测后端与仿真专用断点噪声 ──
+      # 仿真继续采用经典几何检测；真机在覆盖配置中使用 ROI/CSRT。
+      backend: classic                 # 可选 classic 或 roi
+      # 经典检测成功后，仅在仿真发布的两个断点 X/Z 上各加独立高斯定位误差。
+      # 真机 runtime.backend=real 时强制为零；不会改变边身份或内部跟踪状态。
+      simulation_localization_std_m: 0.0005  # 检测输出两个断点 X/Z 各轴额外加入 0.5 mm 高斯定位误差。
+      simulation_localization_seed: 20260728 # 上述端点噪声随机种子，便于重现实验。
 
       # ── 2. ROS 输入、输出与控制话题 ──
       input_topic: /gocator/profile  # 待检测的原始轮廓话题。
@@ -118,7 +105,7 @@
       minimum_points: 12            # 一帧轮廓允许进入检测的最少点数。
       minimum_segment_points: 10    # 候选板面线段拟合所需最少点数。
       minimum_segment_length_m: 0.010  # 候选线段最短长度，m；不是伺服的 70 mm 工作带。
-      maximum_segment_length_m: 0.350  # 与真机 ROI 后端一致，覆盖当前平板对角线。
+      maximum_segment_length_m: 0.800  # 候选线段最长长度，m。
       absolute_neighbor_gap_m: 0.004   # 分割轮廓时相邻点距离的绝对断裂阈值，m。
       neighbor_gap_multiplier: 8.0     # 相邻点间距相对典型采样间隔的放大阈值。
       residual_mad_multiplier: 3.5     # 稳健线拟合中以 MAD 标准差筛除残差的倍数。
@@ -143,9 +130,9 @@
       identity_ambiguity_ratio: 0.05  # 两种端点身份配对代价过近时判为身份歧义的比例。
       # 0 表示仿真不按轮廓中点筛选；真机使用较宽中心 ROI 避免选中工作台。
       maximum_abs_surface_midpoint_x_m: 0.0 # 候选板面线中点 |X_S| 上限；0 关闭该筛选。
-      # 自动参考位姿使用“左端=e1”的有向截线，使传感器 +Y_S 背离基座；
+      # 在现有参考位姿，采集顺序的首个端点属于物理边 e2；
       # 后续按时间关联身份，不能逐帧简单地按 X 坐标重新排序。
-      initial_first_label: e1  # 初次锁定时采集顺序第一个端点的物理边标签。
+      initial_first_label: e2  # 初次锁定时采集顺序第一个端点的物理边标签。
       minimum_confidence: 0.25 # 发布有效候选检测所需的最低置信度。
 
       # ── 6. 初始对齐与目标锁定 ──
@@ -155,7 +142,7 @@
       # 小板及双特征控制器要求参考轮廓进入 70–90 mm 工作带；
       # 引导线与脚本自动设置的新初始位姿匹配，真机仍使用自己的现场引导线。
       alignment_template_center_x_m: 0.0     # 初始紫色期望线中点的传感器 X_S，m。
-      alignment_template_center_z_m: 0.5275  # 初始紫色期望线中点的传感器 Z_S，m。
+      alignment_template_center_z_m: 0.3275  # 初始紫色期望线中点的传感器 Z_S，m。
       alignment_template_length_m: 0.080     # 期望线段长度，m；供人工初始对齐。
       alignment_template_angle_deg: 28.0    # 期望线在 X_S-Z_S 平面的方向角，deg。
       alignment_normal_gate_m: 0.004         # ALIGN 时候选线段到引导线的法向偏离门限，m。
@@ -198,35 +185,34 @@
       # ── 10. 跟踪结果的连续性和断点间距保护 ──
       # 10 mm 仅是检测的绝对长度下限；锁定两条物理边后，
       # 使用身份和拓扑连续性，避免跟踪器漂移到线段内部的弱特征。
-      tracking_maximum_endpoint_step_m: 0.05 # 连续帧单端点允许的最大跳动，m。
+      tracking_maximum_endpoint_step_m: 0.003 # 连续帧单端点允许的最大跳动，m。
       tracking_minimum_reference_length_ratio: 0.60 # 当前断点间距相对锁定参考长度的下限。
       tracking_maximum_reference_length_ratio: 1.80 # 当前断点间距相对锁定参考长度的上限。
 
-      # ── 11. ROI/CSRT 后端专用 ──
-      # 检测和跟踪流程与真机相同；引导线位置和板面扩展阈值适应仿真场景与轮廓噪声。
-      roi_size_m: 0.020  # 每个端点 CSRT 跟踪方框的物理尺寸，m。
+      # ── 11. ROI/CSRT 后端专用；当前仿真 backend=classic 不启用 ──
+      # 以下为 ROI/CSRT 后端参数；仿真经典检测后端不会使用这些参数。
+      roi_size_m: 0.020  # 每个端点 CSRT 跟踪方框的物理尺寸，m；classic 后端不用。
       fail_streak_frames: 3  # 连续跟踪失败达到该帧数时触发后端恢复处理。
       tracker_name: csrt    # ROI 跟踪器算法名。
       raster_res_mm: 0.25   # 将 X-Z 轮廓光栅化为图像时每像素的尺寸，mm。
-      roi_process_every_n_frames: 4 # 与真机一致，每 4 帧处理 1 帧。
+      roi_process_every_n_frames: 1 # 每隔多少原始帧运行一次 ROI/CSRT 处理。
       raster_point_radius_px: 2      # 光栅图上单个轮廓点的绘制半径，px。
       raster_margin_m: 0.020         # 光栅图覆盖轮廓范围外额外留的边距，m。
       raster_maximum_dimension_px: 2400 # 光栅图允许的最长边像素数上限。
       core_fraction: 0.70            # ROI 中央核心区域相对于整框的比例。
-      roi_jump_m: 0.030              # 与真机一致的 CSRT 跟踪框单步跳动门限，m。
-      bp_jump_m: 0.030               # 与真机一致的实测断点相对跟踪框跳动门限，m。
+      roi_jump_m: 0.015              # CSRT 跟踪框中心单步跳动门限，m。
+      bp_jump_m: 0.015               # 实测断点相对跟踪框的跳动门限，m。
       # 避免两个 ROI 逐渐收缩并跟到同一个内部特征。
-      roi_tracking_minimum_chord_ratio: 0.20 # 与真机一致的间距比例下限。
-      roi_tracking_maximum_chord_ratio: 6.00 # 与真机一致的间距比例上限。
-      # 仿真轮廓逐点标准差为 0.5 mm；实测检查表明真机默认 0.8 mm 会过早截断板面。
-      plate_growth_residual_threshold_m: 0.0030 # 约 6 倍逐点噪声标准差，避免随机尖点截断板面。
+      roi_tracking_minimum_chord_ratio: 0.45 # 跟踪断点间距相对锁定值的最小比例。
+      roi_tracking_maximum_chord_ratio: 2.50 # 跟踪断点间距相对锁定值的最大比例。
+      plate_growth_residual_threshold_m: 0.0008 # 从种子向外扩展板面点的残差门限，m。
       roi_surface_residual_threshold_m: 0.0012 # ROI 内点归属目标板面线的残差门限，m。
 
     sensor:
       # 硬域和安全域均使用米制传感器 X_S-Z_S 坐标。
       # 六元顺序均为 [z_near,z_far,x_left_near,x_left_far,x_right_near,x_right_far]。
-      hard_trapezoid: [-0.292, 0.82, -0.021, -0.22, 0.021, 0.22] # 传感器外层可测域；越界视为无效。
-      safe_trapezoid: [-0.270, 0.80, -0.020, -0.21, 0.020, 0.21]     # 内层规划/采集安全域，供余量检查。
+      hard_trapezoid: [-0.292, 0.82, -0.021, -0.22, -0.019, 0.22] # 传感器外层可测域；越界视为无效。
+      safe_trapezoid: [0.20, 0.78, -0.115, -0.19, 0.095, 0.19]     # 内层规划/采集安全域，供余量检查。
       # 旧字段仅用于兼容早期启动文件。
       min_range_m: 0.27       # 无显式梯形时的近端深度，m；本配置有显式梯形。
       max_range_m: 0.82       # 无显式梯形时的远端深度，m。
@@ -250,25 +236,16 @@
       maximum_translation_step_m: 0.012 # legacy 单特征平移控制器的单步上限，m。
       # 与真机使用同一双特征 Broyden 平移伺服控制律。
       servo:
-        controller: "broyden_dual" # 局部 Broyden 控制；仿真启用下方 z_mid 时为三特征，否则为 x_mid+断点间距双特征。
+        controller: "broyden_dual" # 双特征 x_mid+断点间距控制；legacy 为旧版单特征控制。
         # 双断点间距的工作带及期望中心值，单位为米。
         length_lower_m: 0.070  # 无需纠偏的断点间距工作带下界，m。
         length_upper_m: 0.090  # 工作带上界，m。
         length_target_m: 0.080 # 超出工作带时平移伺服趋向的内部目标间距，m。
-        # 仿真专用第三反馈量：在断点接近梯形安全域边界时，提前把轮廓中点
-        # 向较深的测量位置移动，以争取更宽的横向可测范围。真机配置未启用。
-        z_mid:
-          enabled: true # 将 z_mid 与 x_mid、断点间距一同纳入局部 Broyden 平移伺服。
-          lower_m: 0.520 # 正常工作带下界；参考位姿约 0.5275 m，不会一开始强制平移。
-          target_m: 0.580 # 需要深度修正时趋向的内部目标，m。
-          upper_m: 0.620 # 正常工作带上界；超过后向 target 回调。
-          reserve_trigger_margin_m: 0.040 # 任一端点到梯形安全域边界 <40 mm 时提前启动向深处修正。
-          prediction_guard_margin_m: 0.010 # 旋转前馈预测 z_mid 距近/远端边界至少留 10 mm。
         # 硬保护带：超界观测不能更新在线 Jacobian，并触发回退。
         hard_minimum_length_m: 0.010 # 指定物理边身份的断点间距硬下界，m。
         hard_maximum_length_m: 0.150 # 指定物理边身份的断点间距硬上界，m。
         gain: 0.80                    # 阻尼最小二乘平移纠偏增益，范围 (0,1]。
-        damping: 0.05                 # 求局部平移-特征 Jacobian 阻尼伪逆时的系数。
+        damping: 0.05                 # 求 2×3 Jacobian 伪逆时的阻尼系数。
         maximum_axis_step_m: 0.006   # 单次平移每个法兰局部轴的绝对位移上限，m。
         maximum_norm_step_m: 0.009   # 单次三维平移向量范数上限，m。
         minimum_update_step_m: 0.0002 # 实测平移小于该值时不更新 Broyden Jacobian，m。
@@ -299,7 +276,7 @@
       measurement_batch_size: 18  # 每个位姿希望采集的有效同步轮廓帧数。
       minimum_batch_inliers: 14    # MAD 剔除异常整帧后，允许保存的最少内点帧数。
       maximum_batch_frames: 30     # 为凑足目标有效帧，最多读取的原始同步帧数。
-      measurement_batch_timeout_s: 15.0 # ROI 每 4 帧处理 1 帧；给 18 帧目标及 MAD 离群筛除留足时间，成功后立即结束。
+      measurement_batch_timeout_s: 6.0 # 单个位姿定点采集超时，s。
       endpoint_mad_multiplier: 3.5 # 多帧端点偏差的 MAD 离群筛除倍数。
       # 目标失败时先减小角度重试，再考虑保存安全部分位姿或跳过该分支。
       maximum_target_failures: 3 # 同一目标分支累计失败达到该次数后转入终止/参考位姿重试策略。
@@ -335,9 +312,9 @@
         auto_skip_maximum_abs_x_mid_m: 0.010 # auto 跳过预检要求的参考中点偏差上限，m。
         auto_skip_minimum_domain_margin_m: 0.030 # auto 跳过预检要求的参考安全余量，m。
       # 保留仿真运动时间；真机的速度、超时与停稳时间由真机覆盖配置决定。
-      motion_duration_s: 0.3 # 种子阶段单个关节轨迹指令的目标执行时间，s。
-      motion_timeout_s: 100.0   # 种子运动等待控制器完成的超时设置，s。
-      settling_time_s: 0.35  # 种子运动后等待机械臂/观测稳定的时间，s。
+      motion_duration_s: 0.5 # 种子阶段单个关节轨迹指令的目标执行时间，s。
+      motion_timeout_s: 4.0   # 种子运动等待控制器完成的超时设置，s。
+      settling_time_s: 0.15   # 种子运动后等待机械臂/观测稳定的时间，s。
 
     settling_time_s: 0.15        # 顶层停稳等待参数；供主动标定等其他节点使用，s。
     maximum_measurement_age_s: 0.5 # 接收关节/轮廓/断点观测的最大墙钟时效，s。

@@ -4,6 +4,7 @@ Panels:
     Name: Displays
     Property Tree Widget:
       Expanded:
+        - /CalibMarkers1/Namespaces1
         - /ProfileDetection1/Namespaces1
         - /TF1/Frames1
       Splitter Ratio: 0.5
@@ -129,7 +130,13 @@ Visualization Manager:
       Enabled: true
       Name: CalibMarkers
       Namespaces:
-        {}
+        fov_plane_edge: true
+        fov_plane_surface: true
+        intersection_line: true
+        plate: false
+        plate_edge: true
+        scanline: true
+        sensor_frame: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -141,7 +148,11 @@ Visualization Manager:
       Enabled: true
       Name: ProfileDetection
       Namespaces:
-        {}
+        axes: true
+        detected_endpoints: true
+        detection_guide: true
+        profile: true
+        target_surface: true
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -179,7 +190,72 @@ Visualization Manager:
           Expand Joint Details: false
           Expand Link Details: false
           Expand Tree: false
+          J1_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J2_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J3_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J4_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J5_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J6_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           Link Tree Style: Links in Alphabetic Order
+          base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          ee_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fanuc_flange:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          flange:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          gocator_sensor:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          tool0:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          weld_gun:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          world:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
         Loop Animation: false
         Robot Alpha: 0.5
         Robot Color: 150; 50; 150
@@ -225,28 +301,138 @@ Visualization Manager:
           Expand Joint Details: false
           Expand Link Details: false
           Expand Tree: false
+          J1_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J2_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J3_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J4_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J5_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          J6_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
           Link Tree Style: Links in Alphabetic Order
+          base_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          ee_link:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          fanuc_flange:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          flange:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          gocator_sensor:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          tool0:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+          weld_gun:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
+            Value: true
+          world:
+            Alpha: 1
+            Show Axes: false
+            Show Trail: false
         Robot Alpha: 1
         Show Robot Collision: false
         Show Robot Visual: true
       Value: true
       Velocity_Scaling_Factor: 0.1
     - Class: rviz_default_plugins/TF
-      Enabled: false
+      Enabled: true
       Filter (blacklist): ""
       Filter (whitelist): ""
       Frame Timeout: 15
       Frames:
         All Enabled: false
+        J1_link:
+          Value: false
+        J2_link:
+          Value: false
+        J3_link:
+          Value: false
+        J4_link:
+          Value: false
+        J5_link:
+          Value: false
+        J6_link:
+          Value: false
+        base_link:
+          Value: false
+        ee_link:
+          Value: false
+        fanuc_flange:
+          Value: true
+        flange:
+          Value: false
+        gocator_sensor:
+          Value: true
+        tool0:
+          Value: false
+        weld_gun:
+          Value: false
+        world:
+          Value: false
       Marker Scale: 1
       Name: TF
       Show Arrows: true
       Show Axes: true
       Show Names: false
       Tree:
-        {}
+        world:
+          base_link:
+            J1_link:
+              J2_link:
+                J3_link:
+                  J4_link:
+                    J5_link:
+                      J6_link:
+                        flange:
+                          ee_link:
+                            {}
+                          fanuc_flange:
+                            gocator_sensor:
+                              {}
+                            tool0:
+                              {}
+                            weld_gun:
+                              {}
       Update Interval: 0
-      Value: false
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -286,25 +472,25 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 3.285086154937744
+      Distance: 0.6126288771629333
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
       Focal Point:
-        X: 1.1359992027282715
-        Y: -0.02500755712389946
-        Z: 0.10919325053691864
+        X: 0.7671261429786682
+        Y: -0.010545660741627216
+        Z: 0.17249639332294464
       Focal Shape Fixed Size: true
       Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: -0.12020247429609299
+      Pitch: 0.3947980999946594
       Target Frame: <Fixed Frame>
       Value: Orbit (rviz_default_plugins)
-      Yaw: 1.1531864404678345
+      Yaw: 1.6281883716583252
     Saved: ~
 Window Geometry:
   Displays:

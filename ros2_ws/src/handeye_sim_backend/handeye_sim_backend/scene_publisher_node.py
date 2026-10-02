@@ -180,6 +180,8 @@ class ScenePublisher(Node):
         )
         self.declare_parameter('board.length_u_m', 0.4)
         self.declare_parameter('board.length_v_m', 0.5)
+        self.declare_parameter('board.thickness_m', 0.01)
+        self.declare_parameter('board.collision_margin_m', 0.005)
         C = np.asarray(self.get_parameter('board.corner').value, dtype=float)
         R_plate = np.asarray(
             self.get_parameter('board.rotation').value, dtype=float
@@ -187,12 +189,35 @@ class ScenePublisher(Node):
         u_B, v_B, n_B = R_plate[:, 0], R_plate[:, 1], R_plate[:, 2]
         w = float(self.get_parameter('board.length_u_m').value)
         h = float(self.get_parameter('board.length_v_m').value)
+        thickness = float(self.get_parameter('board.thickness_m').value)
+        collision_margin = float(self.get_parameter('board.collision_margin_m').value)
+        if min(w, h, thickness) <= 0.0 or collision_margin < 0.0:
+            raise ValueError('board dimensions must be positive and collision margin nonnegative')
 
         # 手眼真值 — gocator_sensor 原点位于激光平面内，但不在激光窗口上。
         # fanuc_flange → gocator_sensor 关节: xyz=[-0.0116,-0.0046,0.3593] rpy=[0.485,0.161,-1.509]
         # 激光窗口约位于 z_S=-0.29 m，见 fov_factory_calib.json。
-        R_he = HAND_EYE_ROTATION.copy()
-        t_he = HAND_EYE_TRANSLATION.copy()
+        # The YAML truth also generates the runtime robot URDF.  Do not let
+        # the profile fallback silently retain a different fixed transform.
+        self.declare_parameter(
+            'evaluation.handeye_rotation', HAND_EYE_ROTATION.reshape(-1).tolist()
+        )
+        self.declare_parameter(
+            'evaluation.handeye_translation_m', HAND_EYE_TRANSLATION.tolist()
+        )
+        R_he = np.asarray(
+            self.get_parameter('evaluation.handeye_rotation').value, dtype=float
+        ).reshape(3, 3)
+        t_he = np.asarray(
+            self.get_parameter('evaluation.handeye_translation_m').value, dtype=float
+        ).reshape(3)
+        if (
+            not np.isfinite(R_he).all()
+            or not np.isfinite(t_he).all()
+            or not np.allclose(R_he.T @ R_he, np.eye(3), atol=1e-5)
+            or not np.isclose(np.linalg.det(R_he), 1.0, atol=1e-5)
+        ):
+            raise ValueError('evaluation hand-eye truth must be a finite SE(3) transform')
 
         X_gt = make_transform(R_he, t_he)
         R_he, t_he = X_gt[:3, :3], X_gt[:3, 3]
@@ -203,6 +228,8 @@ class ScenePublisher(Node):
         self.scene = {
             'C': C, 'n_B': n_B, 'u_B': u_B, 'v_B': v_B,
             'w': w, 'h': h,
+            'thickness_m': thickness,
+            'collision_margin_m': collision_margin,
             'R_he': R_he, 't_he': t_he,
             'R_plate': R_plate,
             'fov_corners_S': fov_corners_S,
@@ -244,7 +271,12 @@ class ScenePublisher(Node):
         self.get_logger().info(
             "仿真噪声已启用: "
             f"profile={1e3 * self.noise_config.profile_gaussian_std_m:.3f} mm, "
-            f"robot_t={1e3 * self.noise_config.robot_translation_std_m:.3f} mm, "
+            f"robot_absolute_3d_rms="
+            f"{1e3 * self.noise_config.robot_absolute_translation_rms_m:.3f} mm, "
+            f"robot_repeat_3d_rms="
+            f"{1e3 * self.noise_config.robot_repeatability_translation_rms_m:.3f} mm, "
+            f"robot_legacy_axis_std="
+            f"{1e3 * self.noise_config.robot_translation_std_m:.3f} mm, "
             f"robot_R={self.noise_config.robot_rotation_std_deg:.4f} deg, "
             f"flatness={1e3 * self.noise_config.board_flatness_rms_m:.3f} mm, "
             f"sync_jitter={1e3 * self.noise_config.sync_jitter_std_s:.3f} ms"
@@ -645,13 +677,19 @@ class ScenePublisher(Node):
         collision.id = 'calibration_plate'
         primitive = SolidPrimitive()
         primitive.type = SolidPrimitive.BOX
-        primitive.dimensions = [scene['w'], scene['h'], 0.01]
+        thickness = scene['thickness_m']
+        margin = scene['collision_margin_m']
+        primitive.dimensions = [
+            scene['w'] + 2.0 * margin,
+            scene['h'] + 2.0 * margin,
+            thickness + 2.0 * margin,
+        ]
         pose = Pose()
         center = (
             scene['C']
             + 0.5 * scene['w'] * scene['u_B']
             + 0.5 * scene['h'] * scene['v_B']
-            - 0.005 * scene['n_B']
+            - 0.5 * thickness * scene['n_B']
         )
         pose.position = Point(x=float(center[0]), y=float(center[1]), z=float(center[2]))
         quaternion = matrix_to_quat(scene['R_plate'])

@@ -3,12 +3,12 @@
   <model name="calibration_plate">
     <static>true</static>
     <link name="plate_link">
-      <!-- board.corner is the u0/v0 top-surface corner; box pose is its center -->
-      <pose>0.9 0.25 0.245 0 0 0</pose>
+      <!-- 仅作为材质/结构模板；start_simulation.sh 会按 calibration.yaml 生成本次运行的位姿和尺寸。 -->
+      <pose>0.775 0.1 0.245 0 0 0</pose>
       <visual name="visual">
         <geometry>
           <box>
-            <size>0.4 0.5 0.01</size>
+            <size>0.15 0.20 0.01</size>
           </box>
         </geometry>
         <material>
@@ -19,7 +19,7 @@
       <collision name="collision">
         <geometry>
           <box>
-            <size>0.4 0.5 0.01</size>
+            <size>0.15 0.20 0.01</size>
           </box>
         </geometry>
       </collision>

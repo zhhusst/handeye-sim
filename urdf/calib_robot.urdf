@@ -112,6 +112,9 @@
     <visual>
       <origin xyz="0 0 -0.270" rpy="0 0 0" />
       <geometry><mesh filename="file:///workspace/meshes/Gocator_2450.dae" /></geometry>
+      <material name="gocator_gray">
+        <color rgba="0.4 0.4 0.4 1.0" />
+      </material>
     </visual>
     <collision>
       <origin xyz="0 0 -0.270" rpy="0 0 0" />
@@ -126,6 +129,9 @@
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry><mesh filename="file:///workspace/meshes/weldgun.stl" scale="0.001 0.001 0.001" /></geometry>
+      <material name="weld_gun_gray">
+        <color rgba="0.28 0.28 0.28 1.0" />
+      </material>
     </visual>
     <collision>
       <origin xyz="0 0 0" rpy="0 0 0" />

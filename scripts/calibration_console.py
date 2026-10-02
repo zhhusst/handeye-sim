@@ -123,6 +123,150 @@ TARGET_NAMES = {
     "complete": "已完成",
 }
 
+SEED_FAILURE_NAMES = {
+    "bilateral feature became unsafe": "旋转后双断点未保持有效或超出安全域",
+    "servo left the safe bilateral region": "平移修正后双断点超出安全域",
+    "endpoint separation crossed the intended-edge hard guard": "断点间距越过指定物理边的硬保护范围",
+    "no rotation step preserves predicted endpoint spacing": "预测下一微步会使断点间距越过硬保护范围",
+    "bilateral feature missing before micro-rotation": "旋转前缺少同步双断点测量",
+    "servo IK failure": "平移修正目标无可用逆解",
+    "rotation IK failure": "旋转目标无可用逆解",
+    "dual-feature probing did not obtain three valid axes": "平移探测未取得三个有效轴向响应",
+    "feature missing after probe": "平移探测返回后没有有效双断点",
+    "feature invalid after dual-feature probing": "平移探测后双断点未通过有效性检查",
+    "no usable translation-servo axis": "未找到可用的平移伺服方向",
+    "translation servo iteration limit reached": "平移伺服达到最大迭代次数仍未收敛",
+}
+
+DETECTOR_REASON_NAMES = {
+    "tracked_endpoint_topology_rejected": "候选断点对未通过拓扑/身份一致性检查",
+    "partial_endpoint_coast_exceeded": "只剩部分断点，预测续跟已超限",
+    "no_valid_linear_segment": "没有找到有效的平板表面线段",
+    "local_reacquire_pending": "正在等待局部重捕获",
+    "maximum_coast_frames_exceeded": "预测续跟帧数已超限",
+}
+
+
+def format_seed_motion_event(event: dict, total_seeds: int) -> str:
+    """Render one committed motion event without guessing from a progress bar."""
+    branch = int(event.get("branch_index", 0))
+    branch_total = int(event.get("branch_total", 0))
+    target = str(event.get("target", "?"))
+    name = TARGET_NAMES.get(target, target)
+    prefix = (
+        f"[参考位姿｜已采种子 {event.get('seed_count', '?')}/{total_seeds}]"
+        if target == "reference"
+        else (
+            f"[旋转分支 {branch}/{branch_total}｜已采种子 "
+            f"{event.get('seed_count', '?')}/{total_seeds}｜{name}]"
+        )
+    )
+    kind = event.get("kind")
+    angle = float(event.get("angle_deg", 0.0))
+    if kind == "BRANCH_START":
+        return (
+            f"{prefix} 开始：由参考位姿出发，目标 "
+            f"{float(event.get('target_angle_deg', 0.0)):.2f}°；"
+            f"初始微步 {float(event.get('step_deg', 0.0)):.2f}°；"
+            f"参考位姿重试 {event.get('restart_count', 0)} 次。"
+        )
+    if kind == "ROTATION_COMMAND":
+        return (
+            f"{prefix} 旋转命令：{float(event.get('from_deg', angle)):.2f}° → "
+            f"{float(event.get('to_deg', angle)):.2f}°，"
+            f"本步 {float(event.get('step_deg', 0.0)):.2f}°；"
+            f"同步平移前馈 {float(event.get('feedforward_mm', 0.0)):.2f} mm。"
+        )
+    if kind in {"ROTATION_OBSERVED", "SERVO_OBSERVED", "LOCAL_REACQUIRED"}:
+        action = {
+            "ROTATION_OBSERVED": "旋转观测有效",
+            "SERVO_OBSERVED": "平移修正后观测有效",
+            "LOCAL_REACQUIRED": "回退后已重新锁定双断点",
+        }[kind]
+        return (
+            f"{prefix} {action}：累计旋转 {angle:.2f}°；"
+            f"x_mid {float(event.get('x_mid_mm', 0.0)):.2f} mm，"
+            f"断点间距 {float(event.get('length_mm', 0.0)):.2f} mm，"
+            f"安全余量 {float(event.get('margin_mm', 0.0)):.2f} mm。"
+        )
+    if kind == "SERVO_COMMAND":
+        return (
+            f"{prefix} 平移修正：保持旋转 {angle:.2f}°，"
+            f"修正前间距 {float(event.get('length_mm', 0.0)):.2f} mm、"
+            f"x_mid {float(event.get('x_mid_mm', 0.0)):.2f} mm；"
+            f"本步平移 {float(event.get('displacement_mm', 0.0)):.2f} mm。"
+        )
+    if kind == "FAILURE":
+        reason = str(event.get("reason", "unknown"))
+        reason_cn = SEED_FAILURE_NAMES.get(reason, reason)
+        stage = {
+            "MICRO_ROTATION": "旋转后",
+            "BEFORE_MICRO_ROTATION": "旋转前检查时",
+            "SERVO": "平移修正后",
+            "SERVO_PRECHECK": "平移修正前检查时",
+            "PROBE_OUT": "平移探测外移后",
+            "PROBE_BACK": "平移探测返回后",
+        }.get(event.get("stage"), "运动检查时")
+        measurement = (
+            "当前无同步有效双断点"
+            if event.get("measurement") == "missing"
+            else (
+                f"断点间距 {float(event.get('length_mm', 0.0)):.2f} mm、"
+                f"安全余量 {float(event.get('margin_mm', 0.0)):.2f} mm"
+            )
+        )
+        detector_reason = event.get("detector_reason")
+        detector_fallback = event.get("detector_fallback")
+        if detector_reason:
+            measurement += (
+                "；检测器："
+                + DETECTOR_REASON_NAMES.get(detector_reason, detector_reason)
+            )
+        if detector_fallback and detector_fallback != detector_reason:
+            measurement += (
+                "；跟踪器："
+                + DETECTOR_REASON_NAMES.get(detector_fallback, detector_fallback)
+            )
+        recovery = {
+            "LOCAL_RETRY": (
+                "先回上一个有效位姿并重新锁定断点，再以 "
+                f"{float(event.get('retry_step_deg', 0.0)):.2f}° 重试"
+            ),
+            "REFERENCE_RETRY": "先回上一个有效位姿，再回参考位姿以固定 0.50° 重试本分支",
+            "SKIP_BRANCH": "先回上一个有效位姿，再跳过本分支",
+        }.get(event.get("recovery"), "等待恢复检查")
+        next_failure = {
+            "REFERENCE_RETRY": "若再失败，将回参考位姿以 0.50° 重试",
+            "SKIP_BRANCH": "若再失败，将跳过本分支",
+            "REDUCE_STEP": "若再失败，将继续缩小微步",
+        }.get(event.get("if_next_fails"), "")
+        history = "；".join(
+            f"第{item.get('number', '?')}次："
+            f"{SEED_FAILURE_NAMES.get(item.get('reason'), item.get('reason'))}"
+            for item in event.get("history", [])[-3:]
+        )
+        return (
+            f"{prefix} 失败 {event.get('failure_count', '?')}/"
+            f"{event.get('failure_limit', '?')}（{stage}）："
+            f"关联旋转微步 {float(event.get('from_deg', angle)):.2f}° → "
+            f"{float(event.get('to_deg', angle)):.2f}°，"
+            f"本次失败原因：{reason_cn}；{measurement}。\n"
+            f"    本轮失败记录：{history}。\n"
+            f"    接下来：{recovery}。"
+            + (f"{next_failure}。" if next_failure else "")
+        )
+    if kind == "REFERENCE_RETRY":
+        return f"{prefix} 局部退避已到下限；回参考位姿，以固定 0.50° 重新走本分支。"
+    if kind == "RETURN_REFERENCE":
+        return "[自动种子] 正在分段回到参考位姿，为下一分支准备。"
+    if kind == "REACQUIRE_FAILED":
+        return f"{prefix} 回退后双断点未能重新锁定：{event.get('reason', '?')}。"
+    if kind == "BRANCH_SKIPPED":
+        return f"{prefix} 最小微步重试仍失败，跳过此旋转分支。"
+    if kind == "CAPTURE_START":
+        return f"{prefix} 到达采集位姿，开始定点采集同步轮廓帧。"
+    return f"{prefix} {kind}。"
+
 INITIAL_REASON_NAMES = {
     "measurement_missing": "缺少同步双边测量",
     "joints_missing": "缺少新鲜关节状态",
@@ -605,9 +749,18 @@ class CalibrationConsole:
                     f"整帧漏检 {100 * noise['frame_dropout_probability']:.2f}%"
                 )
                 if not noise.get("direct_endpoint_injection_active", True):
-                    print(
-                        "           直接断点真值注噪已禁用；断点误差由原始轮廓检测自然产生。"
+                    config = yaml.safe_load(PARAM_FILE.read_text(encoding="utf-8"))
+                    endpoint_std_m = float(
+                        config["/**"]["ros__parameters"]["endpoint_detection"].get(
+                            "simulation_localization_std_m", 0.0
+                        )
                     )
+                    print("           直接断点真值注噪已禁用；断点先由原始轮廓检测。")
+                    if endpoint_std_m > 0:
+                        print(
+                            "           仿真发布的断点另加独立定位噪声："
+                            f"{1e3 * endpoint_std_m:.3f} mm（每个 X/Z 分量标准差）。"
+                        )
                 surface_model = configured_surface_model()
                 exceedances = noise_regime_exceedances(
                     noise, surface_model=surface_model
@@ -1152,9 +1305,10 @@ class CalibrationConsole:
     ) -> bool:
         print("\n[自动种子采集] 已开始。机器人会自动运动，请勿在 RViz 中下发目标。")
         previous_count = -1
-        previous_target = ""
+        last_event_seq = 0
         started_at = time.monotonic()
         last_status_at = started_at
+        last_heartbeat_at = started_at
         approval_seen = False
         while True:
             if node.poll() is not None:
@@ -1211,50 +1365,46 @@ class CalibrationConsole:
             except ValueError:
                 count = 0
                 total = 6
-            target = fields.get("target", "?")
-            target_cn = TARGET_NAMES.get(target.replace("_partial", ""), target)
-            if target.endswith("_partial"):
-                target_cn += "（安全部分角度）"
             state = fields.get("state", "?")
             state_cn = STATE_NAMES.get(state, state)
-            rotation = fields.get("rotation_deg", "?")
-            rotation_step = fields.get("rotation_step_deg", "?")
-            feedforward_samples = fields.get(
-                "rotation_feedforward_samples", "0"
-            )
-            feedforward_norm = fields.get(
-                "rotation_feedforward_norm_mm", "0"
-            )
-            target_failures = fields.get("target_failures", "0/3")
-            preflight = fields.get("preflight", "0/4")
-            preflight_mode = fields.get("preflight_mode", "?")
-            if fields.get("preflight_required") == "false":
-                preflight_text = f"已跳过({preflight_mode})"
-            elif fields.get("phase") == "PREFLIGHT":
-                preflight_text = f"进行中({preflight_mode}) {preflight}"
-            else:
-                preflight_text = f"已执行({preflight_mode}) {preflight}"
-            seed_batch = fields.get("seed_batch", "0/?")
             elapsed = time.monotonic() - started_at
-            line = (
-                f"[自动种子] {progress_bar(count, total)} {count_text} | "
-                f"{target_cn} | {state_cn} | 旋转 {rotation}° "
-                f"(步长{rotation_step}°，前馈{feedforward_samples}次/"
-                f"{feedforward_norm}mm) | "
-                f"定点帧 {seed_batch} | "
-                f"预检 {preflight_text} | 本目标失败 {target_failures} | "
-                f"已用 {elapsed:.0f}s"
-            )
-            print("\r" + line.ljust(150), end="", flush=True)
-            if count != previous_count and count > 0:
-                print()
+            try:
+                events = json.loads(fields.get("motion_events_json", "[]"))
+                if not isinstance(events, list):
+                    events = []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                events = []
+            new_events = [
+                event for event in events
+                if isinstance(event, dict)
+                and int(event.get("seq", 0)) > last_event_seq
+            ]
+            if new_events and int(new_events[0]["seq"]) > last_event_seq + 1:
                 print(
-                    f"  ✓ 第 {count}/{total} 个种子已通过双边与旋转多样性检查"
+                    "[自动种子] 部分高速事件未进入终端窗口；"
+                    f"完整过程请查 {node.log_file} 和 full_run_bag。"
                 )
-            elif target != previous_target and previous_target:
-                print()
+            for event in new_events:
+                print(format_seed_motion_event(event, total))
+                last_event_seq = int(event["seq"])
+            if new_events:
+                last_heartbeat_at = time.monotonic()
+            if count != previous_count and count > 0:
+                print(
+                    f"[自动种子] ✓ 第 {count}/{total} 个种子已通过双边与旋转多样性检查"
+                )
+            elif time.monotonic() - last_heartbeat_at >= 10.0:
+                target = fields.get("target", "?")
+                target_cn = TARGET_NAMES.get(target.replace("_partial", ""), target)
+                print(
+                    f"[自动种子] 等待中：{target_cn}；{state_cn}；"
+                    f"已确认旋转 {fields.get('rotation_deg', '?')}°；"
+                    f"定点帧 {fields.get('seed_batch', '?')}；"
+                    f"本分支失败 {fields.get('target_failures', '?')}；"
+                    f"用时 {elapsed:.0f}s。"
+                )
+                last_heartbeat_at = time.monotonic()
             previous_count = count
-            previous_target = target
             if state == "DONE":
                 print(f"\n自动种子采集完成，用时 {elapsed:.1f} 秒。")
                 return seed_file.exists()

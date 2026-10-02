@@ -15,6 +15,11 @@ class SimulationNoiseConfig:
     random_seed: int = 20260728
     profile_gaussian_std_m: float = 0.000055
     endpoint_gaussian_std_m: float = 0.000080
+    # Stable, pose-dependent 3-D positioning error and per-arrival
+    # repeatability error.  Both values denote vector RMS, not axis-wise std.
+    robot_absolute_translation_rms_m: float = 0.0
+    robot_repeatability_translation_rms_m: float = 0.0
+    # Legacy per-axis, per-frame robot perturbation retained for old configs.
     robot_translation_std_m: float = 0.000030
     robot_rotation_std_deg: float = 0.003
     board_flatness_rms_m: float = 0.000030
@@ -32,6 +37,8 @@ class SimulationNoiseConfig:
         nonnegative = (
             "profile_gaussian_std_m",
             "endpoint_gaussian_std_m",
+            "robot_absolute_translation_rms_m",
+            "robot_repeatability_translation_rms_m",
             "robot_translation_std_m",
             "robot_rotation_std_deg",
             "board_flatness_rms_m",
@@ -94,6 +101,13 @@ class SimulationNoiseModel:
             None if config.random_seed < 0 else config.random_seed
         )
         self._flatness_coefficients = self.rng.normal(size=6)
+        # Draw once per run: revisiting the same flange pose reproduces the
+        # same absolute positioning error.  The smooth field also changes
+        # with translation and wrist orientation instead of being a single
+        # global shift that a free board corner could absorb entirely.
+        self._robot_absolute_coefficients = self.rng.normal(size=(3, 7))
+        self._repeatability_anchor: np.ndarray | None = None
+        self._repeatability_offset = np.zeros(3)
         grid = np.linspace(0.0, 1.0, 41)
         xi, eta = np.meshgrid(grid, grid, indexing="ij")
         raw = self._flatness_raw(xi.reshape(-1), eta.reshape(-1))
@@ -112,9 +126,40 @@ class SimulationNoiseModel:
 
     def perturb_flange(self, flange_transform: np.ndarray) -> np.ndarray:
         transform = np.asarray(flange_transform, dtype=float)
-        translation = transform[:3, 3] + self.rng.normal(
-            0.0, self.config.robot_translation_std_m, 3
-        )
+        translation = transform[:3, 3].copy()
+        if self.config.robot_absolute_translation_rms_m > 0.0:
+            position = translation
+            tool_axis = transform[:3, 2]
+            features = np.array(
+                [1.0, *np.sin(position / 0.3), *tool_axis], dtype=float
+            )
+            features /= np.linalg.norm(features)
+            translation += (
+                self.config.robot_absolute_translation_rms_m / np.sqrt(3.0)
+            ) * (self._robot_absolute_coefficients @ features)
+        if self.config.robot_repeatability_translation_rms_m > 0.0:
+            # Hold this offset while the robot remains at one target.  Once
+            # it has left that target, the next arrival (including a return
+            # to the same commanded pose) receives a new small offset.
+            moved = (
+                self._repeatability_anchor is None
+                or np.linalg.norm(
+                    transform[:3, 3] - self._repeatability_anchor[:3, 3]
+                ) > 1e-4
+                or np.linalg.norm(
+                    transform[:3, :3] - self._repeatability_anchor[:3, :3]
+                ) > 1e-3
+            )
+            if moved:
+                self._repeatability_anchor = transform.copy()
+                self._repeatability_offset = self.rng.normal(
+                    0.0,
+                    self.config.robot_repeatability_translation_rms_m
+                    / np.sqrt(3.0),
+                    3,
+                )
+            translation += self._repeatability_offset
+        translation += self.rng.normal(0.0, self.config.robot_translation_std_m, 3)
         rotation_vector = self.rng.normal(
             0.0, np.deg2rad(self.config.robot_rotation_std_deg), 3
         )

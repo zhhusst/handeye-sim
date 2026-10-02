@@ -4,9 +4,10 @@
 repeatability and as an explicitly selectable legacy mode.
 
 ``BroydenDualFeatureServo`` controls the measured feature vector
-``[x_mid, endpoint_separation]`` with local flange translations
-``[dx, dy, dz]``.  Its 2x3 image Jacobian is initialized by small measured
-probes and then updated only from accepted, physically valid observations.
+``[x_mid, endpoint_separation]`` (optionally also ``z_mid``) with local
+flange translations ``[dx, dy, dz]``.  Its 2x3 or 3x3 image Jacobian is
+initialized by small measured probes and then updated only from accepted,
+physically valid observations.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import numpy as np
 
 
 class BroydenDualFeatureServo:
-    """Damped least-squares 2-feature/3-axis servo with Broyden updates.
+    """Damped least-squares 2/3-feature, 3-axis servo with Broyden updates.
 
     All distances are expressed in metres.  Consequently the Jacobian maps
     local flange translation in metres to feature changes in metres and is
@@ -34,6 +35,7 @@ class BroydenDualFeatureServo:
         minimum_singular_value: float = 0.02,
         maximum_condition: float = 100.0,
         maximum_model_error_ratio: float = 3.0,
+        feature_count: int = 2,
     ) -> None:
         if not 0.0 < gain <= 1.0:
             raise ValueError("gain must lie in (0, 1]")
@@ -41,6 +43,9 @@ class BroydenDualFeatureServo:
             raise ValueError("damping must be non-negative")
         if maximum_axis_step <= 0.0 or maximum_norm_step <= 0.0:
             raise ValueError("servo step limits must be positive")
+        if feature_count not in (2, 3):
+            raise ValueError("feature_count must be 2 or 3")
+        self.feature_count = int(feature_count)
         self.gain = float(gain)
         self.damping = float(damping)
         self.maximum_axis_step = float(maximum_axis_step)
@@ -56,19 +61,19 @@ class BroydenDualFeatureServo:
 
     def set_jacobian(self, jacobian: np.ndarray) -> None:
         value = np.asarray(jacobian, dtype=float)
-        if value.shape != (2, 3) or not np.all(np.isfinite(value)):
-            raise ValueError("dual-feature Jacobian must be a finite 2x3 matrix")
+        if value.shape != (self.feature_count, 3) or not np.all(np.isfinite(value)):
+            raise ValueError(f"servo Jacobian must be a finite {self.feature_count}x3 matrix")
         self.jacobian = value.copy()
         self.rejected_update_count = 0
         self.last_update_reason = "initialized"
 
     def health(self, jacobian: np.ndarray | None = None) -> dict[str, object]:
         value = self.jacobian if jacobian is None else np.asarray(jacobian, dtype=float)
-        if value is None or value.shape != (2, 3) or not np.all(np.isfinite(value)):
+        if value is None or value.shape != (self.feature_count, 3) or not np.all(np.isfinite(value)):
             return {
                 "healthy": False,
                 "rank": 0,
-                "singular_values": [0.0, 0.0],
+                "singular_values": [0.0] * self.feature_count,
                 "condition": float("inf"),
             }
         singular_values = np.linalg.svd(value, compute_uv=False)
@@ -80,7 +85,7 @@ class BroydenDualFeatureServo:
         )
         return {
             "healthy": bool(
-                rank == 2
+                rank == self.feature_count
                 and singular_values[-1] >= self.minimum_singular_value
                 and condition <= self.maximum_condition
             ),
@@ -99,18 +104,18 @@ class BroydenDualFeatureServo:
     ) -> np.ndarray:
         """Return a bounded local-flange translation that reduces ``error``."""
         if self.jacobian is None:
-            raise RuntimeError("probe a 2x3 Jacobian before requesting a correction")
+            raise RuntimeError("probe a servo Jacobian before requesting a correction")
         health = self.health()
         if not health["healthy"]:
             raise RuntimeError(
                 "dual-feature Jacobian is rank deficient or ill-conditioned"
             )
         error = np.asarray(feature_error, dtype=float).reshape(-1)
-        if error.shape != (2,) or not np.all(np.isfinite(error)):
-            raise ValueError("feature_error must be a finite two-vector")
+        if error.shape != (self.feature_count,) or not np.all(np.isfinite(error)):
+            raise ValueError(f"feature_error must be a finite {self.feature_count}-vector")
         regularized = (
             self.jacobian @ self.jacobian.T
-            + self.damping**2 * np.eye(2)
+            + self.damping**2 * np.eye(self.feature_count)
         )
         selected_gain = self.gain if gain is None else float(gain)
         axis_limit = (
@@ -153,11 +158,11 @@ class BroydenDualFeatureServo:
         delta_s = np.asarray(measured_feature_delta, dtype=float).reshape(-1)
         if (
             delta_q.shape != (3,)
-            or delta_s.shape != (2,)
+            or delta_s.shape != (self.feature_count,)
             or not np.all(np.isfinite(delta_q))
             or not np.all(np.isfinite(delta_s))
         ):
-            raise ValueError("Broyden update requires finite 3-D/2-D deltas")
+            raise ValueError("Broyden update requires finite 3-D motion and matching feature deltas")
         denominator = float(delta_q @ delta_q)
         if denominator < self.minimum_update_step**2:
             # A sub-resolution move carries no useful secant information. It

@@ -27,10 +27,88 @@ def test_trigger_response_and_status_fields_are_parseable():
     }
 
 
+def test_status_parser_preserves_sequenced_motion_events():
+    events = [{"seq": 1, "kind": "ROTATION_COMMAND", "target": "ry_negative"}]
+    message = "state=MOVING; motion_events_json=" + json.dumps(events)
+    output = (
+        "response:\nstd_srvs.srv.Trigger_Response("
+        f"success=True, message='{message}')"
+    )
+
+    success, parsed = CONSOLE.extract_trigger_response(output)
+
+    assert success
+    assert json.loads(CONSOLE.parse_key_values(parsed)["motion_events_json"]) == events
+
+
 def test_progress_bar_is_bounded():
     assert CONSOLE.progress_bar(0, 6) == "[------------------]"
     assert CONSOLE.progress_bar(3, 6) == "[#########---------]"
     assert CONSOLE.progress_bar(9, 6) == "[##################]"
+
+
+def test_seed_failure_event_distinguishes_rotation_from_servo_and_lists_causes():
+    event = {
+        "seq": 12,
+        "kind": "FAILURE",
+        "target": "ry_negative",
+        "branch_index": 2,
+        "branch_total": 8,
+        "seed_count": 2,
+        "angle_deg": 9.0,
+        "stage": "SERVO",
+        "from_deg": 8.0,
+        "to_deg": 9.0,
+        "failure_count": 2,
+        "failure_limit": 3,
+        "reason": "servo left the safe bilateral region",
+        "measurement": "unsafe",
+        "length_mm": 78.43,
+        "margin_mm": -0.23,
+        "retry_step_deg": 0.5,
+        "recovery": "LOCAL_RETRY",
+        "if_next_fails": "REFERENCE_RETRY",
+        "history": [
+            {"number": 1, "reason": "bilateral feature became unsafe"},
+            {"number": 2, "reason": "servo left the safe bilateral region"},
+        ],
+        "detector_reason": "tracked_endpoint_topology_rejected",
+    }
+
+    rendered = CONSOLE.format_seed_motion_event(event, 6)
+
+    assert "旋转分支 2/8" in rendered
+    assert "失败 2/3（平移修正后）" in rendered
+    assert "断点间距 78.43 mm、安全余量 -0.23 mm" in rendered
+    assert "第1次：" in rendered and "第2次：" in rendered
+    assert "拓扑/身份一致性检查" in rendered
+    assert "若再失败，将回参考位姿以 0.50° 重试" in rendered
+
+
+def test_terminal_failure_does_not_claim_another_microstep_retry():
+    event = {
+        "kind": "FAILURE",
+        "target": "ry_negative",
+        "branch_index": 2,
+        "branch_total": 8,
+        "seed_count": 2,
+        "angle_deg": 8.0,
+        "stage": "PROBE_BACK",
+        "from_deg": 6.0,
+        "to_deg": 8.0,
+        "failure_count": 3,
+        "failure_limit": 3,
+        "reason": "dual-feature probing did not obtain three valid axes",
+        "measurement": "missing",
+        "recovery": "REFERENCE_RETRY",
+        "if_next_fails": "",
+    }
+
+    rendered = CONSOLE.format_seed_motion_event(event, 6)
+
+    assert "平移探测返回后" in rendered
+    assert "先回上一个有效位姿，再回参考位姿" in rendered
+    assert "若再失败" not in rendered
 
 
 def test_noise_regime_exceedances_identify_the_modified_dominant_terms():

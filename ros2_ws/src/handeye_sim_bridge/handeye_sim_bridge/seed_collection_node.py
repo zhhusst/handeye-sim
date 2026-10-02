@@ -31,6 +31,7 @@ from calibration_pipeline.geometry import (
 from calibration_pipeline.models import SensorROI, TrapezoidDomain
 from calibration_pipeline.seed_collection import (
     BroydenDualFeatureServo,
+    capability_sweep_rotation_plan,
     InitialPoseCriteria,
     RotationTarget,
     TranslationServo,
@@ -70,7 +71,9 @@ class SeedCollectionNode(Node):
         self.declare_parameter("collection_mode", "automatic")
         self.declare_parameter("seed.rotation_target_deg", 6.0)
         self.declare_parameter("seed.rotation_step_deg", 2.0)
-        self.declare_parameter("seed.minimum_rotation_step_deg", 0.25)
+        self.declare_parameter("seed.minimum_rotation_step_deg", 0.5)
+        self.declare_parameter("seed.rotation_guard_prediction_margin_m", 0.003)
+        self.declare_parameter("seed.maximum_reference_branch_retries", 1)
         self.declare_parameter("seed.minimum_partial_rotation_deg", 2.5)
         self.declare_parameter("seed.probe_step_m", 0.001)
         self.declare_parameter("seed.x_mid_tolerance_m", 0.003)
@@ -86,6 +89,12 @@ class SeedCollectionNode(Node):
         self.declare_parameter("seed.servo.length_lower_m", 0.070)
         self.declare_parameter("seed.servo.length_upper_m", 0.090)
         self.declare_parameter("seed.servo.length_target_m", 0.080)
+        self.declare_parameter("seed.servo.z_mid.enabled", False)
+        self.declare_parameter("seed.servo.z_mid.lower_m", 0.50)
+        self.declare_parameter("seed.servo.z_mid.target_m", 0.58)
+        self.declare_parameter("seed.servo.z_mid.upper_m", 0.62)
+        self.declare_parameter("seed.servo.z_mid.reserve_trigger_margin_m", 0.040)
+        self.declare_parameter("seed.servo.z_mid.prediction_guard_margin_m", 0.010)
         self.declare_parameter("seed.servo.hard_minimum_length_m", 0.050)
         self.declare_parameter("seed.servo.hard_maximum_length_m", 0.120)
         self.declare_parameter("seed.servo.gain", 0.55)
@@ -126,6 +135,15 @@ class SeedCollectionNode(Node):
         self.declare_parameter("seed.minimum_rotation_separation_deg", 2.0)
         self.declare_parameter("seed.target_count", 6)
         self.declare_parameter("seed.debug.single_target_name", "")
+        # Disabled by default.  This side experiment keeps the normal
+        # six-seed workflow byte-for-byte compatible while allowing one
+        # reference plus six stationary checkpoints on each of eight signed
+        # axial/diagonal branches (49 physical observations in total).
+        self.declare_parameter("seed.capability_sweep.enabled", False)
+        self.declare_parameter(
+            "seed.capability_sweep.checkpoints_deg",
+            [5.0, 10.0, 15.0, 20.0, 30.0, 40.0],
+        )
         self.declare_parameter("seed.minimum_seed_domain_margin_m", 0.002)
         self.declare_parameter("seed.initial.maximum_abs_x_mid_m", 0.03)
         self.declare_parameter("seed.initial.minimum_z_mid_m", 0.30)
@@ -192,6 +210,10 @@ class SeedCollectionNode(Node):
             "/calibration/seed_motion_state",
         )
         self.declare_parameter(
+            "interfaces.detector_diagnostics_topic",
+            "/profile_endpoint_detector/diagnostics",
+        )
+        self.declare_parameter(
             "interfaces.trajectory_action",
             "/joint_trajectory_controller/follow_joint_trajectory",
         )
@@ -233,6 +255,19 @@ class SeedCollectionNode(Node):
         self.rotation_step_minimum = np.deg2rad(
             float(self.get_parameter("seed.minimum_rotation_step_deg").value)
         )
+        self.rotation_guard_prediction_margin = float(
+            self.get_parameter("seed.rotation_guard_prediction_margin_m").value
+        )
+        self.maximum_reference_branch_retries = int(
+            self.get_parameter("seed.maximum_reference_branch_retries").value
+        )
+        if (
+            self.rotation_guard_prediction_margin < 0.0
+            or self.maximum_reference_branch_retries < 0
+            or self.rotation_step_minimum <= 0.0
+            or self.rotation_step_default < self.rotation_step_minimum
+        ):
+            raise ValueError("invalid seed rollback/rotation guard configuration")
         self.rotation_step = self.rotation_step_default
         self.minimum_partial_rotation = np.deg2rad(
             float(self.get_parameter("seed.minimum_partial_rotation_deg").value)
@@ -273,6 +308,24 @@ class SeedCollectionNode(Node):
         self.servo_length_target = float(
             self.get_parameter("seed.servo.length_target_m").value
         )
+        self.z_mid_enabled = bool(self.get_parameter("seed.servo.z_mid.enabled").value)
+        self.z_mid_lower = float(self.get_parameter("seed.servo.z_mid.lower_m").value)
+        self.z_mid_target = float(self.get_parameter("seed.servo.z_mid.target_m").value)
+        self.z_mid_upper = float(self.get_parameter("seed.servo.z_mid.upper_m").value)
+        self.z_mid_reserve_trigger_margin = float(
+            self.get_parameter("seed.servo.z_mid.reserve_trigger_margin_m").value
+        )
+        self.z_mid_prediction_guard_margin = float(
+            self.get_parameter("seed.servo.z_mid.prediction_guard_margin_m").value
+        )
+        if self.z_mid_enabled and not (
+            self.roi.safe_domain.z_near < self.z_mid_lower
+            < self.z_mid_target < self.z_mid_upper
+            < self.roi.safe_domain.z_far
+            and self.z_mid_reserve_trigger_margin > 0.0
+            and self.z_mid_prediction_guard_margin >= 0.0
+        ):
+            raise ValueError("invalid seed.servo.z_mid operating band or reserve")
         self.servo_hard_minimum_length = float(
             self.get_parameter("seed.servo.hard_minimum_length_m").value
         )
@@ -291,6 +344,7 @@ class SeedCollectionNode(Node):
                 "0 < hard_min <= lower < target < upper <= hard_max"
             )
         self.dual_servo_options = {
+            "feature_count": 3 if self.z_mid_enabled else 2,
             "gain": float(self.get_parameter("seed.servo.gain").value),
             "damping": float(self.get_parameter("seed.servo.damping").value),
             "maximum_axis_step": float(
@@ -416,6 +470,39 @@ class SeedCollectionNode(Node):
         self.debug_single_target_name = str(
             self.get_parameter("seed.debug.single_target_name").value
         ).strip()
+        self.capability_sweep_enabled = bool(
+            self.get_parameter("seed.capability_sweep.enabled").value
+        )
+        checkpoint_values = np.asarray(
+            self.get_parameter(
+                "seed.capability_sweep.checkpoints_deg"
+            ).value,
+            dtype=float,
+        ).reshape(-1)
+        if (
+            len(checkpoint_values) == 0
+            or not np.all(np.isfinite(checkpoint_values))
+            or np.any(checkpoint_values <= 0.0)
+            or np.any(np.diff(checkpoint_values) <= 0.0)
+        ):
+            raise ValueError(
+                "seed.capability_sweep.checkpoints_deg must be a non-empty "
+                "strictly increasing positive list"
+            )
+        self.capability_sweep_checkpoints = np.deg2rad(checkpoint_values)
+        if self.capability_sweep_enabled:
+            if self.debug_single_target_name:
+                raise ValueError(
+                    "seed.capability_sweep.enabled cannot be combined with "
+                    "seed.debug.single_target_name"
+                )
+            self.rotation_target = float(
+                self.capability_sweep_checkpoints[-1]
+            )
+            self.target_count = 1 + (
+                len(capability_sweep_rotation_plan())
+                * len(self.capability_sweep_checkpoints)
+            )
         if self.debug_single_target_name:
             available_targets = {
                 target.name for target in adaptive_rotation_plan()
@@ -588,6 +675,9 @@ class SeedCollectionNode(Node):
                 "interfaces.measured_detection_prior_topic"
             ).value
         )
+        detection_prior_topic = str(
+            self.get_parameter("interfaces.detection_prior_topic").value
+        )
         detection_control_topic = str(
             self.get_parameter(
                 "interfaces.detection_control_topic"
@@ -597,6 +687,9 @@ class SeedCollectionNode(Node):
             self.get_parameter(
                 "interfaces.seed_motion_state_topic"
             ).value
+        )
+        detector_diagnostics_topic = str(
+            self.get_parameter("interfaces.detector_diagnostics_topic").value
         )
         self.sensor_frame = str(
             self.get_parameter("interfaces.sensor_frame").value
@@ -626,8 +719,17 @@ class SeedCollectionNode(Node):
             self._flange_pose_callback,
             10,
         )
+        self.create_subscription(
+            String,
+            detector_diagnostics_topic,
+            self._detector_diagnostics_callback,
+            10,
+        )
         self.measured_detection_prior_publisher = self.create_publisher(
             PointCloud2, measured_detection_prior_topic, 10
+        )
+        self.detection_prior_publisher = self.create_publisher(
+            PointCloud2, detection_prior_topic, 10
         )
         self.detection_control_publisher = self.create_publisher(
             String, detection_control_topic, 10
@@ -685,7 +787,7 @@ class SeedCollectionNode(Node):
         self.seed_capture_filter_counts: dict[str, int] = {}
         self.seed_capture_last_filter_counts: dict[str, int] = {}
         self.pending_partial_label = ""
-        self.plan = adaptive_rotation_plan()
+        self.plan = self._new_collection_plan()
         self._apply_debug_target_filter()
         self.preflight_plan = (
             RotationTarget("preflight_rx_negative", ((0, -1),)),
@@ -710,20 +812,35 @@ class SeedCollectionNode(Node):
         self.target_index = 0
         self.stage_index = 0
         self.accumulated_angle = 0.0
+        self.capability_sweep_checkpoint_index = 0
+        self.capability_sweep_failures: list[dict] = []
         self.failure_count = 0
+        self.branch_failure_history: list[dict] = []
+        self.motion_event_seq = 0
+        self.motion_events: list[dict] = []
+        self.motion_from_angle_deg = 0.0
+        self.motion_to_angle_deg = 0.0
+        self.latest_detector_diagnostics: dict = {}
+        self.latest_detector_diagnostics_wall_ns = 0
+        self.branch_restart_count = 0
+        self.branch_restart_target_index = -1
+        self.branch_restart_pending = False
+        self.rollback_recovery_pending = False
+        self.rollback_terminal = False
         self.started = bool(self.get_parameter("auto_start").value)
         self.state = "WAIT_MANUAL_INIT"
         self.failure_reason = ""
         self.settle_until_ns = 0
         self.motion_deadline_wall_ns = 0
         self.after_settle = ""
+        self.last_settled_stage = ""
         self.pending_rotation = 0.0
         self.pending_rotation_feedforward = np.zeros(3)
         self.rotation_pre_feature_vector: np.ndarray | None = None
         self.rotation_pre_measurement_transform: np.ndarray | None = None
         self.rotation_feature_rate: np.ndarray | None = None
         self.rotation_feedforward_samples = 0
-        self.rotation_feedforward_last_residual = np.zeros(2)
+        self.rotation_feedforward_last_residual = np.zeros(self.dual_servo_options["feature_count"])
         self.probe_axis = 0
         self.probe_base_transform: np.ndarray | None = None
         self.probe_base_measurement_transform: np.ndarray | None = None
@@ -1088,9 +1205,7 @@ class SeedCollectionNode(Node):
                 * self.preflight_plan[self.preflight_index].angle_scale
             )
         elif self.target_index < len(self.plan):
-            displayed_rotation_target = (
-                self.rotation_target * self.plan[self.target_index].angle_scale
-            )
+            displayed_rotation_target = self._current_target_angle()
         else:
             displayed_rotation_target = self.rotation_target
         response.message = (
@@ -1113,6 +1228,10 @@ class SeedCollectionNode(Node):
             f"rotation_deg={np.rad2deg(self.accumulated_angle):.2f}/"
             f"{np.rad2deg(displayed_rotation_target):.2f}; "
             f"rotation_step_deg={np.rad2deg(self.pending_rotation):.2f}; "
+            f"capability_sweep={str(self.capability_sweep_enabled).lower()}; "
+            f"capability_checkpoint="
+            f"{self.capability_sweep_checkpoint_index + 1 if self.capability_sweep_enabled else 0}/"
+            f"{len(self.capability_sweep_checkpoints) if self.capability_sweep_enabled else 0}; "
             f"rotation_feedforward_samples={self.rotation_feedforward_samples}; "
             f"rotation_feedforward_norm_mm="
             f"{1000.0 * np.linalg.norm(self.pending_rotation_feedforward):.2f}; "
@@ -1120,8 +1239,63 @@ class SeedCollectionNode(Node):
             f"profile_points={0 if self.latest_profile is None else len(self.latest_profile)}; "
             f"{feature_details}; "
             f"failure_reason={self.failure_reason.replace(';', ',') or 'none'}"
+            f"; motion_events_json="
+            f"{json.dumps(self.motion_events, ensure_ascii=False, separators=(',', ':')).replace(';', ',')}"
         )
         return response
+
+    def _record_motion_event(self, kind: str, **details) -> None:
+        """Keep bounded, sequenced operator diagnostics; never control motion."""
+        self.motion_event_seq = getattr(self, "motion_event_seq", 0) + 1
+        target_index = getattr(self, "target_index", 0)
+        plan = getattr(self, "plan", ())
+        target = (
+            plan[target_index].name
+            if 0 <= target_index < len(plan)
+            else "reference"
+        )
+        event = {
+            "seq": self.motion_event_seq,
+            "kind": kind,
+            "target": target,
+            "branch_index": target_index + 1,
+            "branch_total": len(plan),
+            "seed_count": len(getattr(self, "records", ())),
+            "angle_deg": round(float(np.rad2deg(getattr(self, "accumulated_angle", 0.0))), 3),
+            "restart_count": getattr(self, "branch_restart_count", 0),
+            **details,
+        }
+        self.motion_events = (getattr(self, "motion_events", []) + [event])[-32:]
+
+    def _detector_diagnostics_callback(self, message: String) -> None:
+        try:
+            diagnostics = json.loads(message.data)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if isinstance(diagnostics, dict):
+            self.latest_detector_diagnostics = diagnostics
+            self.latest_detector_diagnostics_wall_ns = time.monotonic_ns()
+
+    def _recent_detector_diagnostics(self) -> dict:
+        if (
+            time.monotonic_ns()
+            - getattr(self, "latest_detector_diagnostics_wall_ns", 0)
+            > int(1.0e9)
+        ):
+            return {}
+        return getattr(self, "latest_detector_diagnostics", {})
+
+    @staticmethod
+    def _motion_feature_fields(feature) -> dict:
+        if feature is None:
+            return {"measurement": "missing"}
+        return {
+            "measurement": "safe" if feature.safe else "unsafe",
+            "x_mid_mm": round(1000.0 * float(feature.x_mid), 2),
+            "z_mid_mm": round(1000.0 * float(feature.z_mid), 2),
+            "length_mm": round(1000.0 * float(feature.profile_length), 2),
+            "margin_mm": round(1000.0 * float(feature.domain_margin), 2),
+        }
 
     def _feature(self):
         now_wall_ns = time.monotonic_ns()
@@ -1221,6 +1395,12 @@ class SeedCollectionNode(Node):
             ),
         )
 
+    def _new_collection_plan(self) -> tuple[RotationTarget, ...]:
+        """Construct the selected plan without changing the default flow."""
+        if getattr(self, "capability_sweep_enabled", False):
+            return capability_sweep_rotation_plan()
+        return adaptive_rotation_plan()
+
     def _apply_debug_target_filter(self) -> None:
         if not getattr(self, "debug_single_target_name", ""):
             return
@@ -1273,7 +1453,25 @@ class SeedCollectionNode(Node):
         return 0.0
 
     def _dual_feature_vector(self, feature) -> np.ndarray:
-        return np.array([feature.x_mid, feature.profile_length], dtype=float)
+        values = [feature.x_mid, feature.profile_length]
+        if getattr(self, "z_mid_enabled", False):
+            values.append(feature.z_mid)
+        return np.asarray(values, dtype=float)
+
+    def _z_mid_error(self, z_mid: float, domain_margin: float) -> float:
+        if not getattr(self, "z_mid_enabled", False):
+            return 0.0
+        if z_mid < self.z_mid_lower or z_mid > self.z_mid_upper:
+            return float(z_mid - self.z_mid_target)
+        # Reserve is an early warning.  A deeper profile usually widens the
+        # trapezoidal X range, so begin correcting before either endpoint
+        # reaches the hard boundary.  Never push deeper past the target.
+        if (
+            domain_margin < self.z_mid_reserve_trigger_margin
+            and z_mid < self.z_mid_target
+        ):
+            return float(z_mid - self.z_mid_target)
+        return 0.0
 
     def _dual_feature_error(self, feature) -> np.ndarray:
         tolerance = self._centering_tolerance()
@@ -1291,10 +1489,10 @@ class SeedCollectionNode(Node):
             )
             else 0.0
         )
-        return np.array(
-            [x_error, length_error],
-            dtype=float,
-        )
+        error = [x_error, length_error]
+        if getattr(self, "z_mid_enabled", False):
+            error.append(self._z_mid_error(feature.z_mid, feature.domain_margin))
+        return np.asarray(error, dtype=float)
 
     def _reset_rotation_feedforward_model(self) -> None:
         self.rotation_feature_rate = None
@@ -1302,7 +1500,9 @@ class SeedCollectionNode(Node):
         self.pending_rotation_feedforward = np.zeros(3)
         self.rotation_pre_feature_vector = None
         self.rotation_pre_measurement_transform = None
-        self.rotation_feedforward_last_residual = np.zeros(2)
+        self.rotation_feedforward_last_residual = np.zeros(
+            3 if getattr(self, "z_mid_enabled", False) else 2
+        )
 
     def _rotation_feedforward_is_active(self) -> bool:
         return bool(
@@ -1322,10 +1522,14 @@ class SeedCollectionNode(Node):
             self._dual_feature_vector(feature)
             + self.rotation_feature_rate * rotation_magnitude
         )
-        target_feature = np.array(
+        predicted_error = predicted_feature[:2] - np.array(
             [0.0, self.servo_length_target], dtype=float
         )
-        predicted_error = predicted_feature - target_feature
+        if getattr(self, "z_mid_enabled", False):
+            predicted_error = np.append(
+                predicted_error,
+                self._z_mid_error(predicted_feature[2], feature.domain_margin),
+            )
         try:
             return self.dual_servo.correction(
                 predicted_error,
@@ -1342,6 +1546,58 @@ class SeedCollectionNode(Node):
                 f"rotation feedforward disabled for this step: {error}"
             )
             return np.zeros(3)
+
+    def _rotation_step_with_edge_reserve(
+        self, feature, requested_step: float
+    ) -> tuple[float, np.ndarray] | None:
+        """Choose the largest halved step whose predicted chord stays interior.
+
+        The learned rotation rate describes rotation alone.  Add the predicted
+        effect of the *bounded* translation feedforward before testing the
+        physical-edge guard.  If no verified model exists, retain the ordinary
+        measured post-motion guard rather than inventing a prediction.
+        """
+        rate = getattr(self, "rotation_feature_rate", None)
+        jacobian = getattr(getattr(self, "dual_servo", None), "jacobian", None)
+        if (
+            self.servo_controller != "broyden_dual"
+            or rate is None
+            or jacobian is None
+            or not np.all(np.isfinite(rate))
+            or not np.all(np.isfinite(jacobian))
+        ):
+            return requested_step, self._rotation_feedforward_command(
+                feature, requested_step
+            )
+        minimum_step = min(self.rotation_step_minimum, requested_step)
+        step = requested_step
+        margin = getattr(self, "rotation_guard_prediction_margin", 0.003)
+        lower = getattr(self, "servo_hard_minimum_length", 0.050) + margin
+        upper = getattr(self, "servo_hard_maximum_length", 0.120) - margin
+        while step + 1e-12 >= minimum_step:
+            feedforward = self._rotation_feedforward_command(feature, step)
+            predicted_length = float(
+                feature.profile_length
+                + rate[1] * step
+                + jacobian[1] @ feedforward
+            )
+            predicted_depth_safe = True
+            if getattr(self, "z_mid_enabled", False):
+                predicted_z_mid = float(
+                    feature.z_mid + rate[2] * step + jacobian[2] @ feedforward
+                )
+                safe_domain = self.roi.safe_domain
+                predicted_depth_safe = bool(
+                    safe_domain.z_near + self.z_mid_prediction_guard_margin
+                    <= predicted_z_mid
+                    <= safe_domain.z_far - self.z_mid_prediction_guard_margin
+                )
+            if lower <= predicted_length <= upper and predicted_depth_safe:
+                return step, feedforward
+            if step <= minimum_step + 1e-12:
+                break
+            step = max(minimum_step, 0.5 * step)
+        return None
 
     def _update_rotation_feature_rate(self, feature) -> None:
         if (
@@ -1528,6 +1784,17 @@ class SeedCollectionNode(Node):
                 "target": target,
                 "target_index": self.target_index,
                 "stage_index": self.stage_index,
+                "capability_sweep_enabled": self.capability_sweep_enabled,
+                "capability_checkpoint_index": (
+                    self.capability_sweep_checkpoint_index
+                    if self.capability_sweep_enabled
+                    else None
+                ),
+                "capability_checkpoints_deg": (
+                    np.rad2deg(self.capability_sweep_checkpoints).tolist()
+                    if self.capability_sweep_enabled
+                    else []
+                ),
                 "started": self.started,
                 "seed_count": len(self.records),
                 "failure_count": self.failure_count,
@@ -1630,6 +1897,7 @@ class SeedCollectionNode(Node):
                     "SERVO",
                     "CACHED_SERVO_RECOVERY",
                     "ROLLBACK",
+                    "ROLLBACK_LOCAL_REACQUIRE",
                     "RETURN_REFERENCE",
                     "RETURN_REFERENCE_REACQUIRE",
                     "ROLLBACK_REFERENCE_RECOVERY",
@@ -1643,6 +1911,7 @@ class SeedCollectionNode(Node):
                     < self.measurement_retry_deadline_wall_ns
                 ):
                     return
+                self.last_settled_stage = next_state
                 self.after_settle = ""
                 getattr(self, f"_after_{next_state.lower()}")()
             return
@@ -1690,7 +1959,7 @@ class SeedCollectionNode(Node):
             self.preflight_decision_reason,
         ) = self._dynamic_preflight_decision(assessment)
         self.collection_phase = "REFERENCE"
-        self.plan = adaptive_rotation_plan()
+        self.plan = self._new_collection_plan()
         self._apply_debug_target_filter()
         if self.preflight_was_required:
             self.get_logger().info(
@@ -1706,6 +1975,25 @@ class SeedCollectionNode(Node):
                 f"reason={self.preflight_decision_reason}; real seed motions "
                 "retain bilateral validation and rollback"
             )
+        if (
+            getattr(self, "capability_sweep_enabled", False)
+            and self.servo_controller == "broyden_dual"
+            and not self._feature_controlled(feature)
+        ):
+            # The normal real workflow asks the operator to place the
+            # reference chord inside the 70--90 mm working band.  A headless
+            # capability experiment has no operator, so use the exact same
+            # measured dual-feature controller to perform that initial
+            # alignment before the reference batch is frozen.
+            self.collection_phase = "REFERENCE_ALIGN"
+            self._publish_detection_control("SEED_TRACK_START")
+            self.get_logger().info(
+                "capability sweep reference is safe but outside the dual-"
+                "feature operating band; starting measured reference "
+                "translation alignment"
+            )
+            self._begin_probing(feature, purpose="REFERENCE_ALIGN")
+            return
         if not self._begin_seed_capture("reference", "REFERENCE"):
             self._fail("reference multi-frame capture could not start")
 
@@ -1716,11 +2004,24 @@ class SeedCollectionNode(Node):
         # The reference was explicitly aligned to the purple template.  Use
         # that same narrow, bounded ROI instead of treating the known return
         # pose as an uncertain future-view prediction.
-        self._publish_detection_control("REFERENCE_REACQUIRE")
+        if (
+            getattr(self, "capability_sweep_enabled", False)
+            and self._publish_predicted_detection_prior_for_feature(
+                self.reference_feature
+            )
+        ):
+            # R0 may have been translated by the automatic reference
+            # alignment, so the detector's original purple ALIGN template is
+            # no longer the correct sensor-frame geometry.  Reacquire from
+            # the measured aligned R0 endpoints instead.
+            pass
+        else:
+            self._publish_detection_control("REFERENCE_REACQUIRE")
         self.rotation_step = self.rotation_step_default
         self.accumulated_angle = 0.0
         self.stage_index = 0
         self.failure_count = 0
+        self._record_motion_event("RETURN_REFERENCE")
         if not self._command_return_reference_stage():
             self._fail(
                 "cannot return to the reference pose: controller unavailable"
@@ -1810,9 +2111,15 @@ class SeedCollectionNode(Node):
                         f"spanning X and Y; {details}"
                     )
                     return
-                self.plan = preflight_guided_rotation_plan(
-                    self.preflight_results
-                )
+                if getattr(self, "capability_sweep_enabled", False):
+                    # The capability experiment requires the same fixed eight
+                    # signed branches in every run.  Preflight may diagnose
+                    # them, but must not silently reorder or remove them.
+                    self.plan = self._new_collection_plan()
+                else:
+                    self.plan = preflight_guided_rotation_plan(
+                        self.preflight_results
+                    )
                 self._apply_debug_target_filter()
                 self.collection_phase = "COLLECT"
                 self.get_logger().info(
@@ -1837,19 +2144,40 @@ class SeedCollectionNode(Node):
         ):
             self._finish()
             return
+        if getattr(self, "capability_sweep_enabled", False):
+            self.capability_sweep_checkpoint_index = 0
         self.last_valid_joints = self.latest_joints.copy()
         feature = self._feature()
         if feature is not None and feature.safe:
             self._remember_last_valid(feature)
         self._reset_servo()
         self._reset_rotation_feedforward_model()
+        if self.branch_restart_target_index != self.target_index:
+            self.branch_restart_count = 0
+            self.branch_restart_target_index = self.target_index
+            self.branch_restart_pending = False
+            self.branch_failure_history = []
+        elif self.branch_restart_pending:
+            # _return_reference resets the normal step.  Reapply the bounded
+            # branch-retry step only after R0 has actually been reacquired.
+            self.rotation_step = self.rotation_step_minimum
+            self.branch_restart_pending = False
+            self.get_logger().info(
+                "reference recovered; retrying the same branch with "
+                f"{np.rad2deg(self.rotation_step):.2f} deg micro-steps"
+            )
         self.get_logger().info(f"target {self.plan[self.target_index].name}")
+        self._record_motion_event(
+            "BRANCH_START",
+            target_angle_deg=round(float(np.rad2deg(self._current_target_angle())), 2),
+            step_deg=round(float(np.rad2deg(self.rotation_step)), 2),
+        )
         if (
             getattr(self, "servo_controller", "legacy") == "broyden_dual"
             and getattr(self, "reference_servo_jacobian", None) is None
         ):
             self.get_logger().info(
-                "initializing the 2x3 dual-feature Jacobian once at the "
+                "initializing the local translation-feature Jacobian once at the "
                 "verified reference pose"
             )
             self._begin_probing(feature, purpose="REFERENCE")
@@ -1870,6 +2198,7 @@ class SeedCollectionNode(Node):
         self._after_return_reference()
 
     def _issue_micro_rotation(self) -> None:
+        self.last_settled_stage = "BEFORE_MICRO_ROTATION"
         current = self._current_transform()
         if current is None:
             self._fail("joint state is unavailable")
@@ -1895,33 +2224,67 @@ class SeedCollectionNode(Node):
             and self.rotation_feedforward_samples
             >= self.rotation_feedforward_minimum_verified_steps
             and self.failure_count == 0
+            and not (
+                self.branch_restart_count > 0
+                and self.branch_restart_target_index == self.target_index
+            )
         ):
             effective_step = max(
                 effective_step,
                 self.rotation_feedforward_accelerated_step,
             )
         magnitude = min(effective_step, remaining)
+        feature = self._feature()
+        if feature is None:
+            self.pending_rotation = magnitude
+            self.pending_rotation_feedforward = np.zeros(3)
+            self._rollback("bilateral feature missing before micro-rotation")
+            return
+        bounded_command = self._rotation_step_with_edge_reserve(
+            feature, magnitude
+        )
+        if bounded_command is None:
+            self.pending_rotation = magnitude
+            self.pending_rotation_feedforward = np.zeros(3)
+            self._rollback("no rotation step preserves predicted endpoint spacing")
+            return
+        guarded_magnitude, feedforward = bounded_command
+        if guarded_magnitude + 1e-12 < magnitude:
+            self.get_logger().info(
+                "predicted endpoint-spacing reserve reduced rotation step "
+                f"from {np.rad2deg(magnitude):.2f} to "
+                f"{np.rad2deg(guarded_magnitude):.2f} deg"
+            )
+        magnitude = guarded_magnitude
         axis_vector = np.zeros(3)
         for axis, sign in axis_pairs:
             axis_vector[axis] = sign * magnitude
         target = current.copy()
         target[:3, :3] = current[:3, :3] @ so3_exp(axis_vector)
-        feature = self._feature()
         self.rotation_pre_feature_vector = (
             None if feature is None else self._dual_feature_vector(feature)
         )
         self.rotation_pre_measurement_transform = self._measurement_transform()
         if self.rotation_pre_measurement_transform is None:
             self.rotation_pre_measurement_transform = current.copy()
-        self.pending_rotation_feedforward = (
-            np.zeros(3)
-            if feature is None
-            else self._rotation_feedforward_command(feature, magnitude)
-        )
+        self.pending_rotation_feedforward = feedforward
         target[:3, 3] += (
             current[:3, :3] @ self.pending_rotation_feedforward
         )
         self.pending_rotation = magnitude
+        self.motion_from_angle_deg = float(np.rad2deg(self.accumulated_angle))
+        self.motion_to_angle_deg = float(
+            np.rad2deg(self.accumulated_angle + magnitude)
+        )
+        self._record_motion_event(
+            "ROTATION_COMMAND",
+            from_deg=round(self.motion_from_angle_deg, 2),
+            to_deg=round(self.motion_to_angle_deg, 2),
+            step_deg=round(float(np.rad2deg(magnitude)), 2),
+            feedforward_mm=round(
+                1000.0 * float(np.linalg.norm(self.pending_rotation_feedforward)), 2
+            ),
+        )
         self.get_logger().info(
             "rotation command: "
             f"step={np.rad2deg(magnitude):.2f} deg, "
@@ -1929,6 +2292,7 @@ class SeedCollectionNode(Node):
             f"{(1000.0 * self.pending_rotation_feedforward).round(3).tolist()}, "
             f"model_samples={self.rotation_feedforward_samples}"
         )
+        self.last_settled_stage = "MICRO_ROTATION"
         if not self._command_transform(target, "MICRO_ROTATION"):
             self._rollback("rotation IK failure")
 
@@ -1949,6 +2313,10 @@ class SeedCollectionNode(Node):
         self.accumulated_angle += self.pending_rotation
         self.last_valid_joints = self.latest_joints.copy()
         self._remember_last_valid(feature)
+        self._record_motion_event(
+            "ROTATION_OBSERVED",
+            **self._motion_feature_fields(feature),
+        )
         target_angle = self._current_target_angle()
         length_can_continue = (
             self.servo_controller == "legacy"
@@ -1964,6 +2332,11 @@ class SeedCollectionNode(Node):
             and feature.domain_margin
             >= self.rotation_continue_minimum_domain_margin
             and length_can_continue
+            and (
+                not getattr(self, "z_mid_enabled", False)
+                or abs(self._z_mid_error(feature.z_mid, feature.domain_margin))
+                <= self.servo_convergence_tolerance
+            )
         ):
             self._issue_micro_rotation()
             return
@@ -2094,9 +2467,12 @@ class SeedCollectionNode(Node):
                     f"condition={health['condition']:.2f})"
                 )
                 return
-            if self.probe_purpose == "REFERENCE":
+            if self.probe_purpose in {"REFERENCE", "REFERENCE_ALIGN"}:
                 self.reference_servo_jacobian = self.dual_servo.jacobian.copy()
-            self.servo_from_cache = self.probe_purpose != "REFERENCE"
+            self.servo_from_cache = self.probe_purpose not in {
+                "REFERENCE",
+                "REFERENCE_ALIGN",
+            }
             self.get_logger().info(
                 "dual-feature probe accepted: "
                 f"purpose={self.probe_purpose}, "
@@ -2116,6 +2492,11 @@ class SeedCollectionNode(Node):
                     )
                     return
                 self._issue_micro_rotation()
+            elif self.probe_purpose == "REFERENCE_ALIGN":
+                if self._feature_controlled(feature):
+                    self._continue_after_centered(feature)
+                else:
+                    self._issue_servo()
             else:
                 self._issue_servo()
             return
@@ -2130,6 +2511,7 @@ class SeedCollectionNode(Node):
         self._issue_servo()
 
     def _issue_servo(self) -> None:
+        self.last_settled_stage = "SERVO_PRECHECK"
         if self.servo_iterations >= self.maximum_servo_iterations:
             if self.servo_from_cache and not self.servo_reprobe_attempted:
                 self.get_logger().warning(
@@ -2171,8 +2553,8 @@ class SeedCollectionNode(Node):
                 "dual-feature servo: "
                 f"x_mid={1000.0 * feature.x_mid:.2f} mm, "
                 f"length={1000.0 * feature.profile_length:.2f} mm, "
-                f"error=[{1000.0 * error[0]:.2f},"
-                f"{1000.0 * error[1]:.2f}] mm, "
+                f"z_mid={1000.0 * feature.z_mid:.2f} mm, "
+                f"error_mm={(1000.0 * error).round(2).tolist()}, "
                 f"local_step_mm={(1000.0 * local).round(3).tolist()}, "
                 f"condition={health['condition']:.2f}, "
                 f"iteration={self.servo_iterations + 1}/"
@@ -2202,6 +2584,12 @@ class SeedCollectionNode(Node):
         target = current.copy()
         target[:3, 3] += current[:3, :3] @ local
         self.servo_iterations += 1
+        self._record_motion_event(
+            "SERVO_COMMAND",
+            displacement_mm=round(1000.0 * float(np.linalg.norm(local)), 2),
+            **self._motion_feature_fields(feature),
+        )
+        self.last_settled_stage = "SERVO"
         if not self._command_transform(target, "SERVO"):
             self._rollback("servo IK failure")
 
@@ -2233,6 +2621,9 @@ class SeedCollectionNode(Node):
                 return
             self._rollback("servo left the safe bilateral region")
             return
+        self._record_motion_event(
+            "SERVO_OBSERVED", **self._motion_feature_fields(feature)
+        )
         if self.servo_controller == "broyden_dual":
             measured_transform = self._measurement_transform()
             if measured_transform is None:
@@ -2316,8 +2707,71 @@ class SeedCollectionNode(Node):
         if self.collection_phase == "PREFLIGHT":
             target = self.preflight_plan[self.preflight_index]
             return self.preflight_rotation * target.angle_scale
+        if getattr(self, "capability_sweep_enabled", False):
+            return float(
+                self.capability_sweep_checkpoints[
+                    self.capability_sweep_checkpoint_index
+                ]
+            )
         target = self.plan[self.target_index]
         return self.rotation_target * target.angle_scale
+
+    @staticmethod
+    def _target_axis_pairs(target: RotationTarget) -> tuple[tuple[int, int], ...]:
+        """Return the simultaneous local-axis components of one target."""
+        stage = target.stages[0]
+        if stage and isinstance(stage[0], tuple):
+            return tuple((int(axis), int(sign)) for axis, sign in stage)
+        return ((int(stage[0]), int(stage[1])),)
+
+    def _capability_checkpoint_label(self, target: RotationTarget) -> str:
+        angle_deg = float(
+            np.rad2deg(
+                self.capability_sweep_checkpoints[
+                    self.capability_sweep_checkpoint_index
+                ]
+            )
+        )
+        angle_text = (
+            str(int(round(angle_deg)))
+            if abs(angle_deg - round(angle_deg)) < 1.0e-9
+            else f"{angle_deg:g}"
+        )
+        return f"{target.name}_{angle_text}deg"
+
+    def _abandon_capability_branch(self, reason: str) -> None:
+        """Record a measured boundary and continue with the next branch.
+
+        Missing checkpoints are never replaced by an arbitrary partial pose:
+        the purpose of this mode is to expose the acquisition boundary, not to
+        force every run to contain 49 records.
+        """
+        target = self.plan[self.target_index]
+        failed_checkpoint_deg = float(
+            np.rad2deg(
+                self.capability_sweep_checkpoints[
+                    self.capability_sweep_checkpoint_index
+                ]
+            )
+        )
+        self.capability_sweep_failures.append(
+            {
+                "branch": target.name,
+                "failed_checkpoint_component_deg": failed_checkpoint_deg,
+                "last_accumulated_component_deg": float(
+                    np.rad2deg(self.accumulated_angle)
+                ),
+                "reason": str(reason),
+            }
+        )
+        self.get_logger().warning(
+            f"capability sweep branch {target.name} stopped before "
+            f"{failed_checkpoint_deg:g} deg: {reason}"
+        )
+        self.failure_count = 0
+        self.target_index += 1
+        self.capability_sweep_checkpoint_index = 0
+        self._return_reference()
 
     @staticmethod
     def _stage_primary(stage) -> tuple[int, int]:
@@ -2334,6 +2788,39 @@ class SeedCollectionNode(Node):
         return int(first[0]), int(first[1])
 
     def _continue_after_centered(self, feature) -> None:
+        if self.collection_phase == "REFERENCE_ALIGN":
+            transform = self._current_transform()
+            measurement_transform = self._measurement_transform()
+            if (
+                transform is None
+                or measurement_transform is None
+                or self.latest_joints is None
+                or self.latest_profile is None
+            ):
+                self._fail(
+                    "reference alignment converged without a synchronized "
+                    "robot/profile measurement"
+                )
+                return
+            # The aligned pose, rather than the earlier uncorrected pose, is
+            # the common R0 to which every branch returns.
+            self.reference_joints = self.latest_joints.copy()
+            self.reference_transform = transform.copy()
+            self.reference_measurement_transform = measurement_transform.copy()
+            self.reference_profile = self.latest_profile.copy()
+            self.reference_feature = feature
+            self.last_valid_joints = self.latest_joints.copy()
+            self._remember_last_valid(feature)
+            if not self._begin_seed_capture(
+                "reference", "REFERENCE_ALIGNED"
+            ):
+                self._fail(
+                    "aligned reference multi-frame capture could not start"
+                )
+            return
+        if getattr(self, "rollback_recovery_pending", False):
+            self._resume_after_local_rollback(feature)
+            return
         target_angle = self._current_target_angle()
         if self.accumulated_angle + 1e-10 < target_angle:
             self._issue_micro_rotation()
@@ -2368,6 +2855,13 @@ class SeedCollectionNode(Node):
             self._return_reference()
             return
         target = self.plan[self.target_index]
+        if self.capability_sweep_enabled:
+            label = self._capability_checkpoint_label(target)
+            if not self._begin_seed_capture(label, "CAPABILITY_CHECKPOINT"):
+                self._abandon_capability_branch(
+                    f"{label} stationary frame capture could not start"
+                )
+            return
         if self.stage_index + 1 < len(target.stages):
             self.stage_index += 1
             self.accumulated_angle = 0.0
@@ -2408,49 +2902,88 @@ class SeedCollectionNode(Node):
             )
             self._reset_rotation_feedforward_model()
         self.failure_count += 1
-        self.rotation_step = max(self.rotation_step / 2.0, self.rotation_step_minimum)
+        failed_step = (
+            self.pending_rotation
+            if self.pending_rotation > 1e-12
+            else self.rotation_step
+        )
+        # The commanded step can be accelerated to 2 degrees while the stored
+        # base step remains 1 degree. Back off from what actually failed.
+        self.rotation_step = max(
+            self.rotation_step_minimum,
+            min(self.rotation_step, failed_step / 2.0),
+        )
+        self.rollback_terminal = bool(
+            failed_step <= self.rotation_step_minimum + 1e-12
+            or self.failure_count >= self.maximum_target_failures
+        )
+        self.rollback_recovery_pending = False
+        history = getattr(self, "branch_failure_history", [])
+        history.append(
+            {
+                "attempt": getattr(self, "branch_restart_count", 0) + 1,
+                "number": self.failure_count,
+                "reason": str(reason),
+                "stage": getattr(self, "last_settled_stage", ""),
+                "from_deg": round(getattr(self, "motion_from_angle_deg", 0.0), 2),
+                "to_deg": round(getattr(self, "motion_to_angle_deg", 0.0), 2),
+            }
+        )
+        self.branch_failure_history = history[-12:]
+        retry_available = self._reference_branch_retry_available()
+        self._record_motion_event(
+            "FAILURE",
+            reason=str(reason),
+            stage=getattr(self, "last_settled_stage", ""),
+            failure_count=self.failure_count,
+            failure_limit=self.maximum_target_failures,
+            failed_step_deg=round(float(np.rad2deg(failed_step)), 2),
+            from_deg=round(getattr(self, "motion_from_angle_deg", 0.0), 2),
+            to_deg=round(getattr(self, "motion_to_angle_deg", 0.0), 2),
+            retry_step_deg=round(float(np.rad2deg(self.rotation_step)), 2),
+            recovery=(
+                "REFERENCE_RETRY" if retry_available else "SKIP_BRANCH"
+            ) if self.rollback_terminal else "LOCAL_RETRY",
+            if_next_fails=(
+                "REFERENCE_RETRY" if retry_available else "SKIP_BRANCH"
+            ) if (
+                not self.rollback_terminal
+                and (
+                    self.rotation_step <= self.rotation_step_minimum + 1e-12
+                    or self.failure_count + 1 >= self.maximum_target_failures
+                )
+            ) else ("REDUCE_STEP" if not self.rollback_terminal else ""),
+            history=list(self.branch_failure_history),
+            detector_state=self._recent_detector_diagnostics().get("state"),
+            detector_reason=self._recent_detector_diagnostics().get("reason"),
+            detector_fallback=self._recent_detector_diagnostics().get(
+                "temporal_fallback_reason"
+            ),
+            **self._motion_feature_fields(getattr(self, "_feature", lambda: None)()),
+        )
         if self.failure_count >= self.maximum_target_failures:
             self.get_logger().warning(
                 f"{reason}; target failure limit reached "
                 f"({self.failure_count}/{self.maximum_target_failures})"
             )
-            partial_angle = self._last_valid_relative_rotation()
-            if partial_angle >= self.minimum_partial_rotation:
-                self.pending_partial_label = (
-                    f"{self.plan[self.target_index].name}_partial"
+            if self.collection_phase == "REFERENCE_ALIGN":
+                self._fail(
+                    f"capability sweep reference alignment failed: {reason}"
                 )
-                if (
-                    self.last_valid_joints is not None
-                    and self._publish_detection_prior_for_feature(
-                        self.last_valid_feature
-                    )
-                    and self._command_joints(
-                        self.last_valid_joints, "PARTIAL_CAPTURE_READY"
-                    )
-                ):
-                    self.get_logger().warning(
-                        "target limit not reached; returning to the last "
-                        "centered safe partial orientation for multi-frame capture "
-                        f"at {np.rad2deg(partial_angle):.2f} deg"
-                    )
-                    return
-                self.get_logger().warning(
-                    "partial orientation could not be restored for capture"
-                )
-            else:
-                self.get_logger().warning("target abandoned after repeated failures")
-            self.failure_count = 0
-            self.target_index += 1
-            self._return_reference()
-            return
+                return
+            if self.capability_sweep_enabled:
+                self._abandon_capability_branch(reason)
+                return
         self.get_logger().warning(
-            f"{reason}; rollback, next rotation step="
+            f"{reason}; rollback from an actual "
+            f"{np.rad2deg(failed_step):.2f} deg step, next rotation step="
             f"{np.rad2deg(self.rotation_step):.2f} deg"
         )
         if self.last_valid_joints is None:
             self._fail("no valid rollback pose")
             return
-        self._publish_detection_prior_for_feature(self.last_valid_feature)
+        # Do not reset the detector to old geometry while the robot is still
+        # at the failed pose. Re-arm it only after the rollback has landed.
         if not self._command_joints(self.last_valid_joints, "ROLLBACK"):
             self._fail(
                 f"{reason}; cannot execute rollback because the controller "
@@ -2458,6 +2991,25 @@ class SeedCollectionNode(Node):
             )
 
     def _after_rollback(self) -> None:
+        """At the saved pose, restart bounded endpoint association and wait."""
+        if (
+            self.last_valid_feature is not None
+            and self.latest_joints is not None
+            and self._publish_detection_prior_for_feature(self.last_valid_feature)
+            and self._command_joints(
+                self.latest_joints.copy(), "ROLLBACK_LOCAL_REACQUIRE"
+            )
+        ):
+            self.get_logger().info(
+                "rollback reached the last verified pose; waiting for fresh "
+                "bounded bilateral detector reacquisition"
+            )
+            return
+        self._local_rollback_reacquisition_failed(
+            "could not arm bounded local detector reacquisition"
+        )
+
+    def _after_rollback_local_reacquire(self) -> None:
         feature = self._feature()
         observation_valid = bool(feature is not None and feature.safe)
         if (
@@ -2466,22 +3018,20 @@ class SeedCollectionNode(Node):
         ):
             observation_valid = self._feature_retains_physical_edges(feature)
         if not observation_valid:
-            if (
-                self.collection_phase != "PREFLIGHT"
-                and self.reference_joints is not None
-                and self._request_reference_reacquire(
-                    "ROLLBACK_REFERENCE_REACQUIRE"
-                )
-            ):
-                self.get_logger().warning(
-                    "local rollback did not restore bilateral visibility; "
-                    "trying the verified reference pose and skipping this "
-                    "target"
-                )
-                return
-            self._fail("rollback did not restore bilateral visibility")
+            self._local_rollback_reacquisition_failed(
+                "rollback reached the last valid pose but bounded bilateral "
+                "reacquisition did not stabilize"
+            )
             return
         self._publish_detection_control("PREDICTION_COMMIT")
+        self._remember_last_valid(feature)
+        self._record_motion_event(
+            "LOCAL_REACQUIRED", **self._motion_feature_fields(feature)
+        )
+        self.rollback_recovery_pending = True
+        if self.rollback_terminal:
+            self._resume_after_local_rollback(feature)
+            return
         if (
             self.collection_phase != "PREFLIGHT"
             and self.servo_controller == "broyden_dual"
@@ -2493,7 +3043,78 @@ class SeedCollectionNode(Node):
             )
             self._begin_probing(feature, purpose="BRANCH")
             return
-        self._issue_micro_rotation()
+        self._resume_after_local_rollback(feature)
+
+    def _reference_branch_retry_available(self) -> bool:
+        return bool(
+            self.collection_phase == "COLLECT"
+            and not self.capability_sweep_enabled
+            and getattr(self, "branch_restart_count", 0)
+            < getattr(self, "maximum_reference_branch_retries", 1)
+        )
+
+    def _local_rollback_reacquisition_failed(self, reason: str) -> None:
+        self.get_logger().warning(reason)
+        self._record_motion_event("REACQUIRE_FAILED", reason=str(reason))
+        if self.collection_phase == "REFERENCE_ALIGN":
+            self._fail(f"reference alignment rollback failed: {reason}")
+            return
+        if self._reference_branch_retry_available():
+            self._restart_current_branch_from_reference(reason)
+            return
+        if self.capability_sweep_enabled:
+            self._abandon_capability_branch(reason)
+            return
+        self.get_logger().warning(
+            f"{self.plan[self.target_index].name} abandoned after bounded "
+            "local reacquisition failed"
+        )
+        self.target_index += 1
+        self._return_reference()
+
+    def _restart_current_branch_from_reference(self, reason: str) -> None:
+        self.branch_restart_count += 1
+        self.branch_restart_target_index = self.target_index
+        self.branch_restart_pending = True
+        self.rollback_recovery_pending = False
+        self._record_motion_event(
+            "REFERENCE_RETRY",
+            reason=str(reason),
+            step_deg=round(float(np.rad2deg(self.rotation_step_minimum)), 2),
+        )
+        self.get_logger().warning(
+            f"{reason}; restarting {self.plan[self.target_index].name} "
+            f"from the verified reference at the minimum rotation step "
+            f"({self.branch_restart_count}/"
+            f"{self.maximum_reference_branch_retries})"
+        )
+        self._return_reference()
+
+    def _resume_after_local_rollback(self, feature) -> None:
+        self.rollback_recovery_pending = False
+        if not self.rollback_terminal:
+            self._issue_micro_rotation()
+            return
+        if self._reference_branch_retry_available():
+            self._restart_current_branch_from_reference(
+                "minimum rotation step or target failure limit reached"
+            )
+            return
+        if self.capability_sweep_enabled:
+            self._abandon_capability_branch(
+                "minimum rotation step or target failure limit reached"
+            )
+            return
+        self.get_logger().warning(
+            f"{self.plan[self.target_index].name} still failed at the "
+            "minimum micro-step after the reference retry; skipping the branch"
+        )
+        self._record_motion_event(
+            "BRANCH_SKIPPED",
+            reason="minimum micro-step failed after reference retry",
+        )
+        self.target_index += 1
+        self._return_reference()
 
     def _after_rollback_reference_recovery(self) -> None:
         feature = self._feature()
@@ -2526,6 +3147,18 @@ class SeedCollectionNode(Node):
 
     def _finish_rollback_reference_recovery(self) -> None:
         self._publish_detection_control("PREDICTION_COMMIT")
+        if self.collection_phase == "REFERENCE_ALIGN":
+            self._fail(
+                "reference alignment lost the bilateral target and could not "
+                "resume after returning to the initial pose"
+            )
+            return
+        if self.capability_sweep_enabled:
+            self._abandon_capability_branch(
+                "local rollback and reference recovery could not continue "
+                "the scheduled checkpoint sequence"
+            )
+            return
         self.get_logger().warning(
             f"{self.plan[self.target_index].name} abandoned after reference "
             "recovery; continuing with the next preflight-guided branch"
@@ -2582,6 +3215,12 @@ class SeedCollectionNode(Node):
         self.seed_capture_last_diagnostics = None
         self.seed_capture_filter_counts = self._empty_seed_capture_counts()
         self.state = "CAPTURING_SEED"
+        if label == "reference":
+            self._record_motion_event(
+                "CAPTURE_START", label=label, target="reference", branch_index=0
+            )
+        else:
+            self._record_motion_event("CAPTURE_START", label=label)
         self.get_logger().info(
             f"stationary seed capture started: {label}, "
             f"frames={self.seed_measurement_batch_size}, "
@@ -2762,6 +3401,8 @@ class SeedCollectionNode(Node):
         candidate_rotations = self.seed_rotations + [transform_rotation]
         diversity = rotation_diversity(candidate_rotations)
         if (
+            not self.capability_sweep_enabled
+            and
             self.seed_rotations
             and diversity["minimum_pairwise_deg"]
             < self.minimum_rotation_separation_deg
@@ -2772,8 +3413,7 @@ class SeedCollectionNode(Node):
             diagnostics.median_u, diagnostics.median_v, self.roi
         )
         self.seed_rotations.append(transform_rotation.copy())
-        self.records.append(
-            {
+        record = {
                 "label": label,
                 # A representative observation keeps the file inspectable by
                 # older tools; schema-v3 consumers use every frame below.
@@ -2787,7 +3427,47 @@ class SeedCollectionNode(Node):
                     self._frame_payload(frame) for frame in frames
                 ],
             }
-        )
+        if self.capability_sweep_enabled:
+            if label == "reference":
+                target_name = "reference"
+                axis_pairs: tuple[tuple[int, int], ...] = ()
+                component_angle_deg = 0.0
+            else:
+                target = self.plan[self.target_index]
+                target_name = target.name
+                axis_pairs = self._target_axis_pairs(target)
+                component_angle_deg = float(
+                    np.rad2deg(
+                        self.capability_sweep_checkpoints[
+                            self.capability_sweep_checkpoint_index
+                        ]
+                    )
+                )
+            actual_relative_deg = 0.0
+            if self.reference_measurement_transform is not None:
+                relative = (
+                    self.reference_measurement_transform[:3, :3].T
+                    @ transform_rotation
+                )
+                cosine = float(
+                    np.clip((np.trace(relative) - 1.0) / 2.0, -1.0, 1.0)
+                )
+                actual_relative_deg = float(np.rad2deg(np.arccos(cosine)))
+            record["capability_sweep"] = {
+                "branch": target_name,
+                "axis_sign_pairs": [list(pair) for pair in axis_pairs],
+                "scheduled_component_angle_deg": component_angle_deg,
+                "scheduled_resultant_angle_deg": float(
+                    component_angle_deg * np.sqrt(len(axis_pairs))
+                ),
+                "actual_relative_rotation_deg": actual_relative_deg,
+                "checkpoint_index": (
+                    0
+                    if label == "reference"
+                    else self.capability_sweep_checkpoint_index + 1
+                ),
+            }
+        self.records.append(record)
         self.get_logger().info(
             f"accepted physical seed {len(self.records)}: {label}; "
             f"endpoint inliers={len(frames)}/{diagnostics.raw_count}"
@@ -2826,9 +3506,57 @@ class SeedCollectionNode(Node):
                 )
             self._return_reference()
             return
+        if continuation == "REFERENCE_ALIGNED":
+            if not success:
+                self._fail(f"aligned reference seed capture failed: {reason}")
+                return
+            self.collection_phase = "COLLECT"
+            self.get_logger().info(
+                "aligned reference multi-frame seed accepted; starting the "
+                "fixed eight-branch capability sweep"
+            )
+            # We are already exactly at the newly defined aligned R0.  A
+            # zero-distance "return" would unnecessarily reset/reacquire the
+            # detector and can discard the valid lock just established by the
+            # reference batch.
+            self._after_return_reference()
+            return
         if continuation in {"TARGET", "PARTIAL"}:
             self.failure_count = 0
             self.target_index += 1
+            self._return_reference()
+            return
+        if continuation == "CAPABILITY_CHECKPOINT":
+            if not self.capability_sweep_enabled:
+                self._fail(
+                    "CAPABILITY_CHECKPOINT continuation received while "
+                    "capability sweep is disabled"
+                )
+                return
+            if not success:
+                self._abandon_capability_branch(reason)
+                return
+            if (
+                self.capability_sweep_checkpoint_index + 1
+                < len(self.capability_sweep_checkpoints)
+            ):
+                self.capability_sweep_checkpoint_index += 1
+                self.failure_count = 0
+                # A completed stationary checkpoint is a newly verified safe
+                # state.  Do not carry a previously halved retry step through
+                # the remainder of a long 40-degree branch; restart from the
+                # configured nominal micro-step and let the measured guard
+                # halve it again only when the next motion requires it.
+                self.rotation_step = self.rotation_step_default
+                self.get_logger().info(
+                    f"continuing {self.plan[self.target_index].name} to "
+                    f"{np.rad2deg(self._current_target_angle()):g} deg"
+                )
+                self._issue_micro_rotation()
+                return
+            self.failure_count = 0
+            self.target_index += 1
+            self.capability_sweep_checkpoint_index = 0
             self._return_reference()
             return
         if continuation == "MANUAL":
@@ -2864,6 +3592,27 @@ class SeedCollectionNode(Node):
         )
         return True
 
+    def _publish_predicted_detection_prior_for_feature(self, feature) -> bool:
+        """Publish the measured R0 geometry as the expected future return.
+
+        The observation itself is measured, but during a long branch return
+        it is a future-view prior.  Using the predicted-prior channel gives
+        the detector its bounded recovery corridor without reverting to the
+        pre-alignment static template.
+        """
+        if feature is None:
+            return False
+        header = Header()
+        header.stamp = self.get_clock().now().to_msg()
+        header.frame_id = self.sensor_frame
+        endpoints = np.vstack(
+            (feature.endpoint_u, feature.endpoint_v)
+        ).astype(np.float32)
+        self.detection_prior_publisher.publish(
+            point_cloud2.create_cloud_xyz32(header, endpoints.tolist())
+        )
+        return True
+
     def _publish_detection_control(self, command: str) -> None:
         message = String()
         message.data = str(command)
@@ -2873,7 +3622,13 @@ class SeedCollectionNode(Node):
         """Re-arm the bounded detector at the known reference robot pose."""
         if self.reference_joints is None:
             return False
-        self._publish_detection_control("REFERENCE_REACQUIRE")
+        if not (
+            getattr(self, "capability_sweep_enabled", False)
+            and self._publish_predicted_detection_prior_for_feature(
+                self.reference_feature
+            )
+        ):
+            self._publish_detection_control("REFERENCE_REACQUIRE")
         # Sending the already reached reference joints is intentional.  The
         # real motion bridge recognizes this as a zero-distance goal, so no TP
         # motion is triggered, while the normal settling/fresh-frame state
@@ -2889,6 +3644,17 @@ class SeedCollectionNode(Node):
 
     def _finish(self) -> None:
         self._publish_detection_control("SEED_TRACK_STOP")
+        all_targets_observed = len(self.records) >= self.target_count
+        schedule_exhausted = bool(
+            self.capability_sweep_enabled
+            and self.target_index >= len(self.plan)
+        )
+        terminal_reason = self.failure_reason
+        if not all_targets_observed and schedule_exhausted:
+            terminal_reason = (
+                f"capability sweep exhausted all branches with "
+                f"{len(self.records)}/{self.target_count} observable targets"
+            )
         raw_diversity = rotation_diversity(self.seed_rotations)
         diversity = {
             key: value.tolist() if isinstance(value, np.ndarray) else value
@@ -2900,6 +3666,7 @@ class SeedCollectionNode(Node):
                 {
                     "schema_version": 3,
                     "collection_mode": self.collection_mode,
+                    "terminal_failure_reason": terminal_reason,
                     "dynamic_preflight": {
                         "mode": self.preflight_mode,
                         "executed": bool(self.preflight_was_required),
@@ -2916,13 +3683,43 @@ class SeedCollectionNode(Node):
                     ),
                     "measurement_batch_size": self.seed_measurement_batch_size,
                     "rotation_diversity": diversity,
+                    "capability_sweep": {
+                        "enabled": self.capability_sweep_enabled,
+                        "branches": [
+                            target.name for target in self.plan
+                        ] if self.capability_sweep_enabled else [],
+                        "checkpoints_component_deg": (
+                            np.rad2deg(
+                                self.capability_sweep_checkpoints
+                            ).tolist()
+                            if self.capability_sweep_enabled
+                            else []
+                        ),
+                        "expected_observation_count": (
+                            self.target_count
+                            if self.capability_sweep_enabled
+                            else None
+                        ),
+                        "schedule_exhausted": schedule_exhausted,
+                        "all_targets_observed": all_targets_observed,
+                        "failures": self.capability_sweep_failures,
+                    },
                     "seeds": self.records,
                 },
                 indent=2,
             ),
             encoding="utf-8",
         )
-        self.state = "DONE" if len(self.records) >= self.target_count else "FAILED"
+        # In capability-boundary mode, exhausting every scheduled branch is a
+        # successful experiment even when some checkpoints are physically
+        # unobservable.  The missing checkpoints are the measured result, not
+        # a software failure.  Normal seed collection keeps the original
+        # all-targets-required semantics.
+        self.state = (
+            "DONE"
+            if all_targets_observed or schedule_exhausted
+            else "FAILED"
+        )
         self.get_logger().info(
             f"seed collection complete: {len(self.records)} records -> {self.output_file}"
         )
@@ -2934,10 +3731,26 @@ class SeedCollectionNode(Node):
             self.get_logger().error(
                 self.failure_reason
             )
+        elif not all_targets_observed:
+            self.failure_reason = terminal_reason
+            self.get_logger().warning(terminal_reason)
 
     def _fail(self, reason: str) -> None:
         self._publish_detection_control("SEED_TRACK_STOP")
         self.failure_reason = reason
+        if (
+            getattr(self, "capability_sweep_enabled", False)
+            and self.records
+            and not self.output_file.exists()
+        ):
+            # A partial capability library is still scientifically useful:
+            # the first missing checkpoint plus the log identifies a measured
+            # boundary.  Persist it instead of losing all earlier branches.
+            self._finish()
+            self.state = "FAILED"
+            self.failure_reason = reason
+            self.get_logger().error(reason)
+            return
         self.state = "FAILED"
         self.get_logger().error(reason)
 

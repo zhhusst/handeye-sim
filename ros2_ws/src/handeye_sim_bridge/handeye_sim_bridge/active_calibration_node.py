@@ -1194,6 +1194,10 @@ class ActiveCalibrationNode(Node):
         physical_long_edge_axis = str(
             self.get_parameter("board.physical_long_edge_axis").value
         ).lower()
+        if self.backend == "simulation":
+            # Gazebo and the profile publisher define physical u/v directly
+            # from board.rotation; the real-rig axis remapping is not used.
+            physical_long_edge_axis = "u"
         if physical_long_edge_axis in {"y", "-y"}:
             # The solved u axis follows endpoint_u (base +X on the real rig),
             # but the physical long edge (0.2 m) lies along base +Y.  Re-label
@@ -1219,12 +1223,22 @@ class ActiveCalibrationNode(Node):
         # Box centre on the physical top surface: the board corner is the
         # bottom-front corner, so move up by the thickness and centre the box
         # in-plane (the +n half of the margin stays above the top surface).
-        centre = (
-            np.asarray(board.corner)
-            + thickness * n
-            + 0.5 * (size[0] * u + size[1] * v)
-            + margin * n
-        )
+        if self.backend == "simulation":
+            # The solved corner is on the top surface, as in calibration.yaml.
+            # Collision padding is symmetric and does not move the box centre.
+            centre = (
+                np.asarray(board.corner)
+                + 0.5 * (length_u * u + length_v * v)
+                - 0.5 * thickness * n
+            )
+        else:
+            # Preserve the established real-rig collision convention.
+            centre = (
+                np.asarray(board.corner)
+                + thickness * n
+                + 0.5 * (size[0] * u + size[1] * v)
+                + margin * n
+            )
         box = SolidPrimitive()
         box.type = SolidPrimitive.BOX
         box.dimensions = [float(size[0]), float(size[1]), float(size[2])]

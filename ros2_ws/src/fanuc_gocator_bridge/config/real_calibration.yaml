@@ -81,6 +81,13 @@
       # first step moved the selected chord outside the local tracking basin
       # before measured feedback could intervene.
       rotation_step_deg: 1.0
+      # 实测失败时按实际微步 2°→1°→0.5° 退避；0.5° 为下限。
+      minimum_rotation_step_deg: 0.5
+      # 已验证的局部旋转/平移模型用于预测下一步断点间距，
+      # 距 50/120 mm 错边硬门槛至少预留 3 mm；实测门槛仍为最终判据。
+      rotation_guard_prediction_margin_m: 0.003
+      # 最小微步仍失败时，最多回到参考位姿以 0.5° 重试该分支一次。
+      maximum_reference_branch_retries: 1
       # Keep the chord centred before rotating again.  A 1 deg Y-axis step
       # moves the laser line across the plate by ~5-17 mm (lever arm x step);
       # with the old 25 mm default the line left the 48 mm wide plate and the
@@ -176,6 +183,8 @@
       # frame; 30 mm still rejects real jumps while tolerating slow lengthen.
       roi_jump_m: 0.030
       bp_jump_m: 0.030
+      # 公共仿真配置的扩展阈值适配 0.5 mm 轮廓噪声；真机保留原 0.8 mm 阈值。
+      plate_growth_residual_threshold_m: 0.0008
       maximum_residual_rms_m: 0.0005
       smoothing_window: 5
       local_fit_window: 12

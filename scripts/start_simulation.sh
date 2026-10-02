@@ -111,7 +111,12 @@ print_web_visualization_banner() {
 move_to_initial_observation_pose() {
     local action_name=/joint_trajectory_controller/follow_joint_trajectory
     local goal
-    goal='{trajectory: {joint_names: [J1_joint, J2_joint, J3_joint, J4_joint, J5_joint, J6_joint], points: [{positions: [-0.2357, -0.0364, -0.6328, -0.4062, -1.0504, 0.8788], time_from_start: {sec: 3, nanosec: 0}}]}}'
+    if ! goal=$(python3 /workspace/scripts/select_simulation_reference_pose.py \
+        --candidates /tmp/ros_params/reference_pose_candidates.json \
+        --selected /tmp/ros_params/reference_pose_selected.json); then
+        /workspace/scripts/stop_simulation.sh
+        return 1
+    fi
 
     local active=false
     for _ in $(seq 1 60); do
@@ -125,6 +130,7 @@ move_to_initial_observation_pose() {
     if ! $active; then
         echo "joint_trajectory_controller did not become active." >&2
         ros2 control list_controllers >&2 || true
+        /workspace/scripts/stop_simulation.sh
         return 1
     fi
 
@@ -141,6 +147,7 @@ move_to_initial_observation_pose() {
     done
     echo "Initial observation pose was not reached after three attempts." >&2
     sed -n '1,40p' /tmp/handeye_initial_pose.log >&2
+    /workspace/scripts/stop_simulation.sh
     return 1
 }
 
@@ -153,10 +160,14 @@ if [[ ! -f /workspace/ros2_ws/install/setup.bash ]]; then
 fi
 source /workspace/ros2_ws/install/setup.bash
 
-URDF_PATH=/workspace/urdf/calib_robot.urdf
+URDF_TEMPLATE=/workspace/urdf/calib_robot.urdf
+URDF_PATH=/tmp/ros_params/calib_robot.generated.urdf
+WORLD_PATH=/workspace/ros2_ws/src/handeye_sim_bridge/config/handeye_world.sdf
 SRDF_PATH=/workspace/ros2_ws/src/handeye_sim_bridge/config/fanuc.srdf
 GZ_CTRL_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/gz_controllers.yaml
 CALIBRATION_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/calibration.yaml
+PLATE_SDF_TEMPLATE=/workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_plate.sdf
+PLATE_SDF_PATH=/tmp/ros_params/calibration_plate.generated.sdf
 STRESS_NOISE_CONFIG=/workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_noise_stress.yaml
 SCENE_EXE=/workspace/ros2_ws/install/handeye_sim_backend/lib/handeye_sim_backend/scene_publisher
 SRDF_PUB_EXE=/workspace/ros2_ws/install/handeye_sim_bridge/lib/handeye_sim_bridge/srdf_publisher_node
@@ -183,10 +194,22 @@ fi
 if ! ros2 pkg prefix ros_gz_bridge >/dev/null 2>&1; then
     apt-get update -qq && apt-get install -y -qq ros-jazzy-ros-gz-bridge
 fi
-if [ ! -f "$URDF_PATH" ]; then echo "URDF not found"; exit 1; fi
+if [ ! -f "$URDF_TEMPLATE" ]; then echo "URDF template not found"; exit 1; fi
+if [ ! -f "$WORLD_PATH" ]; then echo "Gazebo world not found"; exit 1; fi
 if [ ! -f "$SRDF_PATH" ]; then echo "SRDF not found"; exit 1; fi
 
 mkdir -p /tmp/ros_params
+python3 /workspace/scripts/generate_simulation_robot_urdf.py \
+    --config "$CALIBRATION_CONFIG" \
+    --template "$URDF_TEMPLATE" \
+    --output "$URDF_PATH"
+python3 /workspace/scripts/generate_calibration_plate_sdf.py \
+    --config "$CALIBRATION_CONFIG" \
+    --template "$PLATE_SDF_TEMPLATE" \
+    --output "$PLATE_SDF_PATH"
+python3 /workspace/scripts/plan_simulation_reference_pose.py \
+    --config "$CALIBRATION_CONFIG" \
+    --output /tmp/ros_params/reference_pose_candidates.json
 
 # Fail before launching any ROS processes if URDF -> SDF conversion is invalid.
 if ! gz sdf -p "$URDF_PATH" > /tmp/robot_ready.sdf; then
@@ -316,7 +339,7 @@ tmux split-window -v -t handeye_sim:0.0
 tmux split-window -v -t handeye_sim:0.2
 
 # Pane 0: Gazebo server
-tmux send-keys -t handeye_sim:0.0 "export GZ_SIM_SYSTEM_PLUGIN_PATH=/opt/ros/jazzy/lib && gz sim -s -r -v '$GZ_VERBOSITY' empty.sdf" Enter
+tmux send-keys -t handeye_sim:0.0 "export GZ_SIM_SYSTEM_PLUGIN_PATH=/opt/ros/jazzy/lib && gz sim -s -r -v '$GZ_VERBOSITY' '$WORLD_PATH'" Enter
 sleep 2
 if ! $HEADLESS; then
     ensure_gazebo_gui
@@ -333,7 +356,7 @@ tmux send-keys -t handeye_sim:0.1 "ros2 run tf2_ros static_transform_publisher 0
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_sim create -file /tmp/robot_ready.sdf -name fanuc_robot -world empty -allow_renaming true" Enter
 sleep 2
-tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_sim create -file /workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_plate.sdf -name calibration_plate -world empty -allow_renaming true" Enter
+tmux send-keys -t handeye_sim:0.1 "ros2 run ros_gz_sim create -file '$PLATE_SDF_PATH' -name calibration_plate -world empty -allow_renaming true" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "ros2 param load /controller_manager '$GZ_CTRL_CONFIG' 2>&1 | head -3" Enter
 sleep 1
@@ -341,22 +364,25 @@ tmux send-keys -t handeye_sim:0.1 "ros2 run controller_manager spawner joint_sta
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "ros2 run controller_manager spawner joint_trajectory_controller --param-file '$GZ_CTRL_CONFIG'" Enter
 sleep 2
-echo "Restoring GitHub initial observation pose..."
-move_to_initial_observation_pose
 tmux send-keys -t handeye_sim:0.1 "'$SRDF_PUB_EXE' --ros-args -p use_sim_time:=true &" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "'$SCENE_EXE' --ros-args $SCENE_PARAMETER_ARGS -p use_sim_time:=true &" Enter
 sleep 1
+tmux send-keys -t handeye_sim:0.2 "ros2 run moveit_ros_move_group move_group --ros-args --params-file /tmp/ros_params/mg_params.yaml" Enter
+sleep 5
+echo "Selecting and moving to simulation reference pose..."
+move_to_initial_observation_pose
 tmux send-keys -t handeye_sim:0.1 "'$ENDPOINT_DETECTOR_BIN' --ros-args --params-file '$CALIBRATION_CONFIG' -p use_sim_time:=true &" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "'$PROFILE_VIZ_BIN' --ros-args -p use_sim_time:=true &" Enter
 sleep 1
 tmux send-keys -t handeye_sim:0.1 "echo 'Components started. MoveGroup starting in other pane.'" Enter
-
-sleep 5
-
-# Pane 2: move_group
-tmux send-keys -t handeye_sim:0.2 "ros2 run moveit_ros_move_group move_group --ros-args --params-file /tmp/ros_params/mg_params.yaml" Enter
+if ! python3 /workspace/scripts/verify_simulation_reference_pose.py \
+    --config "$CALIBRATION_CONFIG" \
+    --selected /tmp/ros_params/reference_pose_selected.json; then
+    /workspace/scripts/stop_simulation.sh
+    exit 1
+fi
 
 # Pane 3: monitor
 tmux send-keys -t handeye_sim:0.3 "echo 'Monitoring...' && watch -n 3 'echo Topics:; ros2 topic list 2>/dev/null | grep -E \"marker|plan|trajectory|controller|profile\" | head -10; echo; echo Controllers:; ros2 control list_controllers 2>/dev/null; echo; echo Actions:; ros2 action list -t 2>/dev/null | head -10'" Enter
@@ -385,7 +411,7 @@ else
 echo ""
 echo "[1/7] Gazebo Sim..."
 export GZ_SIM_SYSTEM_PLUGIN_PATH=/opt/ros/jazzy/lib
-gz sim -s -r -v "$GZ_VERBOSITY" empty.sdf &
+gz sim -s -r -v "$GZ_VERBOSITY" "$WORLD_PATH" &
 GZ_PID=$!
 sleep 3
 if ! kill -0 "$GZ_PID" 2>/dev/null; then
@@ -409,7 +435,7 @@ sleep 1
 echo "[3/7] Spawn robot + calibration plate..."
 timeout 30s ros2 run ros_gz_sim create -file /tmp/robot_ready.sdf -name fanuc_robot -world empty -allow_renaming true
 echo "  -> Spawn calibration plate..."
-timeout 30s ros2 run ros_gz_sim create -file /workspace/ros2_ws/src/handeye_sim_bridge/config/calibration_plate.sdf -name calibration_plate -world empty -allow_renaming true
+timeout 30s ros2 run ros_gz_sim create -file "$PLATE_SDF_PATH" -name calibration_plate -world empty -allow_renaming true
 
 echo "[4/7] Controllers..."
 ros2 param load /controller_manager "$GZ_CTRL_CONFIG" 2>&1 | head -3 || true
@@ -418,9 +444,6 @@ ros2 run controller_manager spawner joint_state_broadcaster &
 sleep 1
 ros2 run controller_manager spawner joint_trajectory_controller --param-file "$GZ_CTRL_CONFIG" &
 sleep 2
-echo "  -> Restoring GitHub initial observation pose..."
-move_to_initial_observation_pose
-
 echo "[5/7] MoveIt2 move_group..."
 ros2 run moveit_ros_move_group move_group --ros-args --params-file /tmp/ros_params/mg_params.yaml &
 sleep 5
@@ -434,10 +457,18 @@ else
     "$SCENE_EXE" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
 fi
 sleep 1
+echo "  -> Selecting and moving to simulation reference pose..."
+move_to_initial_observation_pose
 "$ENDPOINT_DETECTOR_BIN" --ros-args --params-file "$CALIBRATION_CONFIG" -p use_sim_time:=true &
 sleep 1
 "$PROFILE_VIZ_BIN" --ros-args -p use_sim_time:=true &
 sleep 1
+if ! python3 /workspace/scripts/verify_simulation_reference_pose.py \
+    --config "$CALIBRATION_CONFIG" \
+    --selected /tmp/ros_params/reference_pose_selected.json; then
+    /workspace/scripts/stop_simulation.sh
+    exit 1
+fi
 
 if $NO_RVIZ; then
     echo "[7/7] Skipping RViz"

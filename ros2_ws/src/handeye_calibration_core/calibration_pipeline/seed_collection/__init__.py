@@ -15,6 +15,7 @@ from .multiframe import EndpointBatchDiagnostics, robust_endpoint_inliers
 from .rotation_scheduler import (
     RotationTarget,
     adaptive_rotation_plan,
+    capability_sweep_rotation_plan,
     preflight_guided_rotation_plan,
     star_rotation_plan,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "TranslationServo",
     "adaptive_rotation_plan",
     "assess_initial_pose",
+    "capability_sweep_rotation_plan",
     "dynamic_preflight_decision",
     "evaluate_bilateral_feature",
     "local_preflight_is_acceptable",

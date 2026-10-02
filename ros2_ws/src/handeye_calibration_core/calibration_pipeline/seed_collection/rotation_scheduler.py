@@ -34,6 +34,29 @@ def star_rotation_plan() -> tuple[RotationTarget, ...]:
     )
 
 
+def capability_sweep_rotation_plan() -> tuple[RotationTarget, ...]:
+    """Return the eight signed axial/diagonal branches used by the
+    acquisition-capability experiment.
+
+    The diagonal targets are *simultaneous* local-flange rotations.  For
+    example ``rx_positive_ry_negative`` commands the body rotation vector
+    ``[+delta, -delta, 0]`` at every micro step; it is not an X rotation
+    followed by a Y rotation.  Checkpoint angles are deliberately not stored
+    here because they are a property of the data-collection experiment, not
+    of the branch geometry.
+    """
+    return (
+        RotationTarget("ry_positive", ((1, 1),)),
+        RotationTarget("ry_negative", ((1, -1),)),
+        RotationTarget("rx_positive", ((0, 1),)),
+        RotationTarget("rx_negative", ((0, -1),)),
+        RotationTarget("rx_positive_ry_positive", (((0, 1), (1, 1)),)),
+        RotationTarget("rx_positive_ry_negative", (((0, 1), (1, -1)),)),
+        RotationTarget("rx_negative_ry_positive", (((0, -1), (1, 1)),)),
+        RotationTarget("rx_negative_ry_negative", (((0, -1), (1, -1)),)),
+    )
+
+
 def adaptive_rotation_plan() -> tuple[RotationTarget, ...]:
     """Return the default star followed by non-parallel fallback branches.
 

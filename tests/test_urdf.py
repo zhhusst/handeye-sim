@@ -6,6 +6,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from calibration_pipeline.simulation.synthetic import default_scene
+from calibration_pipeline.simulation.scene_truth import load_handeye_truth
 
 
 def test_generated_urdf_is_current_and_uses_radians():
@@ -39,8 +40,14 @@ def test_generated_urdf_is_current_and_uses_radians():
         assert links[child_name].find("collision") is not None
 
 
-def test_simulation_truth_matches_urdf_fixed_handeye_joint():
-    root = ET.fromstring(Path("urdf/calib_robot.urdf").read_text(encoding="utf-8"))
+def test_simulation_truth_matches_runtime_urdf_fixed_handeye_joint():
+    specification = importlib.util.spec_from_file_location(
+        "generate_simulation_robot_urdf", Path("scripts/generate_simulation_robot_urdf.py")
+    )
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    config = Path("ros2_ws/src/handeye_sim_bridge/config/calibration.yaml")
+    root = module.make_robot_urdf(config, Path("urdf/calib_robot.urdf")).getroot()
     joint = root.find("./joint[@name='fanuc_flange-gocator_sensor_joint']")
     assert joint is not None
     origin = joint.find("origin")
@@ -48,11 +55,14 @@ def test_simulation_truth_matches_urdf_fixed_handeye_joint():
     xyz = np.fromstring(origin.attrib["xyz"], sep=" ")
     rpy = np.fromstring(origin.attrib["rpy"], sep=" ")
     scene = default_scene()
-    assert np.allclose(scene.handeye_translation, xyz)
+    truth_rotation, truth_translation = load_handeye_truth(config)
+    assert np.allclose(truth_translation, xyz)
+    assert np.allclose(scene.handeye_translation, truth_translation)
     assert np.allclose(
-        scene.handeye_rotation,
+        truth_rotation,
         Rotation.from_euler("xyz", rpy).as_matrix(),
     )
+    assert np.allclose(scene.handeye_rotation, truth_rotation)
 
 
 def test_welding_torch_is_attached_at_validated_tcp():
@@ -85,3 +95,16 @@ def test_welding_torch_is_attached_at_validated_tcp():
         [-3.141540, -0.384130, -0.000070],
     )
     assert tool0_origin.attrib == torch_origin.attrib
+
+
+def test_tool_visual_materials_survive_urdf_to_sdf_conversion():
+    root = ET.fromstring(Path("urdf/calib_robot.urdf").read_text(encoding="utf-8"))
+    links = {link.attrib["name"]: link for link in root.findall("link")}
+
+    gocator_color = links["gocator_sensor"].find("visual/material/color")
+    weld_gun_color = links["weld_gun"].find("visual/material/color")
+
+    assert gocator_color is not None
+    assert weld_gun_color is not None
+    assert gocator_color.attrib["rgba"] == "0.4 0.4 0.4 1.0"
+    assert weld_gun_color.attrib["rgba"] == "0.28 0.28 0.28 1.0"

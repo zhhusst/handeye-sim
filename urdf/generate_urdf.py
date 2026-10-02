@@ -102,6 +102,11 @@ def gen():
     w('    <visual>')
     w('      <origin xyz="0 0 -0.270" rpy="0 0 0" />')
     w(f'      <geometry><mesh filename="{MESH}/Gocator_2450.dae" /></geometry>')
+    # Keep an explicit URDF material instead of relying on the Collada material.
+    # sdformat otherwise drops the embedded colour while lumping fixed joints.
+    w('      <material name="gocator_gray">')
+    w('        <color rgba="0.4 0.4 0.4 1.0" />')
+    w('      </material>')
     w('    </visual>')
     w('    <collision>')
     w('      <origin xyz="0 0 -0.270" rpy="0 0 0" />')
@@ -123,6 +128,10 @@ def gen():
         f'      <geometry><mesh filename="{MESH}/weldgun.stl" '
         'scale="0.001 0.001 0.001" /></geometry>'
     )
+    # STL carries no material information, so Gazebo needs an explicit colour.
+    w('      <material name="weld_gun_gray">')
+    w('        <color rgba="0.28 0.28 0.28 1.0" />')
+    w('      </material>')
     w('    </visual>')
     w('    <collision>')
     w('      <origin xyz="0 0 0" rpy="0 0 0" />')

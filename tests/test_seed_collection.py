@@ -4,6 +4,7 @@ from calibration_pipeline.models import SensorROI
 from calibration_pipeline.seed_collection import (
     BilateralFeature,
     BroydenDualFeatureServo,
+    capability_sweep_rotation_plan,
     EndpointTracker,
     adaptive_rotation_plan,
     assess_initial_pose,
@@ -93,12 +94,55 @@ def test_dual_feature_tiny_motion_does_not_trigger_model_reprobe_counter():
     assert servo.rejected_update_count == 0
 
 
+def test_three_feature_servo_can_correct_depth_without_losing_x_or_spacing():
+    servo = BroydenDualFeatureServo(
+        feature_count=3, gain=0.8, damping=0.01,
+        maximum_axis_step=0.006, maximum_norm_step=0.009,
+    )
+    jacobian = np.array([
+        [0.1158, 0.9812, 0.2514],
+        [1.8194, -0.0415, 0.9437],
+        [0.5505, 0.1677, -0.8246],
+    ])
+    servo.set_jacobian(jacobian)
+    assert servo.health()["healthy"]
+    error = np.array([0.0, 0.0, -0.025])
+    step = servo.correction(error)
+    updated = error + jacobian @ step
+    assert np.linalg.norm(step) <= 0.009 + 1e-12
+    assert abs(updated[2]) < abs(error[2])
+    # Per-axis clipping can temporarily disturb the other two features;
+    # subsequent feedback steps must remove that disturbance as well.
+    for _ in range(5):
+        step = servo.correction(updated)
+        updated += jacobian @ step
+    assert np.max(np.abs(updated)) < 0.0005
+
+
 def test_star_plan_and_rotation_diversity():
     assert len(star_rotation_plan()) == 5
     result = rotation_diversity(
         [np.eye(3), rotation_x(np.deg2rad(15.0)), rotation_y(np.deg2rad(15.0))]
     )
     assert result["minimum_pairwise_deg"] >= 14.9
+
+
+def test_capability_sweep_plan_has_all_eight_unique_signed_branches():
+    plan = capability_sweep_rotation_plan()
+    assert [target.name for target in plan] == [
+        "ry_positive",
+        "ry_negative",
+        "rx_positive",
+        "rx_negative",
+        "rx_positive_ry_positive",
+        "rx_positive_ry_negative",
+        "rx_negative_ry_positive",
+        "rx_negative_ry_negative",
+    ]
+    identities = [_command_identity(target) for target in plan]
+    assert len(identities) == len(set(identities)) == 8
+    checkpoints = (5, 10, 15, 20, 30, 40)
+    assert 1 + len(plan) * len(checkpoints) == 49
 
 
 def _feature(*, x_mid, z_mid, margin, depth_delta, length=0.115):
